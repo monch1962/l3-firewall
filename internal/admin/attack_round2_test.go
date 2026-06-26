@@ -19,7 +19,7 @@ func TestAttack_RulesUpdateWrongContentType(t *testing.T) {
 	})
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
-	eng := engine.New(eval, ct, rl, true, false, nil, nil, nil)
+	eng := engine.New(eval, ct, rl, true, false, nil, nil, nil, nil)
 	api := New(eval, eng, "test", "", "")
 	handler := api.Handler()
 
@@ -40,7 +40,7 @@ func TestAttack_MissingSecurityHeaders(t *testing.T) {
 	})
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
-	eng := engine.New(eval, ct, rl, true, false, nil, nil, nil)
+	eng := engine.New(eval, ct, rl, true, false, nil, nil, nil, nil)
 	api := New(eval, eng, "test", "", "")
 	handler := api.Handler()
 

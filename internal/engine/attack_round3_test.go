@@ -23,7 +23,7 @@ reason := "` + longReason + `" if { input.packet.dst_port == 22 }
 		t.Fatalf("NewEmbedded: %v", err)
 	}
 	eng := New(eval, conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil)
+		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil, nil)
 
 	pi := &packet.PacketInfo{
 		SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP",
@@ -74,7 +74,7 @@ func TestAttack_InvalidProtocolNumber(t *testing.T) {
 		Policy: `package l3_firewall import rego.v1 default allow := true`,
 	})
 	eng := New(eval, conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil)
+		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil, nil)
 
 	pi := &packet.PacketInfo{
 		SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "IP-255",
@@ -95,7 +95,7 @@ allow := false if { input.packet.dst_port == 22 }
 `
 	eval, _ := opa.NewEmbedded(opa.EmbedConfig{Policy: policy})
 	eng := New(eval, conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil)
+		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil, nil)
 
 	pi := &packet.PacketInfo{
 		SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP",

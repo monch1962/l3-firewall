@@ -17,18 +17,20 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/admin"
-	"github.com/monch1962/l3-firewall/internal/audit"
 	"github.com/monch1962/l3-firewall/internal/alert"
+	"github.com/monch1962/l3-firewall/internal/audit"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/engine"
 	"github.com/monch1962/l3-firewall/internal/geoip"
 	"github.com/monch1962/l3-firewall/internal/metrics"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
+	"github.com/monch1962/l3-firewall/internal/threatintel"
 )
 
 const version = "0.1.0"
@@ -55,6 +57,7 @@ func main() {
 		auditLogPath   = flag.String("audit-log", "", "Path to structured audit log file (empty = no audit logging)")
 		alertWebhookURL = flag.String("alert-webhook-url", "", "Webhook URL for firewall alerts (e.g. Slack, Discord)")
 		geoipDBPath   = flag.String("geoip-db", "", "Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup")
+		threatIntelURL = flag.String("threat-intel-url", "", "URL(s) to IP reputation blocklists (comma-separated)")
 	)
 	flag.Parse()
 
@@ -140,9 +143,28 @@ func main() {
 		slog.Info("GeoIP enabled", "db", *geoipDBPath)
 	}
 
+	// Create threat intel blocklist if URLs are specified
+	var threatIntelBlocklist *threatintel.Blocklist
+	if *threatIntelURL != "" {
+		urls := strings.Split(*threatIntelURL, ",")
+		bl := threatintel.NewBlocklist()
+		for _, url := range urls {
+			url = strings.TrimSpace(url)
+			count, err := bl.FetchFromURL(url)
+			if err != nil {
+				slog.Warn("threat intel fetch failed", "url", url, "error", err)
+			} else {
+				slog.Info("threat intel loaded", "url", url, "entries", count)
+			}
+		}
+		bl.StartRefresher(urls, 30*time.Minute)
+		threatIntelBlocklist = bl
+		slog.Info("threat intel enabled", "urls", *threatIntelURL)
+	}
+
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader)
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist)
 
 	// Initialize metrics
 	metrics.Init(func() int { return ct.Len() })

@@ -56,7 +56,7 @@ func TestAttack_RateLimiterMapUnbounded(t *testing.T) {
 
 func TestAttack_EnginePanicRecovery(t *testing.T) {
 	eng := New(nil, conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil)
+		ratelimit.NewLimiter(10000, 100000000), true, false, nil, nil, nil, nil)
 	result := eng.evaluatePacket(&packet.PacketInfo{
 		SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP", SrcPort: 44001, DstPort: 443,
 		TCPFlags: packet.TCPFlags{SYN: true},

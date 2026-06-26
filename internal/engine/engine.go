@@ -22,6 +22,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/packet"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
+	"github.com/monch1962/l3-firewall/internal/threatintel"
 
 	"github.com/florianl/go-nfqueue"
 )
@@ -64,6 +65,7 @@ type Engine struct {
 	auditLogger *audit.Logger // nil = no audit logging
 	alertRouter *alert.Router // nil = no alerts
 	geoipReader *geoip.Reader // nil = no GeoIP lookups
+	threatIntel *threatintel.Blocklist // nil = no threat intel blocking
 
 	// Stats counters
 	packetsProcessed int64
@@ -85,7 +87,7 @@ type Engine struct {
 
 // New creates a firewall engine with the given components.
 // Pass nil for auditLogger or alertRouter to disable those features.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader) *Engine {
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
@@ -95,6 +97,7 @@ func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClo
 		auditLogger:  al,
 		alertRouter:  ar,
 		geoipReader:  gr,
+		threatIntel:  ti,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 		blockStats:   make(map[string]int64),
 	}
@@ -285,7 +288,18 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	input := opa.BuildInput(pi, pps, bps, flow.Established, tcpState,
 		portPPS, portBPS, newConnRate, recentPorts)
 
-	// 5. GeoIP lookup (if GeoIP database is configured)
+	// 5. Threat intel check (if blocklist is configured)
+	if e.threatIntel != nil && e.threatIntel.Contains(pi.SrcIP) {
+		e.packetsBlocked++
+		reason := "source IP in threat intelligence blocklist"
+		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
+			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
+		e.recordBlock(pi, reason, tid)
+		e.logAudit("packet_block", tid, pi, reason)
+		return &opa.Result{Allowed: false, Reason: reason}
+	}
+
+	// 6. GeoIP lookup (if GeoIP database is configured)
 	if e.geoipReader != nil {
 		input.Geo = opa.GeoInfo{
 			SrcCountry: e.geoipReader.LookupCountry(pi.SrcIP),

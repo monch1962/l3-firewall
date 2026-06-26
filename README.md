@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **17 attack categories** with **~98 Go tests** and **76 Rego tests** plus **28 demo tests** across 9 internal packages and 12 standalone demos.
+l3-firewall's OPA Rego policies cover **18 attack categories** with **~104 Go tests** and **76 Rego tests** plus **28 demo tests** across 10 internal packages and 12 standalone demos.
 
 See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
@@ -170,6 +170,7 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `--audit-log` | `""` | Path to structured JSON audit log (empty = no audit logging) |
 | `--alert-webhook-url` | `""` | Webhook URL for firewall alerts (e.g. Slack, Discord, PagerDuty) |
 | `--geoip-db` | `""` | Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup |
+| `--threat-intel-url` | `""` | URL(s) to IP reputation blocklists (comma-separated, auto-refreshed) |
 
 ### Policy Configuration (embedded in `opa-policies/l3.rego`)
 
@@ -235,6 +236,7 @@ To change configuration: edit the `.rego` file — the hot-reloader picks up cha
 | Audit logging | `--audit-log` writes structured JSON | SIEM integration, compliance audit trail |
 | Webhook alerts | `--alert-webhook-url` fires JSON POST on events | Real-time incident notification |
 | GeoIP filtering | `--geoip-db` + Rego `blocked_src_countries` / `allowed_src_countries` | Country-based access control |
+| Threat intel feeds | `--threat-intel-url` fetches IP blocklists | Known-bad-IP blocking |
 
 ## Project Structure
 
@@ -255,6 +257,7 @@ l3-firewall/
 │   ├── alert/alert.go              # Webhook alerting with cooldown
 │   ├── audit/audit.go              # Structured JSON audit logging
 │   ├── geoip/geoip.go              # MaxMind GeoIP country lookup
+│   ├── threatintel/threatintel.go  # IP reputation blocklist fetcher
 │   ├── metrics/metrics.go          # Prometheus metrics
 │   └── admin/api.go                # REST admin API
 ├── opa-policies/
