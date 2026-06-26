@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **18 attack categories** with **~104 Go tests** and **76 Rego tests** plus **28 demo tests** across 10 internal packages and 12 standalone demos.
+l3-firewall's OPA Rego policies cover **17 attack categories** with **190 Go tests** and **76 Rego tests** plus **28 demo tests** across 15 internal packages and 12 standalone demos.
 
 See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
@@ -52,18 +52,24 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | R8 | **Rate limiter burst gap** — 60s cleanup window OOM | MaxEntries eviction handles bursts | ✅ |
 | R9 | **Per-source flow count unbounded** — Many src IPs exhaust `srcFlowCount` map | Per-IP counter naturally bounded by `MaxEntries` (65536) | ✅ |
 
-### Verified Test Coverage (91 Go tests, 76 Rego tests)
+### Verified Test Coverage (190 Go tests, 76 Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
-| `internal/packet` | 11 | TCP (SYN/SYN-ACK-RST-FIN), UDP, ICMP echo, short/nil, size, IPv6, fragment detection (nonzero offset, first-fragment, non-fragment) |
-| `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment/rate), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
+| `internal/packet` | 11 | TCP (SYN/SYN-ACK-RST-FIN), UDP, ICMP echo, short/nil, size, IPv6, fragment detection (nonzero offset, first-fragment, non-fragment), MAC address extraction |
+| `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment/rate/time/geo), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
 | `internal/conntrack` | 25 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, TCP FSM (SYN→ESTABLISHED→FIN→RST→CLOSED), concurrent access, per-source flow limit (blocks under limit, multiple sources, after delete, after expire, stats, TCP state, default unlimited) |
 | `internal/geoip` | 6 | NewReader nil path, bad path, lookup nil reader, invalid IP, nil DB, real file (skip) |
+| `internal/threatintel` | 13 | NewBlocklist, add/contains/remove, CIDR, duplicate, concurrent, URL fetch, HTTP error, refresh, nil safety, OPA data |
 | `internal/ratelimit` | 15 | Basic allowance, burst, per-IP independence, byte rate, stale cleanup, active key preservation, concurrent, rate queries, per-dst-port AllowPort, GetPortPPS, port independence, unknown port |
 | `internal/audit` | 7 | NewLogger default path, block events, allow events, concurrent safety, rotation, close, invalid path |
+| `internal/capture` | 7 | NewWriter nil dir, dir creation, write block, rotation, nil safety, close |
 | `internal/engine` | 11 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK |
-| `internal/admin` | 8 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth |
+| `internal/alert` | 9 | Type strings, defaults, webhook payload, cooldown suppression, multi-type, async non-blocking, nil safety, concurrent |
+| `internal/l2filter` | 11 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC |
+| `internal/admin` | 11 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth, policy versions |
+| `internal/persist` | 6 | Save/load, missing file, empty path, corrupt file, nil safety |
+| `internal/syncer` | 5 | Empty endpoints, bad endpoints, nil start, nil close, callback |
 | OPA Policies (Rego) | 76 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1), time-based rules (13), GeoIP rules (11) |
 
 ## Architecture
@@ -85,6 +91,8 @@ Admin API (:8082)
   ├── /admin/blocks     → [{timestamp,src_ip,dst_ip,protocol,src_port,dst_port,reason,...}]
   ├── /admin/block-stats → {"blocked SSH": 42, "SYN flood": 7, ...}
   ├── /admin/policy/reload → Trigger policy hot-reload (POST)
+  ├── /admin/policy/versions → Policy reload history
+  └── State + pcap files on disk
 
 Metrics (:9090 or admin port)
   └── /metrics → Prometheus format
@@ -171,6 +179,10 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `--alert-webhook-url` | `""` | Webhook URL for firewall alerts (e.g. Slack, Discord, PagerDuty) |
 | `--geoip-db` | `""` | Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup |
 | `--threat-intel-url` | `""` | URL(s) to IP reputation blocklists (comma-separated, auto-refreshed) |
+| `--pcap-dir` | `""` | Directory for blocked packet pcap captures |
+| `--state-file` | `""` | Path for persisting firewall state across restarts |
+| `--etcd-endpoints` | `""` | etcd endpoints for distributed policy sync (comma-separated) |
+| `--etcd-key` | `/l3-firewall/policy` | etcd key to watch for policy updates |
 
 ### Policy Configuration (embedded in `opa-policies/l3.rego`)
 
@@ -237,6 +249,12 @@ To change configuration: edit the `.rego` file — the hot-reloader picks up cha
 | Webhook alerts | `--alert-webhook-url` fires JSON POST on events | Real-time incident notification |
 | GeoIP filtering | `--geoip-db` + Rego `blocked_src_countries` / `allowed_src_countries` | Country-based access control |
 | Threat intel feeds | `--threat-intel-url` fetches IP blocklists | Known-bad-IP blocking |
+| MAC filtering | `--mac-allow` / `--mac-block` + L2 filter | MAC spoofing, unauthorized devices |
+| ARP/DHCP inspection | IP→MAC binding table, change detection | ARP spoofing, DHCP poisoning |
+| Packet capture | `--pcap-dir` writes blocked packets to pcap | Forensic analysis |
+| State persistence | `--state-file` saves block stats to JSON | Survive restarts without losing counters |
+| Policy versioning | `/admin/policy/versions` endpoint | Audit trail for rule changes |
+| Distributed sync | `--etcd-endpoints` watches etcd for policy updates | Multi-instance rule consistency |
 
 ## Project Structure
 
@@ -257,7 +275,11 @@ l3-firewall/
 │   ├── alert/alert.go              # Webhook alerting with cooldown
 │   ├── audit/audit.go              # Structured JSON audit logging
 │   ├── geoip/geoip.go              # MaxMind GeoIP country lookup
+│   ├── l2filter/l2filter.go        # MAC filtering & ARP/DHCP inspection
 │   ├── threatintel/threatintel.go  # IP reputation blocklist fetcher
+│   ├── capture/capture.go          # Pcap packet capture on block
+│   ├── persist/persist.go          # State persistence across restarts
+│   ├── syncer/syncer.go            # Distributed policy sync via etcd
 │   ├── metrics/metrics.go          # Prometheus metrics
 │   └── admin/api.go                # REST admin API
 ├── opa-policies/
