@@ -23,6 +23,7 @@ import (
 
 const maxRecentBlocks = 100
 const maxBlockStatsReasons = 256 // Cap unique deny reasons to prevent memory exhaustion
+const maxReasonLength = 1024    // Truncate OPA reason strings to prevent memory bloat
 
 // BlockLogEntry records a single blocked packet for the admin API.
 type BlockLogEntry struct {
@@ -125,9 +126,15 @@ func (e *Engine) RecentBlocks() []BlockLogEntry {
 }
 
 // recordBlock appends a block log entry and increments the per-reason counter.
+// Long reason strings are truncated to maxReasonLength to prevent memory bloat.
 func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
 	e.recentMu.Lock()
 	defer e.recentMu.Unlock()
+
+	// Truncate long reason strings
+	if len(reason) > maxReasonLength {
+		reason = reason[:maxReasonLength]
+	}
 
 	entry := BlockLogEntry{
 		Timestamp:  time.Now(),
@@ -241,6 +248,10 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		e.packetsAllowed++
 	} else {
 		e.packetsBlocked++
+		// Truncate long reason strings
+		if len(result.Reason) > maxReasonLength {
+			result.Reason = result.Reason[:maxReasonLength]
+		}
 		slog.Warn("blocked", "reason", result.Reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort)
 		e.recordBlock(pi, result.Reason)
