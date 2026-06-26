@@ -1,0 +1,22 @@
+{
+  "allowed_subnets": ["0.0.0.0/0"],
+  "allowed_ports": [],
+  "blocked_ports": [22, 23, 3389, 5900, 5901],
+  "blocked_protocols": [],
+  "syn_rate_per_second": 100,
+  "icmp_rate_per_second": 10,
+  "max_packets_per_second": 10000,
+  "blocked_icmp_types": [8],
+  "blocked_icmp_codes": [],
+  "enable_ip_spoofing_check": true,
+  "enable_port_scan_detection": true,
+  "enable_syn_flood_protection": true,
+  "enable_stateful_inspection": true,
+  "enable_fragment_attack_detection": true,
+  "enable_geo_ip_blocking": false,
+  "enable_ingress_egress_filtering": true,
+  "connection_table_size": 65536,
+  "connection_idle_timeout_sec": 300,
+  "port_scan_threshold": 20,
+  "port_scan_window_sec": 10
+}

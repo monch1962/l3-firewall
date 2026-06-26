@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.23"
+  OPA_VERSION: "1.1.0"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: ${{ env.OPA_VERSION }}
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+      - name: Install nilaway
+        run: go install go.uber.org/nilaway/cmd/nilaway@latest
+
+      - name: golangci-lint
+        run: golangci-lint run --timeout 3m
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: nilaway
+        run: nilaway -include-pkgs="github.com/monch1962/l3-firewall/internal/packet,\
+          github.com/monch1962/l3-firewall/internal/engine,\
+          github.com/monch1962/l3-firewall/internal/opa,\
+          github.com/monch1962/l3-firewall/internal/conntrack,\
+          github.com/monch1962/l3-firewall/internal/ratelimit,\
+          github.com/monch1962/l3-firewall/internal/metrics,\
+          github.com/monch1962/l3-firewall/internal/admin,\
+          github.com/monch1962/l3-firewall/cmd/server" ./... 2>&1 | grep -v "_test.go" | grep -q "error:" && echo "nilaway FAILED" && exit 1 || echo "nilaway PASS"
+
+      - name: Build
+        run: go build -ldflags="-s -w" -trimpath -o l3-firewall ./cmd/server/
+
+      - name: Go test
+        run: go test ./... -count=1 -v
+
+      - name: OPA test
+        run: opa test opa-policies/ -v

@@ -1,0 +1,74 @@
+# ─── Go ───────────────────────────────────────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.test.exe
+*.out
+*.prof
+*.cov
+*.trace
+*.test.bin
+/vendor/
+/go/pkg/
+
+# Build outputs
+/server
+l3-firewall
+/l3-firewall
+/cmd/server/server
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.vs/
+*.sublime-project
+*.sublime-workspace
+*.iml
+.project
+.classpath
+.settings/
+.idea_modules/
+*.hprof
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Environment
+.env
+.env.local
+.env.production
+.env.development
+*.env
+.env.*
+
+# Temporary
+/tmp/
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# Logs
+*.log
+/logs/
+
+# Coverage
+coverage/
+coverage.html
+coverage.out
+coverage.txt
+
+# Dependencies
+vendor/
+/go/pkg/mod/
