@@ -44,8 +44,11 @@ type ConnectionInfo struct {
 
 // RateInfo holds per-source rate tracking for OPA input.
 type RateInfo struct {
-	SrcIPpps float64 `json:"src_ip_pps"`
-	SrcIPbps float64 `json:"src_ip_bps"`
+	SrcIPpps      float64 `json:"src_ip_pps"`
+	SrcIPbps      float64 `json:"src_ip_bps"`
+	SrcPortPPS    float64 `json:"src_port_pps"`     // PPS to a specific destination port
+	SrcPortBPS    float64 `json:"src_port_bps"`     // BPS to a specific destination port
+	NewConnsPerSec float64 `json:"new_conns_per_sec"` // New connections/sec from this source
 }
 
 // Input is the complete OPA input document.
@@ -56,8 +59,10 @@ type Input struct {
 }
 
 // BuildInput constructs the OPA input from parsed packet info, rate data,
-// connection state, TCP state string, and recent destination ports for port-scan detection.
-func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpState string, recentPorts []uint16) *Input {
+// connection state, TCP state string, per-port rate, new connection rate,
+// and recent destination ports for port-scan detection.
+func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpState string,
+	portPPS, portBPS, newConnRate float64, recentPorts []uint16) *Input {
 	input := &Input{
 		Packet: PacketInfo{
 			SrcIP:      pi.SrcIP,
@@ -81,8 +86,11 @@ func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpSt
 			PacketsInFlow: 1,
 		},
 		Rate: RateInfo{
-			SrcIPpps: pps,
-			SrcIPbps: bps,
+			SrcIPpps:      pps,
+			SrcIPbps:      bps,
+			SrcPortPPS:    portPPS,
+			SrcPortBPS:    portBPS,
+			NewConnsPerSec: newConnRate,
 		},
 	}
 

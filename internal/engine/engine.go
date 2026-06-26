@@ -49,6 +49,10 @@ type Engine struct {
 	packetsAllowed   int64
 	packetsBlocked   int64
 
+	// Per-reason block counters for aggregation
+	blockStatsMu sync.RWMutex
+	blockStats   map[string]int64
+
 	// Recent blocks ring buffer
 	recentMu    sync.RWMutex
 	recentBlocks []BlockLogEntry
@@ -67,6 +71,7 @@ func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClo
 		failClosed:   failClosed,
 		auditOnly:    auditOnly,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
+		blockStats:   make(map[string]int64),
 	}
 }
 
@@ -95,6 +100,17 @@ func (e *Engine) ConntrackStats() conntrack.Stats {
 	return e.conntrack.Stats()
 }
 
+// BlockStats returns a copy of the per-reason block counters.
+func (e *Engine) BlockStats() map[string]int64 {
+	e.blockStatsMu.RLock()
+	defer e.blockStatsMu.RUnlock()
+	result := make(map[string]int64, len(e.blockStats))
+	for k, v := range e.blockStats {
+		result[k] = v
+	}
+	return result
+}
+
 // RecentBlocks returns a copy of the recent blocked packet log.
 func (e *Engine) RecentBlocks() []BlockLogEntry {
 	e.recentMu.RLock()
@@ -107,7 +123,7 @@ func (e *Engine) RecentBlocks() []BlockLogEntry {
 	return result
 }
 
-// recordBlock appends a block log entry, keeping at most maxRecentBlocks.
+// recordBlock appends a block log entry and increments the per-reason counter.
 func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
 	e.recentMu.Lock()
 	defer e.recentMu.Unlock()
@@ -126,6 +142,11 @@ func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
 		e.recentBlocks = e.recentBlocks[1:]
 	}
 	e.recentBlocks = append(e.recentBlocks, entry)
+
+	// Per-reason counter
+	e.blockStatsMu.Lock()
+	e.blockStats[reason]++
+	e.blockStatsMu.Unlock()
 }
 
 // evaluatePacket runs the full firewall evaluation pipeline on a parsed packet.
@@ -148,8 +169,10 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 		e.conntrack.RecordDestPort(pi.SrcIP, pi.DstPort)
 	}
 
-	// 2. Rate tracking
+	// 2. Rate tracking — per-IP and per-destination-port
 	pps, bps := e.ratelimit.Allow(pi.SrcIP, packetSize)
+	portPPS, portBPS := e.ratelimit.AllowPort(pi.SrcIP, pi.DstPort, packetSize)
+	newConnRate := e.conntrack.NewConnectionRate()
 
 	// 3. Get recent ports for port scan detection
 	recentPorts := e.conntrack.GetRecentDestPorts(pi.SrcIP)
@@ -159,7 +182,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 	if pi.Protocol == "TCP" {
 		tcpState = flow.TCPState.String()
 	}
-	input := opa.BuildInput(pi, pps, bps, flow.Established, tcpState, recentPorts)
+	input := opa.BuildInput(pi, pps, bps, flow.Established, tcpState,
+		portPPS, portBPS, newConnRate, recentPorts)
 
 	// 5. OPA evaluation
 	if e.eval == nil {

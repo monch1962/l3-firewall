@@ -12,9 +12,9 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **11 attack categories** with **63 Go tests** and **46 Rego tests** (**109 total**) across 7 internal packages:
+l3-firewall's OPA Rego policies cover **14 attack categories** with **67 Go tests** and **52 Rego tests** (**119 total**) across 7 internal packages:
 
-### OPA Policy Coverage (11 categories)
+### OPA Policy Coverage (14 categories)
 
 | # | Attack Vector | Detection | Status |
 |---|---|---|---|
@@ -29,18 +29,21 @@ l3-firewall's OPA Rego policies cover **11 attack categories** with **63 Go test
 | 9 | **Protocol Blocking** — Block traffic by IP protocol | `blocked_protocols` list | ✅ |
 | 10 | **Traffic Rate Limit** — Per-source-IP packets/sec budget | `max_packets_per_second` | ✅ |
 | 11 | **Fragment Attack** — Non-zero-offset IP fragments | `fragment.offset > 0` check | ✅ |
+| 12 | **Source Port Filtering** — Block traffic from specific source ports | `port_in_ranges(src_port, blocked_ports)` | ✅ |
+| 13 | **New Connection Rate** — Too many new flows from one source | `new_conns_per_sec` threshold | ✅ |
+| 14 | **Per-Port Rate Limit** — Too much traffic to a specific dst port | `src_port_pps` threshold | ✅ |
 
-### Verified Test Coverage (63 Go tests, 46 Rego tests)
+### Verified Test Coverage (67 Go tests, 52 Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
 | `internal/packet` | 11 | TCP (SYN/SYN-ACK-RST-FIN), UDP, ICMP echo, short/nil, size, IPv6, fragment detection (nonzero offset, first-fragment, non-fragment) |
-| `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
+| `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment/rate), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
 | `internal/conntrack` | 17 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, TCP FSM (SYN→ESTABLISHED→FIN→RST→CLOSED), concurrent access |
-| `internal/ratelimit` | 11 | Basic allowance, burst handling, per-IP independence, byte rate limiting, stale cleanup, active key preservation, concurrent access, rate queries |
+| `internal/ratelimit` | 15 | Basic allowance, burst, per-IP independence, byte rate, stale cleanup, active key preservation, concurrent, rate queries, per-dst-port AllowPort, GetPortPPS, port independence, unknown port |
 | `internal/engine` | 9 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats |
-| `internal/admin` | 8 | Health, stats, blocks, rules GET/UPDATE, invalid JSON, wrong method, auth (no token, wrong token, valid token) |
-| OPA Policies (Rego) | 46 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), combined (1) |
+| `internal/admin` | 8 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth |
+| OPA Policies (Rego) | 52 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1) |
 
 ## Architecture
 
@@ -58,6 +61,7 @@ Admin API (:8082)
   ├── /admin/stats      → {"packets_processed":N,"packets_allowed":N,"packets_blocked":N,
   │                        "conntrack_entries":N,"conntrack_expired":N,"conntrack_evicted":N}
   ├── /admin/blocks     → [{timestamp,src_ip,dst_ip,protocol,src_port,dst_port,reason,...}]
+  ├── /admin/block-stats → {"blocked SSH": 42, "SYN flood": 7, ...}
   ├── /admin/rules      → GET current OPA params
   └── /admin/rules/update → POST new params (live reload)
 
@@ -167,6 +171,8 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `connection_icmp_timeout_sec` | number | `5` | ICMP connection idle timeout (s) |
 | `port_scan_threshold` | number | `20` | Unique ports before scan detection |
 | `port_scan_window_sec` | number | `10` | Port scan detection window |
+| `max_new_connections_per_second` | number | `1000` | Per-IP new connection rate limit |
+| `max_port_pps` | number | `500` | Per-destination-port PPS limit |
 
 ## Security Features
 

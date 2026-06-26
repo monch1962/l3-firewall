@@ -41,6 +41,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/admin/health", a.handleHealth)
 	mux.HandleFunc("/admin/stats", a.requireAuth(a.handleStats))
 	mux.HandleFunc("/admin/blocks", a.requireAuth(a.handleBlocks))
+	mux.HandleFunc("/admin/block-stats", a.requireAuth(a.handleBlockStats))
 	mux.HandleFunc("/admin/rules", a.requireAuth(a.handleGetRules))
 	mux.HandleFunc("/admin/rules/update", a.requireAuth(a.handleUpdateRules))
 	return mux
@@ -105,6 +106,12 @@ func (a *API) handleBlocks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	json.NewEncoder(w).Encode(blocks)
+}
+
+func (a *API) handleBlockStats(w http.ResponseWriter, r *http.Request) {
+	stats := a.engine.BlockStats()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(stats)
 }
 
 func (a *API) handleGetRules(w http.ResponseWriter, r *http.Request) {

@@ -30,11 +30,13 @@ func newTestEngine(t *testing.T) *Engine {
 	}
 
 	return &Engine{
-		eval:       eval,
-		conntrack:  conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit:  ratelimit.NewLimiter(10000, 100000000),
-		auditOnly:  false,
-		failClosed: true,
+		eval:         eval,
+		conntrack:    conntrack.NewTable(conntrack.DefaultConfig()),
+		ratelimit:    ratelimit.NewLimiter(10000, 100000000),
+		auditOnly:    false,
+		failClosed:   true,
+		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
+		blockStats:   make(map[string]int64),
 	}
 }
 
@@ -165,10 +167,12 @@ func TestAuditOnlyDefense(t *testing.T) {
 
 func TestFailClosed(t *testing.T) {
 	eng := &Engine{
-		eval:       nil,
-		conntrack:  conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit:  ratelimit.NewLimiter(10000, 100000000),
-		failClosed: true,
+		eval:         nil,
+		conntrack:    conntrack.NewTable(conntrack.DefaultConfig()),
+		ratelimit:    ratelimit.NewLimiter(10000, 100000000),
+		failClosed:   true,
+		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
+		blockStats:   make(map[string]int64),
 	}
 	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
 	result := eng.evaluatePacket(pi, 64)

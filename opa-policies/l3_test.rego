@@ -306,3 +306,47 @@ test_port_range_below_allowed if {
     allow with data.params as object.union(default_mock, {"blocked_ports": {22, "8000-9000"}})
         with input.packet as {"protocol": "TCP", "dst_port": 21}
 }
+
+# =============================================================================
+# RULE 12: SOURCE PORT FILTERING
+# =============================================================================
+
+test_source_port_blocked_tcp if {
+    not allow with data.params as object.union(default_mock, {"blocked_ports": {31337}})
+        with input.packet as {"protocol": "TCP", "src_port": 31337, "dst_port": 443}
+}
+
+test_source_port_allowed_normal if {
+    allow with data.params as object.union(default_mock, {"blocked_ports": {31337}})
+        with input.packet as {"protocol": "TCP", "src_port": 44001, "dst_port": 443}
+}
+
+# =============================================================================
+# RULE 13: NEW CONNECTION RATE LIMIT
+# =============================================================================
+
+test_new_conn_rate_under_limit if {
+    allow with data.params as object.union(default_mock, {"max_new_connections_per_second": 100})
+        with input.rate as {"new_conns_per_sec": 50}
+}
+
+test_new_conn_rate_over_limit if {
+    not allow with data.params as object.union(default_mock, {"max_new_connections_per_second": 100})
+        with input.rate as {"new_conns_per_sec": 200}
+}
+
+# =============================================================================
+# RULE 14: PER-PORT RATE LIMIT
+# =============================================================================
+
+test_per_port_rate_under_limit if {
+    allow with data.params as object.union(default_mock, {"max_port_pps": 100})
+        with input.rate as {"src_port_pps": 50}
+        with input.packet as {"protocol": "TCP", "dst_port": 80}
+}
+
+test_per_port_rate_over_limit if {
+    not allow with data.params as object.union(default_mock, {"max_port_pps": 100})
+        with input.rate as {"src_port_pps": 200}
+        with input.packet as {"protocol": "TCP", "dst_port": 80}
+}

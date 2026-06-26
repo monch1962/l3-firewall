@@ -241,6 +241,48 @@ allow := false if { deny_fragment_attack }
 deny_reason := sprintf("fragment attack: offset=%v", [input.packet.fragment.offset]) if { deny_fragment_attack }
 
 # =============================================================================
+# RULE 12: Source Port Filtering — block traffic from specific source ports
+# =============================================================================
+
+deny_source_port if {
+    input.packet.protocol == "TCP"
+    port_in_ranges(input.packet.src_port, blocked_ports_set)
+}
+
+allow := false if { deny_source_port }
+deny_reason := sprintf("blocked source port %v (TCP)", [input.packet.src_port]) if { deny_source_port }
+
+deny_source_port if {
+    input.packet.protocol == "UDP"
+    port_in_ranges(input.packet.src_port, blocked_ports_set)
+}
+
+allow := false if { deny_source_port }
+deny_reason := sprintf("blocked source port %v (UDP)", [input.packet.src_port]) if { deny_source_port }
+
+# =============================================================================
+# RULE 13: New Connection Rate Limit — too many new connections from one source
+# =============================================================================
+
+deny_new_conn_rate if {
+    input.rate.new_conns_per_sec > object.get(data.params, "max_new_connections_per_second", 1000)
+}
+
+allow := false if { deny_new_conn_rate }
+deny_reason := sprintf("new connection rate exceeded: %v/sec", [input.rate.new_conns_per_sec]) if { deny_new_conn_rate }
+
+# =============================================================================
+# RULE 14: Per-Port Rate Limit — too much traffic to a specific destination port
+# =============================================================================
+
+deny_port_rate if {
+    input.rate.src_port_pps > object.get(data.params, "max_port_pps", 500)
+}
+
+allow := false if { deny_port_rate }
+deny_reason := sprintf("per-port rate limit: %v pps to port %v", [input.rate.src_port_pps, input.packet.dst_port]) if { deny_port_rate }
+
+# =============================================================================
 # HELPERS
 # =============================================================================
 

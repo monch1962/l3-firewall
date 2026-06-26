@@ -1,82 +1,66 @@
-// Package ratelimit provides per-IP token bucket rate limiting for packets
-// and bytes, designed for high-concurrency NFQUEUE usage.
+// Package ratelimit provides per-IP and per-destination-port rate limiting using
+// EWMA (Exponentially Weighted Moving Average) for smooth rate estimation.
 package ratelimit
 
 import (
+	"fmt"
 	"math"
 	"sync"
 	"time"
 )
 
-// bucket tracks rate for a single IP using a token bucket with leaky bucket
-// rate calculation.
-type bucket struct {
-	pps       float64 // exponentially weighted moving average of packets/sec
-	bps       float64 // exponentially weighted moving average of bytes/sec
-	lastTime  time.Time
+// rateBucket tracks rate for a single key (IP or IP:port pair).
+type rateBucket struct {
+	pps      float64
+	bps      float64
+	lastTime time.Time
 }
 
-// rateKey is a limiter key (currently just IP, but could be extended).
+// rateKey is a generic rate limiter key (IP or IP:port).
 type rateKey string
 
-// Limiter provides per-IP packet and byte rate tracking.
-// Uses an EWMA (Exponentially Weighted Moving Average) approach so that
-// the reported rate smoothly decays after activity stops, rather than
-// resetting abruptly.
+// Limiter provides per-IP and per-destination-port packet and byte rate tracking.
+// Uses EWMA so the reported rate smoothly decays after activity stops.
 type Limiter struct {
-	mu         sync.RWMutex
-	buckets    map[rateKey]*bucket
-	ppsLimit   float64 // max packets per second
-	bpsLimit   float64 // max bytes per second
-	alpha      float64 // EWMA smoothing factor (0..1)
+	mu        sync.RWMutex
+	buckets   map[rateKey]*rateBucket
+	ppsLimit  float64
+	bpsLimit  float64
+	alpha     float64
 }
 
-// NewLimiter creates a per-IP rate limiter.
-// ppsLimit: max packets per second (0 = unlimited)
-// bpsLimit: max bytes per second (0 = unlimited)
+// NewLimiter creates a rate limiter.
 func NewLimiter(ppsLimit, bpsLimit float64) *Limiter {
 	return &Limiter{
-		buckets:  make(map[rateKey]*bucket),
+		buckets:  make(map[rateKey]*rateBucket),
 		ppsLimit: ppsLimit,
 		bpsLimit: bpsLimit,
-		alpha:    0.3, // EWMA smoothing factor — higher = faster response
+		alpha:    0.3,
 	}
 }
 
-// Allow records a packet for the given IP and returns the current PPS and BPS
-// for that IP. Also tracks rates per destination port for the source IP.
-// The caller should compare the returned values against configured limits.
-func (l *Limiter) Allow(ip string, packetSize int) (pps, bps float64) {
-	key := rateKey(ip)
-	now := time.Now()
+// ipKey returns the per-IP key.
+func ipKey(ip string) rateKey {
+	return rateKey("ip:" + ip)
+}
 
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// portKey returns the per-IP:destination-port key.
+func portKey(ip string, dstPort uint16) rateKey {
+	return rateKey(fmt.Sprintf("port:%s:%d", ip, dstPort))
+}
 
-	b, ok := l.buckets[key]
-	if !ok {
-		b = &bucket{
-			lastTime: now,
-		}
-		l.buckets[key] = b
-	}
-
-	// Calculate time delta in seconds
+// updateBucket records a packet in the given bucket and returns the current PPS/BPS.
+func (l *Limiter) updateBucket(b *rateBucket, packetSize int, now time.Time) (pps, bps float64) {
 	dt := now.Sub(b.lastTime).Seconds()
 	if dt <= 0 {
-		dt = 0.001 // minimum 1ms to avoid division issues
+		dt = 0.001
 	}
 	b.lastTime = now
 
-	// Instantaneous rate for this sample
 	instPPS := 1.0 / dt
 	instBPS := float64(packetSize) / dt
 
-	// EWMA update
 	if b.pps == 0 {
-		// First packet — use a conservative starting rate rather than
-		// the instantaneous rate which can be absurdly high (1/dt for
-		// very small dt).
 		b.pps = 1.0
 		b.bps = float64(packetSize)
 	} else {
@@ -84,21 +68,46 @@ func (l *Limiter) Allow(ip string, packetSize int) (pps, bps float64) {
 		b.bps = l.alpha*instBPS + (1-l.alpha)*b.bps
 	}
 
-	// Clamp to prevent infinity
 	if math.IsInf(b.pps, 0) || b.pps > 1e12 {
 		b.pps = 1e12
 	}
 	if math.IsInf(b.bps, 0) || b.bps > 1e15 {
 		b.bps = 1e15
 	}
-
 	return b.pps, b.bps
 }
 
-// GetPPS returns the current packets-per-second rate for the given IP.
-// Returns 0 if the IP has no recorded activity.
-func (l *Limiter) GetPPS(ip string) float64 {
-	key := rateKey(ip)
+// getOrCreateBucket returns the bucket for a key, creating it if needed.
+func (l *Limiter) getOrCreateBucket(key rateKey, now time.Time) *rateBucket {
+	b, ok := l.buckets[key]
+	if !ok {
+		b = &rateBucket{lastTime: now}
+		l.buckets[key] = b
+	}
+	return b
+}
+
+// Allow records a packet for the given IP and returns the current PPS and BPS.
+func (l *Limiter) Allow(ip string, packetSize int) (pps, bps float64) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.getOrCreateBucket(ipKey(ip), now)
+	return l.updateBucket(b, packetSize, now)
+}
+
+// AllowPort records a packet for the given IP:destination-port pair and returns
+// the current PPS and BPS for that specific port.
+func (l *Limiter) AllowPort(ip string, dstPort uint16, packetSize int) (pps, bps float64) {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.getOrCreateBucket(portKey(ip, dstPort), now)
+	return l.updateBucket(b, packetSize, now)
+}
+
+// getBucketPPS is a helper to safely read a bucket's PPS.
+func (l *Limiter) getBucketPPS(key rateKey) float64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if b, ok := l.buckets[key]; ok {
@@ -107,10 +116,8 @@ func (l *Limiter) GetPPS(ip string) float64 {
 	return 0
 }
 
-// GetBPS returns the current bytes-per-second rate for the given IP.
-// Returns 0 if the IP has no recorded activity.
-func (l *Limiter) GetBPS(ip string) float64 {
-	key := rateKey(ip)
+// getBucketBPS is a helper to safely read a bucket's BPS.
+func (l *Limiter) getBucketBPS(key rateKey) float64 {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if b, ok := l.buckets[key]; ok {
@@ -119,9 +126,27 @@ func (l *Limiter) GetBPS(ip string) float64 {
 	return 0
 }
 
+// GetPPS returns the packets-per-second rate for the given IP.
+func (l *Limiter) GetPPS(ip string) float64 {
+	return l.getBucketPPS(ipKey(ip))
+}
+
+// GetBPS returns the bytes-per-second rate for the given IP.
+func (l *Limiter) GetBPS(ip string) float64 {
+	return l.getBucketBPS(ipKey(ip))
+}
+
+// GetPortPPS returns the packets-per-second rate for the given IP:port pair.
+func (l *Limiter) GetPortPPS(ip string, dstPort uint16) float64 {
+	return l.getBucketPPS(portKey(ip, dstPort))
+}
+
+// GetPortBPS returns the bytes-per-second rate for the given IP:port pair.
+func (l *Limiter) GetPortBPS(ip string, dstPort uint16) float64 {
+	return l.getBucketBPS(portKey(ip, dstPort))
+}
+
 // Cleanup removes buckets that have been idle longer than the given duration.
-// Returns the number of entries removed. Should be called periodically
-// (e.g. every minute) to prevent memory exhaustion from stale IPs.
 func (l *Limiter) Cleanup(idleThreshold time.Duration) int {
 	now := time.Now()
 	l.mu.Lock()
@@ -137,7 +162,7 @@ func (l *Limiter) Cleanup(idleThreshold time.Duration) int {
 	return removed
 }
 
-// Len returns the number of tracked IPs.
+// Len returns the number of tracked rate entries.
 func (l *Limiter) Len() int {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
