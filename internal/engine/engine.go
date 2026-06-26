@@ -9,7 +9,8 @@ package engine
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/conntrack"
@@ -20,11 +21,19 @@ import (
 	"github.com/florianl/go-nfqueue"
 )
 
-// Verdict constants returned from evaluatePacket.
-const (
-	VerdictAccept = iota
-	VerdictDrop
-)
+const maxRecentBlocks = 100
+
+// BlockLogEntry records a single blocked packet for the admin API.
+type BlockLogEntry struct {
+	Timestamp  time.Time `json:"timestamp"`
+	SrcIP      string    `json:"src_ip"`
+	DstIP      string    `json:"dst_ip"`
+	Protocol   string    `json:"protocol"`
+	SrcPort    uint16    `json:"src_port"`
+	DstPort    uint16    `json:"dst_port"`
+	Reason     string    `json:"reason"`
+	PacketSize int       `json:"packet_size"`
+}
 
 // Engine is the core firewall evaluation pipeline.
 type Engine struct {
@@ -33,11 +42,16 @@ type Engine struct {
 	ratelimit *ratelimit.Limiter
 	auditOnly bool
 	failClosed bool
+	running   bool
 
 	// Stats counters
 	packetsProcessed int64
 	packetsAllowed   int64
 	packetsBlocked   int64
+
+	// Recent blocks ring buffer
+	recentMu    sync.RWMutex
+	recentBlocks []BlockLogEntry
 
 	// NFQUEUE lifecycle
 	ctx    context.Context
@@ -47,15 +61,16 @@ type Engine struct {
 // New creates a firewall engine with the given components.
 func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool) *Engine {
 	return &Engine{
-		eval:       eval,
-		conntrack:  ct,
-		ratelimit:  rl,
-		failClosed: failClosed,
-		auditOnly:  auditOnly,
+		eval:         eval,
+		conntrack:    ct,
+		ratelimit:    rl,
+		failClosed:   failClosed,
+		auditOnly:    auditOnly,
+		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 	}
 }
 
-// Stats returns current packet counters.
+// Stats holds current packet counters.
 type Stats struct {
 	PacketsProcessed int64
 	PacketsAllowed   int64
@@ -70,15 +85,56 @@ func (e *Engine) Stats() Stats {
 	}
 }
 
+// Running returns whether the engine is actively running (NFQUEUE connected).
+func (e *Engine) Running() bool {
+	return e.running
+}
+
+// ConntrackStats returns the connection tracking stats.
+func (e *Engine) ConntrackStats() conntrack.Stats {
+	return e.conntrack.Stats()
+}
+
+// RecentBlocks returns a copy of the recent blocked packet log.
+func (e *Engine) RecentBlocks() []BlockLogEntry {
+	e.recentMu.RLock()
+	defer e.recentMu.RUnlock()
+	if len(e.recentBlocks) == 0 {
+		return nil
+	}
+	result := make([]BlockLogEntry, len(e.recentBlocks))
+	copy(result, e.recentBlocks)
+	return result
+}
+
+// recordBlock appends a block log entry, keeping at most maxRecentBlocks.
+func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
+	e.recentMu.Lock()
+	defer e.recentMu.Unlock()
+
+	entry := BlockLogEntry{
+		Timestamp:  time.Now(),
+		SrcIP:      pi.SrcIP,
+		DstIP:      pi.DstIP,
+		Protocol:   pi.Protocol,
+		SrcPort:    pi.SrcPort,
+		DstPort:    pi.DstPort,
+		Reason:     reason,
+		PacketSize: pi.PacketSize,
+	}
+	if len(e.recentBlocks) >= maxRecentBlocks {
+		e.recentBlocks = e.recentBlocks[1:]
+	}
+	e.recentBlocks = append(e.recentBlocks, entry)
+}
+
 // evaluatePacket runs the full firewall evaluation pipeline on a parsed packet.
 // Returns the OPA result (Allowed + Reason).
-// This function is safe to export for testing.
 func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Result {
 	e.packetsProcessed++
 
 	// 1. Connection tracking lookup
-	srcIP, dstIP := pi.SrcIP, pi.DstIP
-	flow := e.conntrack.LookupOrCreate(srcIP, dstIP, pi.Protocol, pi.SrcPort, pi.DstPort)
+	flow := e.conntrack.LookupOrCreate(pi.SrcIP, pi.DstIP, pi.Protocol, pi.SrcPort, pi.DstPort)
 
 	// Track SYN-ACK as established
 	if pi.Protocol == "TCP" && pi.TCPFlags.SYN && pi.TCPFlags.ACK {
@@ -87,14 +143,14 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 
 	// Track destination port for scan detection
 	if pi.Protocol == "TCP" || pi.Protocol == "UDP" {
-		e.conntrack.RecordDestPort(srcIP, pi.DstPort)
+		e.conntrack.RecordDestPort(pi.SrcIP, pi.DstPort)
 	}
 
 	// 2. Rate tracking
-	pps, bps := e.ratelimit.Allow(srcIP, packetSize)
+	pps, bps := e.ratelimit.Allow(pi.SrcIP, packetSize)
 
 	// 3. Get recent ports for port scan detection
-	recentPorts := e.conntrack.GetRecentDestPorts(srcIP)
+	recentPorts := e.conntrack.GetRecentDestPorts(pi.SrcIP)
 
 	// 4. Build OPA input
 	input := opa.BuildInput(pi, pps, bps, flow.Established, recentPorts)
@@ -103,7 +159,11 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 	if e.eval == nil {
 		if e.failClosed {
 			e.packetsBlocked++
-			return &opa.Result{Allowed: false, Reason: "evaluator unavailable — blocked for safety"}
+			reason := "evaluator unavailable — blocked for safety"
+			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
+				"protocol", pi.Protocol, "port", pi.DstPort)
+			e.recordBlock(pi, reason)
+			return &opa.Result{Allowed: false, Reason: reason}
 		}
 		e.packetsAllowed++
 		return &opa.Result{Allowed: true}
@@ -113,15 +173,20 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 	if err != nil {
 		if e.failClosed {
 			e.packetsBlocked++
-			return &opa.Result{Allowed: false, Reason: fmt.Sprintf("OPA error: %v — blocked for safety", err)}
+			reason := fmt.Sprintf("OPA error: %v — blocked for safety", err)
+			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
+				"protocol", pi.Protocol, "port", pi.DstPort)
+			e.recordBlock(pi, reason)
+			return &opa.Result{Allowed: false, Reason: reason}
 		}
 		e.packetsAllowed++
 		return &opa.Result{Allowed: true}
 	}
 
-	// 6. Audit-only mode overrides blocks
+	// 6. Audit-only mode overrides blocks (but still logs them)
 	if !result.Allowed && e.auditOnly {
-		log.Printf("[AUDIT] would block: %s", result.Reason)
+		slog.Warn("[AUDIT] would block", "reason", result.Reason, "src", pi.SrcIP,
+			"dst", pi.DstIP, "protocol", pi.Protocol, "port", pi.DstPort)
 		e.packetsAllowed++
 		return &opa.Result{Allowed: true}
 	}
@@ -130,35 +195,33 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 		e.packetsAllowed++
 	} else {
 		e.packetsBlocked++
+		slog.Warn("blocked", "reason", result.Reason, "src", pi.SrcIP, "dst", pi.DstIP,
+			"protocol", pi.Protocol, "port", pi.DstPort)
+		e.recordBlock(pi, result.Reason)
 	}
 
 	return result
 }
 
-// packetHandler is the NFQUEUE callback. It processes a single raw packet.
+// packetHandler is the NFQUEUE callback.
 func (e *Engine) packetHandler(attr nfqueue.Attribute) int {
 	if attr.Payload == nil || attr.PacketID == nil {
-		// Can't process — accept
 		return 0
 	}
 
-	// Parse the raw packet
 	pi, err := packet.ParsePacket(*attr.Payload)
 	if err != nil {
-		// Can't parse — accept and let upstream handle it
 		return 0
 	}
 
 	result := e.evaluatePacket(pi, len(*attr.Payload))
 	if result.Allowed {
-		return 0 // NF_ACCEPT
+		return 0
 	}
-	return 1 // NF_DROP
+	return 1
 }
 
 // Run starts the NFQUEUE listener on the given queue number.
-// Blocks until the context is cancelled. Returns an error if the
-// NFQUEUE socket cannot be opened (e.g., missing CAP_NET_ADMIN).
 func (e *Engine) Run(queueNum uint16) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	e.ctx = ctx
@@ -177,16 +240,17 @@ func (e *Engine) Run(queueNum uint16) error {
 		return fmt.Errorf("opening NFQUEUE %d: %w", queueNum, err)
 	}
 
-	// Register the callback
+	e.running = true
+
 	if err := nf.Register(ctx, func(attr nfqueue.Attribute) int {
 		return e.packetHandler(attr)
 	}); err != nil {
 		nf.Close()
+		e.running = false
 		cancel()
 		return fmt.Errorf("registering NFQUEUE handler: %w", err)
 	}
 
-	// Periodic cleanup goroutines
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
@@ -201,9 +265,9 @@ func (e *Engine) Run(queueNum uint16) error {
 		}
 	}()
 
-	// Block until context cancelled
 	<-ctx.Done()
 	nf.Close()
+	e.running = false
 	return nil
 }
 

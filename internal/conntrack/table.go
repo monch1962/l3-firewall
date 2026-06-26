@@ -1,8 +1,9 @@
-// Package conntrack provides TCP connection state tracking for L3 firewall.
+// Package conntrack provides connection state tracking for L3 firewall.
 //
 // Tracks 5-tuple flows (src_ip, dst_ip, protocol, src_port, dst_port) with
-// connection state (NEW / ESTABLISHED), packet counts, age tracking, and
-// per-source destination-port recording for port scan detection.
+// per-protocol idle timeouts (TCP=300s, UDP=30s, ICMP=5s), connection state,
+// packet counts, age tracking, and per-source destination-port recording
+// for port scan detection.
 package conntrack
 
 import (
@@ -13,10 +14,12 @@ import (
 
 // Config controls the connection table behaviour.
 type Config struct {
-	MaxEntries      int           // Max flows before eviction (oldest first)
-	IdleTimeout     time.Duration // Flow idle timeout before expiry
-	PortScanWindow  int           // Max recent destination ports to track per source IP
-	PortScanMaxPorts int          // Max unique ports recorded per source IP
+	MaxEntries       int           // Max flows before eviction (oldest first)
+	IdleTimeout      time.Duration // TCP flow idle timeout
+	UDPTimeout       time.Duration // UDP flow idle timeout
+	ICMPTimeout      time.Duration // ICMP flow idle timeout
+	PortScanWindow   int           // Max recent destination ports to track per source IP
+	PortScanMaxPorts int           // Max unique ports recorded per source IP
 }
 
 // DefaultConfig returns sensible defaults for production use.
@@ -24,9 +27,19 @@ func DefaultConfig() Config {
 	return Config{
 		MaxEntries:       65536,
 		IdleTimeout:      300 * time.Second,
-		PortScanWindow:   10,  // seconds worth of history
-		PortScanMaxPorts: 100, // max unique ports per source
+		UDPTimeout:       30 * time.Second,
+		ICMPTimeout:      5 * time.Second,
+		PortScanWindow:   10,
+		PortScanMaxPorts: 100,
 	}
+}
+
+// Stats holds cumulative connection tracking counters.
+type Stats struct {
+	Hits    int64 // Existing flow found
+	Created int64 // New flow created
+	Expired int64 // Flow expired by timeout
+	Evicted int64 // Flow evicted due to max entries
 }
 
 // Flow represents a single tracked connection with state and metrics.
@@ -82,8 +95,11 @@ type Table struct {
 	mu       sync.RWMutex
 	flows    map[flowKey]*Flow
 	cfg      Config
-	// Per-source dest port tracking for scan detection
-	srcPorts map[string][]uint16 // srcIP -> recent dest ports
+	stats    Stats
+	srcPorts map[string][]uint16 // srcIP -> recent dest ports for scan detection
+	// New connection rate tracking
+	newConns     []time.Time
+	rateMu       sync.Mutex
 }
 
 // NewTable creates a connection tracking table with the given configuration.
@@ -93,6 +109,12 @@ func NewTable(cfg Config) *Table {
 	}
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = 300 * time.Second
+	}
+	if cfg.UDPTimeout <= 0 {
+		cfg.UDPTimeout = 30 * time.Second
+	}
+	if cfg.ICMPTimeout <= 0 {
+		cfg.ICMPTimeout = 5 * time.Second
 	}
 	return &Table{
 		flows:    make(map[flowKey]*Flow),
@@ -108,6 +130,25 @@ func (t *Table) Len() int {
 	return len(t.flows)
 }
 
+// Stats returns a copy of the cumulative stats counters.
+func (t *Table) Stats() Stats {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.stats
+}
+
+// idleTimeoutFor returns the appropriate idle timeout for a given protocol.
+func (t *Table) idleTimeoutFor(protocol string) time.Duration {
+	switch protocol {
+	case "UDP":
+		return t.cfg.UDPTimeout
+	case "ICMP":
+		return t.cfg.ICMPTimeout
+	default:
+		return t.cfg.IdleTimeout
+	}
+}
+
 // LookupOrCreate finds an existing flow by 5-tuple or creates a new one.
 // Returns the flow with its packet counter already incremented.
 func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort uint16) *Flow {
@@ -118,12 +159,14 @@ func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort u
 
 	if f, ok := t.flows[key]; ok {
 		f.touch()
+		t.stats.Hits++
 		return f
 	}
 
 	// Evict if at capacity
 	if len(t.flows) >= t.cfg.MaxEntries {
 		t.evictOneLocked()
+		t.stats.Evicted++
 	}
 
 	f := &Flow{
@@ -137,7 +180,49 @@ func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort u
 		lastSeen: time.Now(),
 	}
 	t.flows[key] = f
+	t.stats.Created++
+
+	// Track new connection timestamp for rate calculation
+	t.recordNewConn()
+
 	return f
+}
+
+// recordNewConn records a new connection timestamp for rate calculation.
+func (t *Table) recordNewConn() {
+	t.rateMu.Lock()
+	defer t.rateMu.Unlock()
+	now := time.Now()
+	t.newConns = append(t.newConns, now)
+	// Prune timestamps older than 10 seconds
+	cutoff := now.Add(-10 * time.Second)
+	start := 0
+	for i, ts := range t.newConns {
+		if ts.After(cutoff) {
+			start = i
+			break
+		}
+	}
+	t.newConns = t.newConns[start:]
+	// Cap slice length
+	if len(t.newConns) > 10000 {
+		t.newConns = t.newConns[len(t.newConns)-10000:]
+	}
+}
+
+// NewConnectionRate returns the number of new connections per second (over last 10 seconds).
+func (t *Table) NewConnectionRate() float64 {
+	t.rateMu.Lock()
+	defer t.rateMu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-10 * time.Second)
+	count := 0
+	for _, ts := range t.newConns {
+		if ts.After(cutoff) {
+			count++
+		}
+	}
+	return float64(count) / 10.0
 }
 
 // Delete removes a flow by 5-tuple.
@@ -148,7 +233,27 @@ func (t *Table) Delete(srcIP, dstIP, protocol string, srcPort, dstPort uint16) {
 	delete(t.flows, key)
 }
 
-// Expire removes flows that have been idle longer than the configured timeout.
+// expireBefore removes flows that have been idle longer than the given duration.
+// This is exposed for testing. Use Expire() for production with config-based timeouts.
+func (t *Table) expireBefore(idle time.Duration) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := time.Now()
+	var expired []flowKey
+	for key, f := range t.flows {
+		if now.Sub(f.lastSeen) > idle {
+			expired = append(expired, key)
+		}
+	}
+	for _, key := range expired {
+		delete(t.flows, key)
+	}
+	t.stats.Expired += int64(len(expired))
+	return len(expired)
+}
+
+// Expire removes flows that have been idle longer than their protocol-specific timeout.
 // Returns the number of expired flows.
 func (t *Table) Expire() int {
 	t.mu.Lock()
@@ -157,13 +262,15 @@ func (t *Table) Expire() int {
 	now := time.Now()
 	var expired []flowKey
 	for key, f := range t.flows {
-		if now.Sub(f.lastSeen) > t.cfg.IdleTimeout {
+		timeout := t.idleTimeoutFor(f.Protocol)
+		if now.Sub(f.lastSeen) > timeout {
 			expired = append(expired, key)
 		}
 	}
 	for _, key := range expired {
 		delete(t.flows, key)
 	}
+	t.stats.Expired += int64(len(expired))
 	return len(expired)
 }
 
@@ -191,13 +298,11 @@ func (t *Table) RecordDestPort(srcIP string, dstPort uint16) {
 	defer t.mu.Unlock()
 
 	ports := t.srcPorts[srcIP]
-	// Deduplicate
 	for _, p := range ports {
 		if p == dstPort {
 			return
 		}
 	}
-	// Cap at max
 	if len(ports) >= t.cfg.PortScanMaxPorts {
 		return
 	}

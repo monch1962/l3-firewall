@@ -5,7 +5,6 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"time"
@@ -41,6 +40,7 @@ func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/health", a.handleHealth)
 	mux.HandleFunc("/admin/stats", a.requireAuth(a.handleStats))
+	mux.HandleFunc("/admin/blocks", a.requireAuth(a.handleBlocks))
 	mux.HandleFunc("/admin/rules", a.requireAuth(a.handleGetRules))
 	mux.HandleFunc("/admin/rules/update", a.requireAuth(a.handleUpdateRules))
 	return mux
@@ -74,21 +74,37 @@ func (a *API) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "ok",
-		"version": a.version,
-		"uptime":  time.Since(a.started).String(),
+		"status":         "ok",
+		"version":        a.version,
+		"uptime":         time.Since(a.started).String(),
+		"engine_running": a.engine.Running(),
 	})
 }
 
 func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := a.engine.Stats()
+	ctStats := a.engine.ConntrackStats()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"packets_processed": stats.PacketsProcessed,
-		"packets_allowed":   stats.PacketsAllowed,
-		"packets_blocked":   stats.PacketsBlocked,
-		"uptime":            time.Since(a.started).String(),
-		"version":           a.version,
+		"packets_processed":  stats.PacketsProcessed,
+		"packets_allowed":    stats.PacketsAllowed,
+		"packets_blocked":    stats.PacketsBlocked,
+		"conntrack_entries":  json.Number(fmt.Sprintf("%d", ctStats.Created)),
+		"conntrack_expired":  json.Number(fmt.Sprintf("%d", ctStats.Expired)),
+		"conntrack_evicted":  json.Number(fmt.Sprintf("%d", ctStats.Evicted)),
+		"engine_running":     a.engine.Running(),
+		"uptime":             time.Since(a.started).String(),
+		"version":            a.version,
 	})
+}
+
+func (a *API) handleBlocks(w http.ResponseWriter, r *http.Request) {
+	blocks := a.engine.RecentBlocks()
+	w.Header().Set("Content-Type", "application/json")
+	if blocks == nil {
+		json.NewEncoder(w).Encode([]engine.BlockLogEntry{})
+		return
+	}
+	json.NewEncoder(w).Encode(blocks)
 }
 
 func (a *API) handleGetRules(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +122,6 @@ func (a *API) handleUpdateRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply body limit to prevent OOM from oversized payloads
 	r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
 
 	var params map[string]interface{}
@@ -143,6 +158,3 @@ func (a *API) StartServer(addr string) *http.Server {
 	}()
 	return srv
 }
-
-// Suppress unused import warning
-var _ = log.Println

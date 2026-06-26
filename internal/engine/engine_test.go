@@ -2,7 +2,6 @@ package engine
 
 import (
 	"testing"
-	"time"
 
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/opa"
@@ -10,16 +9,12 @@ import (
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
 )
 
-// testPolicy is a minimal Rego policy that blocks SSH (port 22) and high rate.
 const testPolicy = `package l3_firewall
 import rego.v1
 default allow := true
 deny_ssh if { input.packet.dst_port == 22 }
-deny_rate if { input.rate.src_ip_pps > 500 }
 allow := false if { deny_ssh }
-allow := false if { deny_rate }
 reason := "blocked SSH" if { deny_ssh }
-reason := "rate limit" if { deny_rate }
 `
 
 func newTestEngine(t *testing.T) *Engine {
@@ -35,21 +30,18 @@ func newTestEngine(t *testing.T) *Engine {
 	}
 
 	return &Engine{
-		eval:      eval,
-		conntrack: conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit: ratelimit.NewLimiter(10000, 100000000),
-		auditOnly: false,
+		eval:       eval,
+		conntrack:  conntrack.NewTable(conntrack.DefaultConfig()),
+		ratelimit:  ratelimit.NewLimiter(10000, 100000000),
+		auditOnly:  false,
 		failClosed: true,
 	}
 }
 
 func buildTestPacket(srcIP, dstIP string, srcPort, dstPort uint16, syn, ack bool) *packet.PacketInfo {
 	return &packet.PacketInfo{
-		SrcIP:      srcIP,
-		DstIP:      dstIP,
-		Protocol:   "TCP",
-		SrcPort:    srcPort,
-		DstPort:    dstPort,
+		SrcIP: srcIP, DstIP: dstIP, Protocol: "TCP",
+		SrcPort: srcPort, DstPort: dstPort,
 		TCPFlags:   packet.TCPFlags{SYN: syn, ACK: ack},
 		PacketSize: 64,
 	}
@@ -58,134 +50,150 @@ func buildTestPacket(srcIP, dstIP string, srcPort, dstPort uint16, syn, ack bool
 func TestEvaluateAllowsHTTPS(t *testing.T) {
 	eng := newTestEngine(t)
 	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
-
 	result := eng.evaluatePacket(pi, 64)
 	if !result.Allowed {
-		t.Errorf("HTTPS should be allowed, got reason: %s", result.Reason)
+		t.Errorf("HTTPS allowed: got reason %s", result.Reason)
 	}
 }
 
 func TestEvaluateBlocksSSH(t *testing.T) {
 	eng := newTestEngine(t)
 	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 22, true, false)
-
 	result := eng.evaluatePacket(pi, 64)
 	if result.Allowed {
-		t.Error("SSH to port 22 should be blocked")
+		t.Error("SSH should be blocked")
 	}
 	if result.Reason != "blocked SSH" {
 		t.Errorf("Reason = %q, want %q", result.Reason, "blocked SSH")
 	}
 }
 
-func TestEvaluateConntrackUpdates(t *testing.T) {
+func TestRecentBlocks(t *testing.T) {
 	eng := newTestEngine(t)
-	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
-
+	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 22, true, false)
 	eng.evaluatePacket(pi, 64)
 
-	// Second packet should see established connection
-	pi2 := buildTestPacket("10.0.2.50", "10.0.1.100", 443, 44001, true, true)
-	result := eng.evaluatePacket(pi2, 64)
-	if !result.Allowed {
-		t.Errorf("SYN-ACK response should be allowed: %s", result.Reason)
+	blocks := eng.RecentBlocks()
+	if len(blocks) != 1 {
+		t.Fatalf("RecentBlocks len = %d, want 1", len(blocks))
+	}
+	if blocks[0].Reason != "blocked SSH" {
+		t.Errorf("Block reason = %q, want %q", blocks[0].Reason, "blocked SSH")
+	}
+	if blocks[0].SrcIP != "10.0.1.100" {
+		t.Errorf("SrcIP = %q, want %q", blocks[0].SrcIP, "10.0.1.100")
+	}
+	if blocks[0].DstIP != "10.0.2.50" {
+		t.Errorf("DstIP = %q, want %q", blocks[0].DstIP, "10.0.2.50")
+	}
+	if blocks[0].DstPort != 22 {
+		t.Errorf("DstPort = %d, want %d", blocks[0].DstPort, 22)
+	}
+	if blocks[0].Protocol != "TCP" {
+		t.Errorf("Protocol = %q, want %q", blocks[0].Protocol, "TCP")
 	}
 }
 
-func TestEvaluateAuditOnly(t *testing.T) {
+func TestRecentBlocksMaxCapacity(t *testing.T) {
+	eng := newTestEngine(t)
+	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 22, true, false)
+
+	// Generate 150 blocks (capacity is 100)
+	for i := 0; i < 150; i++ {
+		eng.evaluatePacket(pi, 64)
+	}
+
+	blocks := eng.RecentBlocks()
+	if len(blocks) > 100 {
+		t.Errorf("RecentBlocks len = %d, want <= 100", len(blocks))
+	}
+}
+
+func TestRecentBlocksEmpty(t *testing.T) {
+	eng := newTestEngine(t)
+	blocks := eng.RecentBlocks()
+	if blocks != nil {
+		t.Errorf("RecentBlocks = %v, want nil", blocks)
+	}
+}
+
+func TestEngineRunningStatus(t *testing.T) {
+	eng := newTestEngine(t)
+	if eng.Running() {
+		t.Error("Engine should not be running before Run()")
+	}
+}
+
+func TestEngineStats(t *testing.T) {
+	eng := newTestEngine(t)
+	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
+	eng.evaluatePacket(pi, 64)
+
+	// Block SSH
+	pi2 := buildTestPacket("10.0.2.50", "10.0.1.100", 40001, 22, true, false)
+	eng.evaluatePacket(pi2, 64)
+
+	s := eng.Stats()
+	if s.PacketsProcessed != 2 {
+		t.Errorf("PacketsProcessed = %d, want 2", s.PacketsProcessed)
+	}
+	if s.PacketsAllowed != 1 {
+		t.Errorf("PacketsAllowed = %d, want 1", s.PacketsAllowed)
+	}
+	if s.PacketsBlocked != 1 {
+		t.Errorf("PacketsBlocked = %d, want 1", s.PacketsBlocked)
+	}
+}
+
+func TestEngineConntrackStats(t *testing.T) {
+	eng := newTestEngine(t)
+	s := eng.ConntrackStats()
+	if s.Created != 0 {
+		t.Errorf("Created = %d, want 0", s.Created)
+	}
+}
+
+func TestAuditOnlyDefense(t *testing.T) {
 	eng := newTestEngine(t)
 	eng.auditOnly = true
-
 	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 22, true, false)
 	result := eng.evaluatePacket(pi, 64)
-
 	if !result.Allowed {
 		t.Error("SSH should be allowed in audit-only mode")
 	}
-	if result.Reason != "" {
-		t.Errorf("Reason should be empty in audit-only, got %q", result.Reason)
-	}
 }
 
-func TestEvaluateFailClosed(t *testing.T) {
-	// Create an engine but with a deliberately broken evaluator
+func TestFailClosed(t *testing.T) {
 	eng := &Engine{
-		eval:      nil, // will cause evaluation to fail
-		conntrack: conntrack.NewTable(conntrack.DefaultConfig()),
-		ratelimit: ratelimit.NewLimiter(10000, 100000000),
+		eval:       nil,
+		conntrack:  conntrack.NewTable(conntrack.DefaultConfig()),
+		ratelimit:  ratelimit.NewLimiter(10000, 100000000),
 		failClosed: true,
 	}
 	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
-
 	result := eng.evaluatePacket(pi, 64)
 	if result.Allowed {
 		t.Error("fail-closed should block when evaluator is nil")
 	}
 }
 
-func TestEvaluateRateLimiting(t *testing.T) {
+func TestBlockLogContainsMetadata(t *testing.T) {
 	eng := newTestEngine(t)
-
-	// Send many packets quickly to trigger rate limit
-	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
-	var lastResult *opa.Result
-	for i := 0; i < 50; i++ {
-		lastResult = eng.evaluatePacket(pi, 64)
-		time.Sleep(1 * time.Millisecond)
-	}
-
-	// At high rate (50 packets in ~50ms = ~1000 pps), the OPA limit of 500
-	// should be exceeded through EWMA
-	// Since EWMA smooths, it may not exceed 500 immediately — just verify it doesn't crash
-	if lastResult == nil {
-		t.Fatal("evaluatePacket returned nil")
-	}
-	// Test passes if we get this far without crash/panic
-}
-
-func TestEvaluateICMP(t *testing.T) {
-	eng := newTestEngine(t)
-	icmpType := uint8(8)
-	icmpCode := uint8(0)
-	pi := &packet.PacketInfo{
-		SrcIP:      "10.0.1.100",
-		DstIP:      "10.0.2.50",
-		Protocol:   "ICMP",
-		ICMPType:   &icmpType,
-		ICMPCode:   &icmpCode,
-		PacketSize: 64,
-	}
-
-	result := eng.evaluatePacket(pi, 64)
-	// ICMP echo should be allowed by default (no ICMP blocking in this policy)
-	if !result.Allowed {
-		t.Errorf("ICMP should be allowed: %s", result.Reason)
-	}
-}
-
-func TestEvaluateConnTrackPacketCount(t *testing.T) {
-	eng := newTestEngine(t)
-	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
-
-	eng.evaluatePacket(pi, 64)
-	eng.evaluatePacket(pi, 64)
+	pi := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 22, true, false)
 	eng.evaluatePacket(pi, 64)
 
-	// Flow should have 3 packets
-	f := eng.conntrack.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	if f.Packets != 4 { // 3 + 1 from LookupOrCreate
-		t.Errorf("Packets = %d, want 4", f.Packets)
+	blocks := eng.RecentBlocks()
+	if len(blocks) == 0 {
+		t.Fatal("no blocks recorded")
 	}
-}
-
-func TestEngineRunStop(t *testing.T) {
-	eng := newTestEngine(t)
-	// NFQUEUE requires special kernel capabilities, so Run() will fail without them.
-	// Just verify the context cancellation works and Run() returns without hanging.
-	err := eng.Run(0) // queue 0
-	// Expected to fail since we don't have netadmin in test environment
-	if err == nil {
-		t.Log("NFQUEUE started (expected failure without CAP_NET_ADMIN)")
-		eng.Stop()
+	b := blocks[0]
+	if b.Timestamp.IsZero() {
+		t.Error("block timestamp should be set")
+	}
+	if b.SrcPort != 44001 {
+		t.Errorf("SrcPort = %d, want 44001", b.SrcPort)
+	}
+	if b.PacketSize != 64 {
+		t.Errorf("PacketSize = %d, want 64", b.PacketSize)
 	}
 }

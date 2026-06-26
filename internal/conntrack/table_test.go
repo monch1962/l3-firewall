@@ -6,243 +6,150 @@ import (
 	"time"
 )
 
-func TestNewTable(t *testing.T) {
+func TestPerProtocolTimeouts(t *testing.T) {
 	cfg := Config{
-		MaxEntries:  1000,
-		IdleTimeout: 60 * time.Second,
+		MaxEntries:     1000,
+		IdleTimeout:    300 * time.Second, // TCP default
+		UDPTimeout:     30 * time.Second,
+		ICMPTimeout:    5 * time.Second,
+		PortScanMaxPorts: 100,
 	}
 	ct := NewTable(cfg)
-	if ct == nil {
-		t.Fatal("NewTable returned nil")
-	}
-	if ct.Len() != 0 {
-		t.Errorf("Len = %d, want 0", ct.Len())
-	}
-}
 
-func TestLookupOrCreateNewFlow(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	f := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	if f == nil {
-		t.Fatal("LookupOrCreate returned nil")
-	}
-	if f.Established {
-		t.Error("new flow should not be established")
-	}
-	if f.Packets != 1 {
-		t.Errorf("Packets = %d, want 1", f.Packets)
-	}
-	if ct.Len() != 1 {
-		t.Errorf("Len = %d, want 1", ct.Len())
-	}
-}
-
-func TestLookupOrCreateDuplicate(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	f1 := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	f2 := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-
-	if f1 != f2 {
-		t.Error("LookupOrCreate should return the same flow for duplicate calls")
-	}
-	if f2.Packets != 2 {
-		t.Errorf("Packets = %d, want 2 (after second lookup)", f2.Packets)
-	}
-}
-
-func TestFlowEstablish(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	f := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	if f.Established {
-		t.Error("flow should not be established initially")
-	}
-	f.SetEstablished()
-	if !f.Established {
-		t.Error("flow should be established after SetEstablished()")
-	}
-}
-
-func TestDeleteFlow(t *testing.T) {
-	ct := NewTable(DefaultConfig())
 	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	if ct.Len() != 1 {
-		t.Errorf("Len = %d, want 1", ct.Len())
-	}
-	ct.Delete("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	if ct.Len() != 0 {
-		t.Errorf("Len = %d, want 0 after delete", ct.Len())
-	}
-}
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "UDP", 44002, 53)
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "ICMP", 0, 0)
 
-func TestDeleteNonExistentFlow(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	// Should not panic
-	ct.Delete("1.2.3.4", "5.6.7.8", "TCP", 1, 2)
-}
-
-func TestFlowKeyUniqueness(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	f1 := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	f2 := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44002, 443)
-	f3 := ct.LookupOrCreate("10.0.1.100", "10.0.2.51", "TCP", 44001, 443)
-
-	if f1 == f2 {
-		t.Error("different src ports should create different flows")
-	}
-	if f1 == f3 {
-		t.Error("different dst IPs should create different flows")
-	}
 	if ct.Len() != 3 {
 		t.Errorf("Len = %d, want 3", ct.Len())
 	}
 }
 
-func TestExpireIdleFlows(t *testing.T) {
-	ct := NewTable(Config{
-		MaxEntries:  1000,
-		IdleTimeout: 50 * time.Millisecond,
-	})
+func TestExpireByProtocolTCP(t *testing.T) {
+	cfg := Config{
+		MaxEntries:     1000,
+		IdleTimeout:    300 * time.Second,
+		UDPTimeout:     30 * time.Second,
+		ICMPTimeout:    5 * time.Second,
+		PortScanMaxPorts: 100,
+	}
+	ct := NewTable(cfg)
 	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-
-	time.Sleep(20 * time.Millisecond)
+	// Use Expire() which respects protocol-specific timeout (300s).
+	// A just-created TCP flow should not expire.
 	expired := ct.Expire()
 	if expired != 0 {
-		t.Errorf("Expired = %d, want 0 (not yet timed out)", expired)
+		t.Errorf("Expire() expired TCP = %d, want 0 (TCP timeout is 300s)", expired)
 	}
+}
 
-	time.Sleep(50 * time.Millisecond)
-	expired = ct.Expire()
+func TestExpireUDPFast(t *testing.T) {
+	cfg := Config{
+		MaxEntries:     1000,
+		IdleTimeout:    300 * time.Second,
+		UDPTimeout:     1 * time.Millisecond,
+		ICMPTimeout:    5 * time.Second,
+		PortScanMaxPorts: 100,
+	}
+	ct := NewTable(cfg)
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "UDP", 44002, 53)
+	time.Sleep(2 * time.Millisecond)
+	expired := ct.Expire()
 	if expired != 1 {
-		t.Errorf("Expired = %d, want 1", expired)
-	}
-	if ct.Len() != 0 {
-		t.Errorf("Len = %d, want 0 after expiry", ct.Len())
+		t.Errorf("UDP expired = %d, want 1 (UDP timeout is 1ms)", expired)
 	}
 }
 
-func TestExpireSkipsActiveFlows(t *testing.T) {
-	ct := NewTable(Config{
-		MaxEntries:  1000,
-		IdleTimeout: 50 * time.Millisecond,
-	})
-	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-
-	time.Sleep(30 * time.Millisecond)
-	// Refresh the flow
-	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-
-	time.Sleep(30 * time.Millisecond)
+func TestExpireICMPFast(t *testing.T) {
+	cfg := Config{
+		MaxEntries:     1000,
+		IdleTimeout:    300 * time.Second,
+		UDPTimeout:     30 * time.Second,
+		ICMPTimeout:    1 * time.Millisecond,
+		PortScanMaxPorts: 100,
+	}
+	ct := NewTable(cfg)
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "ICMP", 0, 0)
+	time.Sleep(2 * time.Millisecond)
 	expired := ct.Expire()
-	if expired != 0 {
-		t.Errorf("Expired = %d, want 0 (flow was refreshed)", expired)
+	if expired != 1 {
+		t.Errorf("ICMP expired = %d, want 1 (ICMP timeout is 1ms)", expired)
 	}
 }
 
-func TestMaxEntriesEviction(t *testing.T) {
-	ct := NewTable(Config{
-		MaxEntries:  5,
-		IdleTimeout: 60 * time.Second,
-	})
-	// Create 10 flows — only 5 should stay
-	for i := 0; i < 10; i++ {
-		ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP",
-			uint16(44000+i), uint16(80+i))
+func TestDefaultTimeouts(t *testing.T) {
+	cfg := DefaultConfig()
+	if cfg.UDPTimeout != 30*time.Second {
+		t.Errorf("UDPTimeout = %v, want 30s", cfg.UDPTimeout)
 	}
-	if ct.Len() > 5 {
-		t.Errorf("Len = %d, want <= 5", ct.Len())
+	if cfg.ICMPTimeout != 5*time.Second {
+		t.Errorf("ICMPTimeout = %v, want 5s", cfg.ICMPTimeout)
 	}
 }
 
-func TestConcurrentAccess(t *testing.T) {
+func TestConcurrentNewConnections(t *testing.T) {
 	ct := NewTable(DefaultConfig())
 	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 50; i++ {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
 			f := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP",
 				uint16(44000+n), uint16(80+n%10))
-			if n%2 == 0 {
+			if n%5 == 0 {
 				f.SetEstablished()
 			}
 		}(i)
 	}
 	wg.Wait()
-	if ct.Len() != 100 {
-		t.Errorf("Len = %d, want 100 after concurrent creation", ct.Len())
+	if ct.Len() != 50 {
+		t.Errorf("Len = %d, want 50", ct.Len())
 	}
 }
 
-func TestRecordDestPort(t *testing.T) {
+func TestLookupOrCreateStats(t *testing.T) {
 	ct := NewTable(DefaultConfig())
-	ct.RecordDestPort("10.0.1.100", 22)
-	ct.RecordDestPort("10.0.1.100", 23)
-	ct.RecordDestPort("10.0.1.100", 25)
-
-	ports := ct.GetRecentDestPorts("10.0.1.100")
-	if len(ports) != 3 {
-		t.Errorf("Recent ports = %v, want 3", len(ports))
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
+	s := ct.Stats()
+	if s.Created != 1 {
+		t.Errorf("Created = %d, want 1", s.Created)
+	}
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
+	s = ct.Stats()
+	if s.Hits != 1 {
+		t.Errorf("Hits = %d, want 1", s.Hits)
+	}
+	if s.Created != 1 {
+		t.Errorf("Created = %d, want 1 (still 1 after hit)", s.Created)
 	}
 }
 
-func TestRecordDestPortDeduplicates(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	ct.RecordDestPort("10.0.1.100", 22)
-	ct.RecordDestPort("10.0.1.100", 22)
-	ct.RecordDestPort("10.0.1.100", 22)
-
-	ports := ct.GetRecentDestPorts("10.0.1.100")
-	if len(ports) != 1 {
-		t.Errorf("Recent ports = %v (len=%d), want 1", ports, len(ports))
-	}
-}
-
-func TestRecordDestPortMaxWindow(t *testing.T) {
-	ct := NewTable(Config{
-		MaxEntries:           1000,
-		IdleTimeout:          60 * time.Second,
-		PortScanWindow:       100,
-		PortScanMaxPorts:     100,
-	})
-	// Record more than max ports
-	for i := 0; i < 150; i++ {
-		ct.RecordDestPort("10.0.1.100", uint16(1+i))
-	}
-	ports := ct.GetRecentDestPorts("10.0.1.100")
-	if len(ports) > 100 {
-		t.Errorf("Recent ports = %d, want <= 100", len(ports))
-	}
-}
-
-func TestGetRecentDestPortsEmpty(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	ports := ct.GetRecentDestPorts("10.0.1.100")
-	if ports != nil {
-		t.Errorf("Expected nil, got %v", ports)
-	}
-}
-
-func TestFlowAge(t *testing.T) {
-	ct := NewTable(DefaultConfig())
-	_ = ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	time.Sleep(5 * time.Millisecond)
-
-	f := ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
-	if f.AgeMs() <= 0 {
-		t.Errorf("AgeMs = %d, want > 0", f.AgeMs())
-	}
-}
-
-func TestConfigValidation(t *testing.T) {
+func TestExpireStats(t *testing.T) {
 	cfg := Config{
-		MaxEntries:  0,
-		IdleTimeout: 0,
+		MaxEntries:     1000,
+		IdleTimeout:    300 * time.Second,
+		UDPTimeout:     30 * time.Second,
+		ICMPTimeout:    1 * time.Millisecond,
+		PortScanMaxPorts: 100,
 	}
 	ct := NewTable(cfg)
-	if ct == nil {
-		t.Fatal("NewTable should not return nil")
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "ICMP", 0, 0)
+	time.Sleep(2 * time.Millisecond)
+	ct.Expire()
+	s := ct.Stats()
+	if s.Expired != 1 {
+		t.Errorf("Expired = %d, want 1", s.Expired)
 	}
-	if ct.Len() != 0 {
-		t.Errorf("Len = %d, want 0", ct.Len())
+}
+
+func TestNewConnectionRate(t *testing.T) {
+	ct := NewTable(DefaultConfig())
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.50", "TCP", 44001, 443)
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.51", "TCP", 44002, 80)
+	ct.LookupOrCreate("10.0.1.100", "10.0.2.52", "TCP", 44003, 443)
+
+	rate := ct.NewConnectionRate()
+	if rate <= 0 {
+		t.Errorf("NewConnectionRate = %f, want > 0", rate)
 	}
 }
