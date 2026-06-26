@@ -3,6 +3,7 @@ package admin
 
 import (
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -125,31 +126,63 @@ func (a *API) handlePolicyReload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"use POST"}`, http.StatusMethodNotAllowed)
 		return
 	}
-
-	// Trigger hot-reload via file watcher (read the latest policy from disk)
-	// The reload is handled by the file watcher in cmd/server. This endpoint
-	// just logs the request; the actual reload happens on file change detection.
 	slog.Info("admin API: policy reload requested (file watcher handles the reload)")
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "reload triggered"})
 }
 
-// StartServer starts the admin HTTP server in a goroutine.
+// StartServer starts the admin HTTP server in a goroutine (plain HTTP).
 func (a *API) StartServer(addr string) *http.Server {
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           a.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       30 * time.Second,
-	}
+	srv := newServer(addr, a.Handler())
 	go func() {
-		slog.Info("admin API listening", "addr", addr)
+		slog.Info("admin API listening", "addr", addr, "tls", false)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("admin API error", "error", err)
 		}
 	}()
 	return srv
+}
+
+// StartServerTLS starts the admin HTTP server with TLS in a goroutine.
+// If certFile or keyFile is empty, falls back to plain HTTP.
+// Returns the server and the actual listening address.
+func (a *API) StartServerTLS(addr, certFile, keyFile string) (*http.Server, string, error) {
+	if certFile == "" || keyFile == "" {
+		srv := a.StartServer(addr)
+		return srv, srv.Addr, nil
+	}
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		slog.Error("admin API: failed to load TLS cert", "error", err)
+		srv := a.StartServer(addr)
+		return srv, srv.Addr, nil
+	}
+	// Create listener first to get the actual port
+	listener, err := tls.Listen("tcp", addr, &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("TLS listen: %w", err)
+	}
+	srv := newServer("", a.Handler())
+	go func() {
+		slog.Info("admin API listening", "addr", listener.Addr().String(), "tls", true)
+		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
+			slog.Error("admin API error", "error", err)
+		}
+	}()
+	return srv, listener.Addr().String(), nil
+}
+
+// newServer creates an *http.Server with sensible timeouts.
+func newServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
 }
