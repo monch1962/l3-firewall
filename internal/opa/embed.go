@@ -15,8 +15,9 @@ import (
 
 // EmbedConfig configures the in-process OPA evaluator.
 type EmbedConfig struct {
-	Policy string     // Rego policy source code
-	Store  *DataStore // Parameters data store
+	Policy  string        // Rego policy source code
+	Store   *DataStore    // Parameters data store
+	Timeout time.Duration // Evaluation timeout (0 = default 500ms)
 }
 
 // EmbeddedEvaluator evaluates Rego policies in-process using the OPA Go library.
@@ -26,6 +27,7 @@ type EmbeddedEvaluator struct {
 	compiler    *ast.Compiler
 	store       storage.Store
 	opaStore    *DataStore
+	evalTimeout time.Duration
 }
 
 // NewEmbedded creates an EmbeddedEvaluator from a Rego policy string.
@@ -46,9 +48,10 @@ func NewEmbedded(cfg EmbedConfig) (*EmbeddedEvaluator, error) {
 	}
 
 	e := &EmbeddedEvaluator{
-		compiler: compiler,
-		store:    inmem.New(),
-		opaStore: cfg.Store,
+		compiler:    compiler,
+		store:       inmem.New(),
+		opaStore:    cfg.Store,
+		evalTimeout: cfg.Timeout,
 	}
 
 	if err := e.rebuild(); err != nil {
@@ -85,9 +88,13 @@ func (e *EmbeddedEvaluator) rebuild() error {
 }
 
 // Evaluate executes the Rego policy against the given input and returns the result.
-// Evaluation time is typically ~10µs for cached/prepared policies.
+// The timeout is configurable via EmbedConfig.Timeout (default 500ms).
 func (e *EmbeddedEvaluator) Evaluate(input *Input) (*Result, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	timeout := e.evalTimeout
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	e.mu.RLock()

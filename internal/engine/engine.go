@@ -22,6 +22,7 @@ import (
 )
 
 const maxRecentBlocks = 100
+const maxBlockStatsReasons = 256 // Cap unique deny reasons to prevent memory exhaustion
 
 // BlockLogEntry records a single blocked packet for the admin API.
 type BlockLogEntry struct {
@@ -143,15 +144,30 @@ func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
 	}
 	e.recentBlocks = append(e.recentBlocks, entry)
 
-	// Per-reason counter
+	// Per-reason counter (capped to prevent memory exhaustion)
 	e.blockStatsMu.Lock()
-	e.blockStats[reason]++
+	if len(e.blockStats) < maxBlockStatsReasons {
+		e.blockStats[reason]++
+	}
 	e.blockStatsMu.Unlock()
 }
 
 // evaluatePacket runs the full firewall evaluation pipeline on a parsed packet.
-// Returns the OPA result (Allowed + Reason).
-func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Result {
+// Returns the OPA result (Allowed + Reason). Panics are recovered and
+// returned as blocked results (fail-closed).
+func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *opa.Result) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			e.packetsProcessed++
+			e.packetsBlocked++
+			result = &opa.Result{
+				Allowed: false,
+				Reason:  fmt.Sprintf("internal error: %v", rec),
+			}
+			slog.Error("panic in evaluatePacket", "panic", fmt.Sprintf("%v", rec))
+		}
+	}()
+
 	e.packetsProcessed++
 
 	// 1. Connection tracking with TCP state machine
@@ -233,8 +249,17 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 	return result
 }
 
-// packetHandler is the NFQUEUE callback.
+// packetHandler is the NFQUEUE callback with panic recovery.
 func (e *Engine) packetHandler(attr nfqueue.Attribute) int {
+	defer func() {
+		if rec := recover(); rec != nil {
+			e.packetsProcessed++
+			e.packetsAllowed++
+			slog.Error("panic recovered in packet handler",
+				"panic", fmt.Sprintf("%v", rec))
+		}
+	}()
+
 	if attr.Payload == nil || attr.PacketID == nil {
 		return 0
 	}

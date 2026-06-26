@@ -21,21 +21,24 @@ type rateKey string
 
 // Limiter provides per-IP and per-destination-port packet and byte rate tracking.
 // Uses EWMA so the reported rate smoothly decays after activity stops.
+// Bounded at MaxEntries to prevent memory exhaustion.
 type Limiter struct {
-	mu        sync.RWMutex
-	buckets   map[rateKey]*rateBucket
-	ppsLimit  float64
-	bpsLimit  float64
-	alpha     float64
+	mu         sync.RWMutex
+	buckets    map[rateKey]*rateBucket
+	ppsLimit   float64
+	bpsLimit   float64
+	alpha      float64
+	MaxEntries int // Maximum entries before eviction (0 = unlimited)
 }
 
-// NewLimiter creates a rate limiter.
+// NewLimiter creates a rate limiter with sensible defaults.
 func NewLimiter(ppsLimit, bpsLimit float64) *Limiter {
 	return &Limiter{
-		buckets:  make(map[rateKey]*rateBucket),
-		ppsLimit: ppsLimit,
-		bpsLimit: bpsLimit,
-		alpha:    0.3,
+		buckets:    make(map[rateKey]*rateBucket),
+		ppsLimit:   ppsLimit,
+		bpsLimit:   bpsLimit,
+		alpha:      0.3,
+		MaxEntries: 100000, // Default cap prevents memory exhaustion
 	}
 }
 
@@ -78,9 +81,26 @@ func (l *Limiter) updateBucket(b *rateBucket, packetSize int, now time.Time) (pp
 }
 
 // getOrCreateBucket returns the bucket for a key, creating it if needed.
+// If MaxEntries is set and the map is at capacity, evicts one random entry.
 func (l *Limiter) getOrCreateBucket(key rateKey, now time.Time) *rateBucket {
 	b, ok := l.buckets[key]
 	if !ok {
+		if l.MaxEntries > 0 && len(l.buckets) >= l.MaxEntries {
+			// Evict oldest entry
+			var oldestKey rateKey
+			var oldestTime time.Time
+			first := true
+			for k, v := range l.buckets {
+				if first || v.lastTime.Before(oldestTime) {
+					oldestKey = k
+					oldestTime = v.lastTime
+					first = false
+				}
+			}
+			if !first {
+				delete(l.buckets, oldestKey)
+			}
+		}
 		b = &rateBucket{lastTime: now}
 		l.buckets[key] = b
 	}
