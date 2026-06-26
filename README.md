@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **14 attack categories** with **67 Go tests** and **52 Rego tests** (**119 total**) across 7 internal packages:
+l3-firewall's OPA Rego policies cover **14 attack categories** with **75 Go tests** and **52 Rego tests** (**127 total**) across 7 internal packages + 8 red-team security tests:
 
 ### OPA Policy Coverage (14 categories)
 
@@ -32,6 +32,19 @@ l3-firewall's OPA Rego policies cover **14 attack categories** with **67 Go test
 | 12 | **Source Port Filtering** — Block traffic from specific source ports | `port_in_ranges(src_port, blocked_ports)` | ✅ |
 | 13 | **New Connection Rate** — Too many new flows from one source | `new_conns_per_sec` threshold | ✅ |
 | 14 | **Per-Port Rate Limit** — Too much traffic to a specific dst port | `src_port_pps` threshold | ✅ |
+
+### Red-Team Verified Transport Protection (8 attack simulation tests)
+
+| # | Attack Vector | Defense | Status |
+|---|---|---|---|
+| R1 | **Block stats map unbounded** — Unique deny reasons exhaust memory | Capped at 256 entries | ✅ |
+| R2 | **Rate limiter map unbounded** — Unique IPs exhaust memory | Capped at 100k entries, oldest-evicted | ✅ |
+| R3 | **Engine panic crash** — Uncaught panic kills process | `recover()` in packetHandler + evaluatePacket | ✅ |
+| R4 | **Port rate limiter unbounded** — IP:port combos exhaust memory | Same MaxEntries cap as R2 | ✅ |
+| R5 | **OPA timeout hardcoded** — Cannot adjust for workload | `EmbedConfig.Timeout` (0 = 500ms default) | ✅ |
+| R6 | **Concurrent block stats race** — Race on map writes | Protected by `sync.RWMutex` | ✅ |
+| R7 | **Block stats reason flood** — Many unique reasons | Cap prevents new entries after 256 | ✅ |
+| R8 | **Rate limiter burst gap** — 60s cleanup window OOM | MaxEntries eviction handles bursts | ✅ |
 
 ### Verified Test Coverage (67 Go tests, 52 Rego tests)
 
@@ -182,6 +195,10 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | OPA fail-closed | `--opa-fail-closed` | Bypass via OPA DoS |
 | Audit-only mode | `--opa-audit-only` | Safe data collection before enforcement |
 | Deny-override model | Default `allow := true` | Safe phased rollout |
+| Rate limiter map cap | MaxEntries eviction (oldest-first) | Memory exhaustion from unique IPs |
+| Block stats reason cap | 256 unique deny reasons max | Memory exhaustion from reason flooding |
+| Engine panic recovery | defer/recover in packetHandler + evaluatePacket | Process crash from unexpected panics |
+| Configurable OPA timeout | EmbedConfig.Timeout (0=500ms default) | Workload-specific timeout tuning |
 | TCP FSM tracking | 9-state machine (SYN→ESTABLISHED→FIN→CLOSED) | Connection state violation, evasive handshakes |
 | Fragmentation detection | Parse IPv4 FragOffset + MoreFragments | Fragment-based evasion (overlap, tiny fragment) |
 | CIDR subnet matching | `net.cidr_contains` | Real subnet filtering (not string match) |
