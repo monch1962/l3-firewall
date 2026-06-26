@@ -126,8 +126,15 @@ func (e *EmbeddedEvaluator) Evaluate(input *Input) (*Result, error) {
 				switch a := allowed.(type) {
 				case bool:
 					result.Allowed = a
+				case string:
+					result.Allowed = a == "true" || a == "1"
 				case json.Number:
-					result.Allowed = a.String() == "true"
+					n, err := a.Float64()
+					if err == nil {
+						result.Allowed = n != 0
+					}
+				case nil:
+					result.Allowed = false
 				}
 			}
 			if reason, ok := val["reason"]; ok {
