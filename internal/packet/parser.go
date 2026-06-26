@@ -18,23 +18,27 @@ type TCPFlags struct {
 
 // FragmentInfo holds IP fragmentation information.
 type FragmentInfo struct {
-	IsFragment bool `json:"is_fragment"`
+	IsFragment    bool `json:"is_fragment"`
 	MoreFragments bool `json:"more_fragments"`
-	Offset    int  `json:"offset"` // fragment offset in 8-byte units
+	Offset        int  `json:"offset"` // fragment offset in 8-byte units
 }
+
+// IPv6ExtHeaderType is a string representation of an IPv6 extension header.
+type IPv6ExtHeaderType string
 
 // PacketInfo holds all parsed fields from a single L3/L4 packet.
 type PacketInfo struct {
-	SrcIP      string       `json:"src_ip"`
-	DstIP      string       `json:"dst_ip"`
-	Protocol   string       `json:"protocol"` // "TCP", "UDP", "ICMP", etc.
-	SrcPort    uint16       `json:"src_port"`  // 0 for non-TCP/UDP
-	DstPort    uint16       `json:"dst_port"`  // 0 for non-TCP/UDP
-	TCPFlags   TCPFlags     `json:"tcp_flags"`
-	ICMPType   *uint8       `json:"icmp_type"`  // nil for non-ICMP
-	ICMPCode   *uint8       `json:"icmp_code"`  // nil for non-ICMP
-	Fragment   FragmentInfo `json:"fragment"`
-	PacketSize int          `json:"packet_size"`
+	SrcIP         string             `json:"src_ip"`
+	DstIP         string             `json:"dst_ip"`
+	Protocol      string             `json:"protocol"` // "TCP", "UDP", "ICMP", etc.
+	SrcPort       uint16             `json:"src_port"`  // 0 for non-TCP/UDP
+	DstPort       uint16             `json:"dst_port"`  // 0 for non-TCP/UDP
+	TCPFlags      TCPFlags           `json:"tcp_flags"`
+	ICMPType      *uint8             `json:"icmp_type"`  // nil for non-ICMP
+	ICMPCode      *uint8             `json:"icmp_code"`  // nil for non-ICMP
+	Fragment      FragmentInfo       `json:"fragment"`
+	PacketSize    int                `json:"packet_size"`
+	IPv6ExtHeaders []IPv6ExtHeaderType `json:"ipv6_ext_headers"`
 }
 
 // ParsePacket decodes a raw IP packet (IPv4 or IPv6) and returns parsed fields.
@@ -92,6 +96,14 @@ func parseIPv4Packet(raw []byte) (*PacketInfo, error) {
 	return info, nil
 }
 
+// extHeaderTypes maps gopacket layer types to short names for the extension header list.
+var extHeaderTypes = map[gopacket.LayerType]IPv6ExtHeaderType{
+	layers.LayerTypeIPv6HopByHop:    "HopByHop",
+	layers.LayerTypeIPv6Routing:     "Routing",
+	layers.LayerTypeIPv6Fragment:    "Fragment",
+	layers.LayerTypeIPv6Destination: "Destination",
+}
+
 func parseIPv6Packet(raw []byte) (*PacketInfo, error) {
 	if len(raw) < 40 {
 		return nil, fmt.Errorf("IPv6 packet too short: %d bytes", len(raw))
@@ -111,14 +123,64 @@ func parseIPv6Packet(raw []byte) (*PacketInfo, error) {
 		return nil, fmt.Errorf("failed to cast IPv6 layer")
 	}
 
-	info := &PacketInfo{
-		SrcIP:      ipv6.SrcIP.String(),
-		DstIP:      ipv6.DstIP.String(),
-		PacketSize: len(packet.Data()),
+	// Find the actual L4 protocol by walking through extension headers
+	l4Proto := ipv6.NextHeader
+	extHeaders := []IPv6ExtHeaderType{}
+
+	// Check all layers for extension headers
+	for _, layer := range packet.Layers() {
+		if name, ok := extHeaderTypes[layer.LayerType()]; ok {
+			extHeaders = append(extHeaders, name)
+			// Update the protocol to the next header from this extension
+			if ext, ok2 := layer.(interface{ NextLayerType() gopacket.LayerType }); ok2 {
+				l4Proto = ipv6ProtoFromLayer(ext.NextLayerType())
+			}
+		}
 	}
 
-	populateL4(info, packet, ipv6.NextHeader)
+	info := &PacketInfo{
+		SrcIP:          ipv6.SrcIP.String(),
+		DstIP:          ipv6.DstIP.String(),
+		PacketSize:     len(packet.Data()),
+		IPv6ExtHeaders: extHeaders,
+	}
+
+	// Check if a fragment extension header was present
+	for _, layer := range packet.Layers() {
+		if frag, ok := layer.(*layers.IPv6Fragment); ok {
+			info.Fragment.IsFragment = true
+			info.Fragment.MoreFragments = frag.MoreFragments
+			info.Fragment.Offset = int(frag.FragmentOffset)
+			break
+		}
+	}
+
+	populateL4(info, packet, l4Proto)
 	return info, nil
+}
+
+// ipv6ProtoFromLayer converts a gopacket layer type back to an IP protocol number.
+func ipv6ProtoFromLayer(lt gopacket.LayerType) layers.IPProtocol {
+	switch lt {
+	case layers.LayerTypeTCP:
+		return layers.IPProtocolTCP
+	case layers.LayerTypeUDP:
+		return layers.IPProtocolUDP
+	case layers.LayerTypeICMPv4:
+		return layers.IPProtocolICMPv4
+	case layers.LayerTypeICMPv6:
+		return layers.IPProtocolICMPv6
+	case layers.LayerTypeIPv6HopByHop:
+		return layers.IPProtocolIPv6HopByHop
+	case layers.LayerTypeIPv6Routing:
+		return layers.IPProtocolIPv6Routing
+	case layers.LayerTypeIPv6Fragment:
+		return layers.IPProtocolIPv6Fragment
+	case layers.LayerTypeIPv6Destination:
+		return layers.IPProtocolIPv6Destination
+	default:
+		return layers.IPProtocol(0)
+	}
 }
 
 // populateL4 fills in L4 protocol fields (TCP, UDP, ICMP) from a decoded packet.
