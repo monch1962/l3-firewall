@@ -114,6 +114,51 @@ func TestPolicyReload(t *testing.T) {
 	}
 }
 
+func TestPolicyVersions(t *testing.T) {
+	eval, _ := opa.NewEmbedded(opa.EmbedConfig{
+		Policy: `package l3_firewall import rego.v1 default allow := true`,
+	})
+	ct := conntrack.NewTable(conntrack.DefaultConfig())
+	rl := ratelimit.NewLimiter(1000, 1000000)
+	eng := engine.New(eval, ct, rl, true, false, nil, nil, nil, nil, nil, "")
+	api := New(eval, eng, "test", "", "")
+	handler := api.Handler()
+
+	// Initially empty
+	req := httptest.NewRequest(http.MethodGet, "/admin/policy/versions", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var versions []PolicyVersion
+	if err := json.NewDecoder(w.Body).Decode(&versions); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(versions) != 0 {
+		t.Errorf("expected empty versions, got %d", len(versions))
+	}
+
+	// Reload policy, then check versions has 1 entry
+	req2 := httptest.NewRequest(http.MethodPost, "/admin/policy/reload", nil)
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, req2)
+
+	req3 := httptest.NewRequest(http.MethodGet, "/admin/policy/versions", nil)
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, req3)
+	var versions2 []PolicyVersion
+	if err := json.NewDecoder(w3.Body).Decode(&versions2); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(versions2) != 1 {
+		t.Errorf("expected 1 version entry after reload, got %d", len(versions2))
+	}
+	if versions2[0].Version != "test" {
+		t.Errorf("version = %q, want %q", versions2[0].Version, "test")
+	}
+}
+
 func TestPolicyReloadWrongMethod(t *testing.T) {
 	api := newTestAPI(t)
 	handler := api.Handler()

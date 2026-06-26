@@ -21,6 +21,16 @@ type API struct {
 	started   time.Time
 	token     string
 	readToken string // read-only token; optional
+
+	// Rule version history
+	policyVersions []PolicyVersion
+}
+
+// PolicyVersion records a policy reload event.
+type PolicyVersion struct {
+	Timestamp   time.Time `json:"timestamp"`
+	Version     string    `json:"version"`
+	Description string    `json:"description,omitempty"`
 }
 
 // New creates an admin API with the given dependencies.
@@ -45,6 +55,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/admin/stats", a.requireReadAuth(a.handleStats))
 	mux.HandleFunc("/admin/blocks", a.requireReadAuth(a.handleBlocks))
 	mux.HandleFunc("/admin/block-stats", a.requireReadAuth(a.handleBlockStats))
+	mux.HandleFunc("/admin/policy/versions", a.requireReadAuth(a.handlePolicyVersions))
 	// Write endpoints (require full token)
 	mux.HandleFunc("/admin/policy/reload", a.requireWriteAuth(a.handlePolicyReload))
 	return withSecurityHeaders(mux)
@@ -170,7 +181,29 @@ func (a *API) handlePolicyReload(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("admin API: policy reload requested (file watcher handles the reload)")
 	w.Header().Set("Content-Type", "application/json")
+
+	// Record the version entry
+	a.policyVersions = append(a.policyVersions, PolicyVersion{
+		Timestamp:   time.Now(),
+		Version:     a.version,
+		Description: "policy reload triggered via admin API",
+	})
+	// Keep only last 100 entries
+	if len(a.policyVersions) > 100 {
+		a.policyVersions = a.policyVersions[len(a.policyVersions)-100:]
+	}
+
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "reload triggered"})
+}
+
+// handlePolicyVersions returns the policy reload history.
+func (a *API) handlePolicyVersions(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if a.policyVersions == nil {
+		json.NewEncoder(w).Encode([]PolicyVersion{})
+		return
+	}
+	json.NewEncoder(w).Encode(a.policyVersions)
 }
 
 // StartServer starts the admin HTTP server in a goroutine (plain HTTP).
