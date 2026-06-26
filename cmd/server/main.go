@@ -31,6 +31,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/metrics"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
+	"github.com/monch1962/l3-firewall/internal/syncer"
 	"github.com/monch1962/l3-firewall/internal/threatintel"
 )
 
@@ -61,6 +62,8 @@ func main() {
 		threatIntelURL = flag.String("threat-intel-url", "", "URL(s) to IP reputation blocklists (comma-separated)")
 		pcapDir       = flag.String("pcap-dir", "", "Directory for blocked packet pcap captures")
 		stateFile     = flag.String("state-file", "", "Path for persisting firewall state across restarts")
+		etcdEndpoints = flag.String("etcd-endpoints", "", "etcd endpoints for distributed policy sync (comma-separated)")
+		etcdKey       = flag.String("etcd-key", "/l3-firewall/policy", "etcd key to watch for policy updates")
 	)
 	flag.Parse()
 
@@ -102,6 +105,26 @@ func main() {
 		log.Fatalf("failed to initialize OPA: %v", err)
 	}
 	slog.Info("OPA evaluator ready")
+
+	// Start etcd syncer for distributed policy if configured
+	if *etcdEndpoints != "" {
+		endpoints := strings.Split(*etcdEndpoints, ",")
+		for i := range endpoints {
+			endpoints[i] = strings.TrimSpace(endpoints[i])
+		}
+		policySyncer, err := syncer.New(syncer.Config{
+			Endpoints: endpoints,
+			Key:       *etcdKey,
+		}, func(policy string) error {
+			return opaEval.Load(policy)
+		})
+		if err != nil {
+			slog.Warn("etcd syncer not available", "error", err)
+		} else if policySyncer != nil {
+			policySyncer.Start(context.Background())
+			slog.Info("etcd syncer started", "endpoints", *etcdEndpoints, "key", *etcdKey)
+		}
+	}
 
 	// Create components
 	ctConfig := conntrack.Config{
