@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/admin"
+	"github.com/monch1962/l3-firewall/internal/audit"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/engine"
 	"github.com/monch1962/l3-firewall/internal/metrics"
@@ -49,6 +50,7 @@ func main() {
 		conntrackUDP     = flag.Duration("conntrack-udp-timeout", 30*time.Second, "UDP connection idle timeout")
 		conntrackICMP    = flag.Duration("conntrack-icmp-timeout", 5*time.Second, "ICMP connection idle timeout")
 		conntrackMaxFlowsPerSrc = flag.Int("conntrack-max-flows-per-src", 0, "Max concurrent flows per source IP (0 = unlimited)")
+		auditLogPath   = flag.String("audit-log", "", "Path to structured audit log file (empty = no audit logging)")
 	)
 	flag.Parse()
 
@@ -101,9 +103,22 @@ func main() {
 	}
 	ct := conntrack.NewTable(ctConfig)
 
+	// Create audit logger if path is specified
+	var auditLogger *audit.Logger
+	if *auditLogPath != "" {
+		al, err := audit.NewLogger(audit.Config{
+			Path: *auditLogPath,
+		})
+		if err != nil {
+			log.Fatalf("failed to create audit logger: %v", err)
+		}
+		auditLogger = al
+		slog.Info("audit logging enabled", "path", *auditLogPath)
+	}
+
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly)
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger)
 
 	// Initialize metrics
 	metrics.Init(func() int { return ct.Len() })

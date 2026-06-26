@@ -51,7 +51,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | R8 | **Rate limiter burst gap** — 60s cleanup window OOM | MaxEntries eviction handles bursts | ✅ |
 | R9 | **Per-source flow count unbounded** — Many src IPs exhaust `srcFlowCount` map | Per-IP counter naturally bounded by `MaxEntries` (65536) | ✅ |
 
-### Verified Test Coverage (75 Go tests, 65 Rego tests)
+### Verified Test Coverage (82 Go tests, 65 Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
@@ -59,6 +59,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment/rate), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
 | `internal/conntrack` | 25 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, TCP FSM (SYN→ESTABLISHED→FIN→RST→CLOSED), concurrent access, per-source flow limit (blocks under limit, multiple sources, after delete, after expire, stats, TCP state, default unlimited) |
 | `internal/ratelimit` | 15 | Basic allowance, burst, per-IP independence, byte rate, stale cleanup, active key preservation, concurrent, rate queries, per-dst-port AllowPort, GetPortPPS, port independence, unknown port |
+| `internal/audit` | 7 | NewLogger default path, block events, allow events, concurrent safety, rotation, close, invalid path |
 | `internal/engine` | 11 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK |
 | `internal/admin` | 8 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth |
 | OPA Policies (Rego) | 65 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1), time-based rules (13) |
@@ -72,7 +73,8 @@ Packets → [nftables NFQUEUE] → engine.evaluatePacket()
                                   ├── ratelimit.Allow(srcIP, packetSize)
                                   ├── opa.BuildInput(packet + rate + conn state + time)
                                   ├── opaEval.Evaluate(input)
-                                  └── NF_ACCEPT or NF_DROP + stats
+                                  ├── NF_ACCEPT or NF_DROP + stats
+                                  └── audit.Log() → JSON file (block/allow events)
 
 Admin API (:8082)
   ├── /admin/health     → {"status":"ok","version":"0.1.0","uptime":"...","engine_running":bool}
@@ -163,6 +165,7 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `--conntrack-udp-timeout` | `30s` | UDP connection idle timeout |
 | `--conntrack-icmp-timeout` | `5s` | ICMP connection idle timeout |
 | `--conntrack-max-flows-per-src` | `0` | Max concurrent flows per source IP (0 = unlimited) |
+| `--audit-log` | `""` | Path to structured JSON audit log (empty = no audit logging) |
 
 ### Policy Configuration (embedded in `opa-policies/l3.rego`)
 
@@ -222,6 +225,7 @@ To change configuration: edit the `.rego` file — the hot-reloader picks up cha
 | Per-IP rate tracking | EWMA-based PPS/BPS | Memory-efficient rate estimation |
 | Connection limit | Per-source flow counter capped by `MaxFlowsPerSrcIP` | DoS via excessive concurrent connections |
 | Time-based scheduling | `time_based_rules` in Rego policy with UTC hour/day | Access outside approved hours |
+| Audit logging | `--audit-log` writes structured JSON | SIEM integration, compliance audit trail |
 
 ## Project Structure
 
@@ -239,6 +243,7 @@ l3-firewall/
 │   │   └── evaluator.go            #   Evaluator interface
 │   ├── conntrack/table.go          # 5-tuple connection tracking
 │   ├── ratelimit/ratelimit.go      # Per-IP EWMA rate limiter
+│   ├── audit/audit.go              # Structured JSON audit logging
 │   ├── metrics/metrics.go          # Prometheus metrics
 │   └── admin/api.go                # REST admin API
 ├── opa-policies/

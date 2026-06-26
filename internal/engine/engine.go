@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/monch1962/l3-firewall/internal/audit"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/packet"
@@ -52,12 +53,13 @@ type BlockLogEntry struct {
 
 // Engine is the core firewall evaluation pipeline.
 type Engine struct {
-	eval      opa.Evaluator
-	conntrack *conntrack.Table
-	ratelimit *ratelimit.Limiter
-	auditOnly bool
-	failClosed bool
-	running   bool
+	eval        opa.Evaluator
+	conntrack   *conntrack.Table
+	ratelimit   *ratelimit.Limiter
+	auditOnly   bool
+	failClosed  bool
+	running     bool
+	auditLogger *audit.Logger // nil = no audit logging
 
 	// Stats counters
 	packetsProcessed int64
@@ -78,13 +80,15 @@ type Engine struct {
 }
 
 // New creates a firewall engine with the given components.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool) *Engine {
+// Pass nil for auditLogger to disable audit logging.
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
 		ratelimit:    rl,
 		failClosed:   failClosed,
 		auditOnly:    auditOnly,
+		auditLogger:  al,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 		blockStats:   make(map[string]int64),
 	}
@@ -173,6 +177,25 @@ func (e *Engine) recordBlock(pi *packet.PacketInfo, reason, traceID string) {
 	e.blockStatsMu.Unlock()
 }
 
+// logAudit writes a structured audit event if the audit logger is configured.
+func (e *Engine) logAudit(eventType, traceID string, pi *packet.PacketInfo, reason string) {
+	if e.auditLogger == nil {
+		return
+	}
+	e.auditLogger.Log(audit.AuditEvent{
+		Timestamp:  time.Now(),
+		Type:       eventType,
+		TraceID:    traceID,
+		SrcIP:      pi.SrcIP,
+		DstIP:      pi.DstIP,
+		Protocol:   pi.Protocol,
+		SrcPort:    pi.SrcPort,
+		DstPort:    pi.DstPort,
+		PacketSize: pi.PacketSize,
+		Reason:     reason,
+	})
+}
+
 // evaluatePacket runs the full firewall evaluation pipeline on a parsed packet.
 // Returns the OPA result (Allowed + Reason). Panics are recovered and
 // returned as blocked results (fail-closed).
@@ -218,6 +241,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 		e.recordBlock(pi, reason, tid)
+		e.logAudit("packet_block", tid, pi, reason)
 		return &opa.Result{Allowed: false, Reason: reason}
 	}
 
@@ -250,9 +274,11 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 			e.recordBlock(pi, reason, tid)
+			e.logAudit("packet_block", tid, pi, reason)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
 		e.packetsAllowed++
+		e.logAudit("packet_allow", tid, pi, "")
 		return &opa.Result{Allowed: true}
 	}
 
@@ -264,9 +290,11 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 			e.recordBlock(pi, reason, tid)
+			e.logAudit("packet_block", tid, pi, reason)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
 		e.packetsAllowed++
+		e.logAudit("packet_allow", tid, pi, "")
 		return &opa.Result{Allowed: true}
 	}
 
@@ -275,11 +303,13 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		slog.Warn("[AUDIT] would block", "reason", result.Reason, "src", pi.SrcIP,
 			"dst", pi.DstIP, "protocol", pi.Protocol, "port", pi.DstPort)
 		e.packetsAllowed++
+		e.logAudit("audit_block", tid, pi, result.Reason)
 		return &opa.Result{Allowed: true}
 	}
 
 	if result.Allowed {
 		e.packetsAllowed++
+		e.logAudit("packet_allow", tid, pi, "")
 	} else {
 		e.packetsBlocked++
 		// Truncate long reason strings
@@ -289,6 +319,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		slog.Warn("blocked", "reason", result.Reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 		e.recordBlock(pi, result.Reason, tid)
+		e.logAudit("packet_block", tid, pi, result.Reason)
 	}
 
 	return result

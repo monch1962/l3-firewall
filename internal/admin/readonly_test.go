@@ -17,7 +17,7 @@ func TestReadOnlyTokenAllowedOnReadEndpoint(t *testing.T) {
 	})
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
-	eng := engine.New(eval, ct, rl, true, false)
+	eng := engine.New(eval, ct, rl, true, false, nil)
 	api := New(eval, eng, "test", "admin-secret", "read-only-secret")
 	handler := api.Handler()
 
@@ -37,7 +37,7 @@ func TestReadOnlyTokenBlockedOnWriteEndpoint(t *testing.T) {
 	})
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
-	eng := engine.New(eval, ct, rl, true, false)
+	eng := engine.New(eval, ct, rl, true, false, nil)
 	api := New(eval, eng, "test", "admin-secret", "read-only-secret")
 	handler := api.Handler()
 
@@ -57,7 +57,7 @@ func TestAdminTokenAccessesBoth(t *testing.T) {
 	})
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
-	eng := engine.New(eval, ct, rl, true, false)
+	eng := engine.New(eval, ct, rl, true, false, nil)
 	api := New(eval, eng, "test", "admin-secret", "read-only-secret")
 	handler := api.Handler()
 
@@ -87,7 +87,7 @@ func TestReadOnlyTokenWithEmptyReadToken(t *testing.T) {
 	})
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
-	eng := engine.New(eval, ct, rl, true, false)
+	eng := engine.New(eval, ct, rl, true, false, nil)
 	api := New(eval, eng, "test", "admin-secret", "")
 	handler := api.Handler()
 
