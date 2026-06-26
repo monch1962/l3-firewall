@@ -37,7 +37,6 @@ func main() {
 		queueNum         = flag.Uint("queue", 0, "NFQUEUE number for forward traffic")
 		queueNumInput    = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic")
 		opaEmbed         = flag.String("opa-embed", "./opa-policies/l3.rego", "Path to Rego policy file")
-		opaParams        = flag.String("opa-params", "./config/params.json", "Path to parameters JSON")
 		opaFailClosed    = flag.Bool("opa-fail-closed", false, "Block when OPA is unreachable")
 		opaAuditOnly     = flag.Bool("opa-audit-only", false, "Log would-be blocks without enforcing")
 		logFormat        = flag.String("log-format", "text", "Log format: text or json")
@@ -81,23 +80,9 @@ func main() {
 		log.Fatalf("failed to read policy file %s: %v", *opaEmbed, err)
 	}
 
-	// Load params
-	opaStore := opa.NewDataStore()
-	if *opaParams != "" {
-		paramsData, err := os.ReadFile(*opaParams)
-		if err != nil {
-			log.Fatalf("failed to read params file %s: %v", *opaParams, err)
-		}
-		if err := opaStore.LoadParamsFromJSON(paramsData); err != nil {
-			log.Fatalf("failed to parse params JSON: %v", err)
-		}
-		slog.Info("loaded params", "file", *opaParams)
-	}
-
-	// Create embedded OPA evaluator
+	// Create embedded OPA evaluator from policy file
 	opaEval, err := opa.NewEmbedded(opa.EmbedConfig{
 		Policy: string(policyData),
-		Store:  opaStore,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize OPA: %v", err)
@@ -121,11 +106,16 @@ func main() {
 	metrics.Init(func() int { return ct.Len() })
 	slog.Info("metrics initialized")
 
-	// Admin API
-	adminAPI := admin.New(opaEval, opaStore, eng, version, *adminToken)
+	// Admin API — configuration is in the policy file, no external params needed
+	adminAPI := admin.New(opaEval, eng, version, *adminToken)
 	var adminServer *http.Server
 	if *listenAddr != "" {
 		adminServer = adminAPI.StartServer(*listenAddr)
+	}
+
+	// Start file watcher for hot-reload of the OPA policy file
+	if *opaEmbed != "" {
+		go watchPolicyFile(*opaEmbed, opaEval)
 	}
 
 	// Metrics HTTP handler on separate port or admin port
@@ -173,4 +163,29 @@ func main() {
 	}
 
 	slog.Info("shutdown complete")
+}
+
+// watchPolicyFile polls the OPA policy file for modifications every 5 seconds
+// and triggers a hot-reload when the file changes.
+func watchPolicyFile(path string, eval *opa.EmbeddedEvaluator) {
+	var lastMod time.Time
+	for {
+		fi, err := os.Stat(path)
+		if err != nil {
+			slog.Error("hot-reload: failed to stat policy file", "path", path, "error", err)
+			time.Sleep(30 * time.Second)
+			continue
+		}
+		modTime := fi.ModTime()
+		if !lastMod.IsZero() && modTime.After(lastMod) {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				slog.Error("hot-reload: failed to read policy file", "path", path, "error", err)
+			} else if err := eval.Load(string(data)); err != nil {
+				slog.Error("hot-reload: failed to reload policy", "path", path, "error", err)
+			}
+		}
+		lastMod = modTime
+		time.Sleep(5 * time.Second)
+	}
 }

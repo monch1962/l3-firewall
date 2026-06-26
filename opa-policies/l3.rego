@@ -1,58 +1,48 @@
 # l3-firewall — L3 firewall Rego policies
 #
-# Deny-override model: traffic passes by default, blocked only by matching deny rules.
-# Parameters are injected via OPA data (data.params).
+# Configuration is embedded directly in this file as policy constants.
+# To change configuration: edit this file, then hot-reload or restart.
+# Tests: opa test opa-policies/ -v
 #
 # Input structure:
-#   input.packet       — parsed packet headers
-#   input.connection   — connection state (established, packets_in_flow, age_ms)
-#   input.rate         — per-source rate info (src_ip_pps, src_ip_bps)
+#   input.packet       — parsed packet headers (src_ip, dst_ip, protocol, ports, flags, fragment)
+#   input.connection   — connection state (established, tcp_state, packets_in_flow, age_ms, recent_ports)
+#   input.rate         — per-source rate info (src_ip_pps, src_ip_bps, src_port_pps, new_conns_per_sec)
 
 package l3_firewall
 
 import rego.v1
 
 # =============================================================================
-# PARAMETERS (injected via data.params)
+# CONFIGURATION — policy constants (edit to reconfigure)
 # =============================================================================
 
-# Helper function to safely get parameters with defaults
-param_or_default(key, default_val) := val if {
-    val := object.get(data.params, key, default_val)
-}
+# Network filtering
+allowed_subnets := {"0.0.0.0/0"}           # Authorized source/destination subnets
+blocked_ports := {22, 23, 3389, 5900, 5901} # Blocked TCP/UDP ports
+blocked_protocols := {}                      # Blocked IP protocols (e.g. {"ICMP"})
 
-# Check if a port falls within any configured range (e.g. "8000-9000")
-port_in_ranges(port, ranges) if {
-    some r in ranges
-    contains(r, "-")
-    parts := split(r, "-")
-    lower := to_number(parts[0])
-    upper := to_number(parts[1])
-    port >= lower
-    port <= upper
-}
+# ICMP control
+blocked_icmp_types := {8}                    # Blocked ICMP types (8 = Echo Request)
+blocked_icmp_codes := {}                     # Blocked ICMP codes
 
-port_in_ranges(port, ranges) if {
-    ranges[port]
-}
+# Rate limits
+syn_rate_per_second := 100                   # SYN flood threshold (packets/sec)
+icmp_rate_per_second := 10                   # ICMP flood threshold (packets/sec)
+max_packets_per_second := 10000              # Per-IP rate limit (packets/sec)
+max_port_pps := 500                          # Per-destination-port rate limit (packets/sec)
+max_new_connections_per_second := 1000       # Per-IP new connection rate limit
 
-# Parameter accessors
-allowed_subnets_set := object.get(data.params, "allowed_subnets", {"0.0.0.0/0"})
-allowed_ports_set := object.get(data.params, "allowed_ports", {})
-blocked_ports_set := object.get(data.params, "blocked_ports", {22, 23, 3389, 5900, 5901})
-blocked_protocols_set := object.get(data.params, "blocked_protocols", {})
-blocked_icmp_types_set := object.get(data.params, "blocked_icmp_types", {8})
-blocked_icmp_codes_set := object.get(data.params, "blocked_icmp_codes", {})
-syn_rate_limit := object.get(data.params, "syn_rate_per_second", 100)
-icmp_rate_limit := object.get(data.params, "icmp_rate_per_second", 10)
-max_pps := object.get(data.params, "max_packets_per_second", 10000)
-port_scan_threshold := object.get(data.params, "port_scan_threshold", 20)
-enable_ip_spoofing := object.get(data.params, "enable_ip_spoofing_check", true)
-enable_port_scan := object.get(data.params, "enable_port_scan_detection", true)
-enable_syn_flood := object.get(data.params, "enable_syn_flood_protection", true)
-enable_stateful := object.get(data.params, "enable_stateful_inspection", true)
-enable_fragment := object.get(data.params, "enable_fragment_attack_detection", false)
-enable_ingress_egress := object.get(data.params, "enable_ingress_egress_filtering", true)
+# Detection toggles
+enable_ip_spoofing := true
+enable_port_scan := true
+enable_syn_flood := true
+enable_stateful := true
+enable_fragment := false                     # Off by default; enable if fragmentation is not expected
+enable_ingress_egress := true
+
+# Port scan detection
+port_scan_threshold := 20
 
 # =============================================================================
 # DEFAULT: allow all traffic
@@ -67,7 +57,7 @@ default allow := true
 deny_ip_spoofing if {
     enable_ip_spoofing == true
     src_ip := input.packet.src_ip
-    not ip_in_subnets(src_ip, allowed_subnets_set)
+    not ip_in_subnets(src_ip, allowed_subnets)
 }
 
 allow := false if { deny_ip_spoofing }
@@ -97,7 +87,7 @@ deny_syn_flood if {
     input.packet.protocol == "TCP"
     input.packet.tcp_flags.syn == true
     input.packet.tcp_flags.ack == false
-    input.rate.src_ip_pps > syn_rate_limit
+    input.rate.src_ip_pps > syn_rate_per_second
 }
 
 allow := false if { deny_syn_flood }
@@ -115,84 +105,53 @@ deny_protocol_anomaly if {
 allow := false if { deny_protocol_anomaly }
 deny_reason := "protocol anomaly detected" if { deny_protocol_anomaly }
 
-invalid_tcp_flags(flags) if {
-    flags.syn == true
-    flags.rst == true
-}
-
-invalid_tcp_flags(flags) if {
-    flags.fin == true
-    flags.rst == true
-}
-
-invalid_tcp_flags(flags) if {
-    flags.syn == true
-    flags.fin == true
-}
+invalid_tcp_flags(flags) if { flags.syn == true; flags.rst == true }
+invalid_tcp_flags(flags) if { flags.fin == true; flags.rst == true }
+invalid_tcp_flags(flags) if { flags.syn == true; flags.fin == true }
 
 # =============================================================================
-# RULE 5: Ingress/Egress Filtering — source/dest not in allowed subnets
+# RULE 5: Ingress/Egress Filtering — dest IP not in allowed subnets
 # =============================================================================
 
 deny_ingress_egress if {
     enable_ingress_egress == true
     dst_ip := input.packet.dst_ip
-    not ip_in_subnets(dst_ip, allowed_subnets_set)
+    not ip_in_subnets(dst_ip, allowed_subnets)
 }
 
 allow := false if { deny_ingress_egress }
 deny_reason := "ingress/egress filtering blocked" if { deny_ingress_egress }
 
 # =============================================================================
-# RULE 6: Port Control — block specific ports
+# RULE 6: Port Control — block specific ports (with range support)
 # =============================================================================
 
-deny_blocked_port if {
-    input.packet.protocol == "TCP"
-    port_in_ranges(input.packet.dst_port, blocked_ports_set)
-}
-
+deny_blocked_port if { input.packet.protocol == "TCP"; port_in_ranges(input.packet.dst_port, blocked_ports) }
 allow := false if { deny_blocked_port }
 
-deny_blocked_port if {
-    input.packet.protocol == "UDP"
-    port_in_ranges(input.packet.dst_port, blocked_ports_set)
-}
-
+deny_blocked_port if { input.packet.protocol == "UDP"; port_in_ranges(input.packet.dst_port, blocked_ports) }
 allow := false if { deny_blocked_port }
 
 deny_reason := sprintf("blocked port %v (%s)", [input.packet.dst_port, input.packet.protocol]) if { deny_blocked_port }
 
 # =============================================================================
-# RULE 7: ICMP Control — block specific ICMP types/codes
+# RULE 7: ICMP Control — block specific ICMP types/codes, rate-limit floods
 # =============================================================================
 
-deny_icmp if {
-    input.packet.protocol == "ICMP"
-    blocked_icmp_types_set[input.packet.icmp_type]
-}
-
+deny_icmp if { input.packet.protocol == "ICMP"; blocked_icmp_types[input.packet.icmp_type] }
 allow := false if { deny_icmp }
 
-deny_icmp if {
-    input.packet.protocol == "ICMP"
-    blocked_icmp_codes_set[input.packet.icmp_code]
-}
-
+deny_icmp if { input.packet.protocol == "ICMP"; blocked_icmp_codes[input.packet.icmp_code] }
 allow := false if { deny_icmp }
 
 deny_reason := sprintf("blocked ICMP type=%v code=%v", [input.packet.icmp_type, input.packet.icmp_code]) if { deny_icmp }
 
-deny_icmp_flood if {
-    input.packet.protocol == "ICMP"
-    input.rate.src_ip_pps > icmp_rate_limit
-}
-
+deny_icmp_flood if { input.packet.protocol == "ICMP"; input.rate.src_ip_pps > icmp_rate_per_second }
 allow := false if { deny_icmp_flood }
 deny_reason := "ICMP flood detected" if { deny_icmp_flood }
 
 # =============================================================================
-# RULE 8: Connection State Violation
+# RULE 8: Connection State Violation — RST to non-existent flow
 # =============================================================================
 
 deny_state_violation if {
@@ -209,26 +168,20 @@ deny_reason := "connection state violation: RST to non-existent flow" if { deny_
 # RULE 9: Protocol Blocking
 # =============================================================================
 
-deny_blocked_protocol if {
-    blocked_protocols_set[input.packet.protocol]
-}
-
+deny_blocked_protocol if { blocked_protocols[input.packet.protocol] }
 allow := false if { deny_blocked_protocol }
 deny_reason := sprintf("blocked protocol %v", [input.packet.protocol]) if { deny_blocked_protocol }
 
 # =============================================================================
-# RULE 10: Traffic Rate Limit
+# RULE 10: Traffic Rate Limit — per-IP packets/sec budget
 # =============================================================================
 
-deny_traffic_rate if {
-    input.rate.src_ip_pps > max_pps
-}
-
+deny_traffic_rate if { input.rate.src_ip_pps > max_packets_per_second }
 allow := false if { deny_traffic_rate }
 deny_reason := sprintf("rate limit exceeded: %v pps", [input.rate.src_ip_pps]) if { deny_traffic_rate }
 
 # =============================================================================
-# RULE 11: Fragment Attack — non-zero offset or tiny fragments
+# RULE 11: Fragment Attack — non-zero-offset IP fragments
 # =============================================================================
 
 deny_fragment_attack if {
@@ -244,41 +197,27 @@ deny_reason := sprintf("fragment attack: offset=%v", [input.packet.fragment.offs
 # RULE 12: Source Port Filtering — block traffic from specific source ports
 # =============================================================================
 
-deny_source_port if {
-    input.packet.protocol == "TCP"
-    port_in_ranges(input.packet.src_port, blocked_ports_set)
-}
-
+deny_source_port if { input.packet.protocol == "TCP"; port_in_ranges(input.packet.src_port, blocked_ports) }
 allow := false if { deny_source_port }
 deny_reason := sprintf("blocked source port %v (TCP)", [input.packet.src_port]) if { deny_source_port }
 
-deny_source_port if {
-    input.packet.protocol == "UDP"
-    port_in_ranges(input.packet.src_port, blocked_ports_set)
-}
-
+deny_source_port if { input.packet.protocol == "UDP"; port_in_ranges(input.packet.src_port, blocked_ports) }
 allow := false if { deny_source_port }
 deny_reason := sprintf("blocked source port %v (UDP)", [input.packet.src_port]) if { deny_source_port }
 
 # =============================================================================
-# RULE 13: New Connection Rate Limit — too many new connections from one source
+# RULE 13: New Connection Rate Limit
 # =============================================================================
 
-deny_new_conn_rate if {
-    input.rate.new_conns_per_sec > object.get(data.params, "max_new_connections_per_second", 1000)
-}
-
+deny_new_conn_rate if { input.rate.new_conns_per_sec > max_new_connections_per_second }
 allow := false if { deny_new_conn_rate }
 deny_reason := sprintf("new connection rate exceeded: %v/sec", [input.rate.new_conns_per_sec]) if { deny_new_conn_rate }
 
 # =============================================================================
-# RULE 14: Per-Port Rate Limit — too much traffic to a specific destination port
+# RULE 14: Per-Port Rate Limit — too much traffic to a specific dst port
 # =============================================================================
 
-deny_port_rate if {
-    input.rate.src_port_pps > object.get(data.params, "max_port_pps", 500)
-}
-
+deny_port_rate if { input.rate.src_port_pps > max_port_pps }
 allow := false if { deny_port_rate }
 deny_reason := sprintf("per-port rate limit: %v pps to port %v", [input.rate.src_port_pps, input.packet.dst_port]) if { deny_port_rate }
 
@@ -286,18 +225,25 @@ deny_reason := sprintf("per-port rate limit: %v pps to port %v", [input.rate.src
 # HELPERS
 # =============================================================================
 
-# Check if an IP belongs to any subnet in the set.
-# Supports exact IPs (e.g. "10.0.0.1") and CIDR notation (e.g. "10.0.0.0/8").
-# Uses net.cidr_contains for proper subnet matching.
+# CIDR subnet matching — supports "10.0.0.0/8" and exact IPs
 ip_in_subnets(ip, subnets) if {
     some cidr in subnets
     contains(cidr, "/")
     net.cidr_contains(cidr, ip)
 }
+ip_in_subnets(ip, subnets) if { subnets[ip] }
 
-ip_in_subnets(ip, subnets) if {
-    subnets[ip]
+# Port range matching — supports "8000-9000" and single ports
+port_in_ranges(port, ranges) if {
+    some r in ranges
+    contains(r, "-")
+    parts := split(r, "-")
+    lower := to_number(parts[0])
+    upper := to_number(parts[1])
+    port >= lower
+    port <= upper
 }
+port_in_ranges(port, ranges) if { ranges[port] }
 
 # =============================================================================
 # RESULT — single reason string from the first matching deny rule

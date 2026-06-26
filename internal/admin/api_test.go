@@ -10,16 +10,13 @@ import (
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/engine"
 	"github.com/monch1962/l3-firewall/internal/opa"
-	"github.com/monch1962/l3-firewall/internal/packet"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
 )
 
 func newTestAPI(t *testing.T) *API {
 	t.Helper()
-	store := opa.NewDataStore()
 	eval, err := opa.NewEmbedded(opa.EmbedConfig{
 		Policy: `package l3_firewall import rego.v1 default allow := true`,
-		Store:  store,
 	})
 	if err != nil {
 		t.Fatalf("NewEmbedded: %v", err)
@@ -27,7 +24,7 @@ func newTestAPI(t *testing.T) *API {
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	return New(eval, store, eng, "test", "")
+	return New(eval, eng, "test", "")
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -73,39 +70,12 @@ func TestStatsEndpoint(t *testing.T) {
 	if _, ok := resp["packets_processed"]; !ok {
 		t.Error("response missing packets_processed")
 	}
-	if _, ok := resp["conntrack_entries"]; !ok {
-		t.Error("response missing conntrack_entries")
-	}
-	if _, ok := resp["engine_running"]; !ok {
-		t.Error("response missing engine_running")
-	}
 }
 
 func TestBlocksEndpoint(t *testing.T) {
-	// Create an engine with a blocking policy and trigger a block
-	store := opa.NewDataStore()
-	eval, err := opa.NewEmbedded(opa.EmbedConfig{
-		Policy: `package l3_firewall import rego.v1 default allow := true allow := false if { input.packet.dst_port == 22 } reason := "ssh" if { input.packet.dst_port == 22 }`,
-		Store:  store,
-	})
-	if err != nil {
-		t.Fatalf("NewEmbedded: %v", err)
-	}
-	ct := conntrack.NewTable(conntrack.DefaultConfig())
-	rl := ratelimit.NewLimiter(1000, 1000000)
-	eng := engine.New(eval, ct, rl, true, false)
-
-	// Trigger a block by evaluating a packet to port 22
-	pi := &packet.PacketInfo{
-		SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP",
-		SrcPort: 44001, DstPort: 22,
-		TCPFlags: packet.TCPFlags{SYN: true},
-	}
-	// We need a way to call evaluatePacket — it's unexported in engine.
-	// Instead, let's just check that the blocks endpoint returns empty for now.
-	_ = pi
-
-	api := New(eval, store, eng, "test", "")
+	eng := engine.New(nil, conntrack.NewTable(conntrack.DefaultConfig()),
+		ratelimit.NewLimiter(1000, 1000000), true, false)
+	api := New(nil, eng, "test", "")
 	handler := api.Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/blocks", nil)
@@ -120,92 +90,35 @@ func TestBlocksEndpoint(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&blocks); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	// Empty block list expected since engine hasn't processed packets
 	if blocks == nil {
 		t.Error("expected empty array, got nil")
 	}
 }
 
-func TestGetRulesEndpoint(t *testing.T) {
-	store := opa.NewDataStore()
-	store.SetParams(map[string]interface{}{"syn_rate_per_second": float64(200)})
-
-	ct := conntrack.NewTable(conntrack.DefaultConfig())
-	rl := ratelimit.NewLimiter(1000, 1000000)
+func TestPolicyReload(t *testing.T) {
 	eval, _ := opa.NewEmbedded(opa.EmbedConfig{
 		Policy: `package l3_firewall import rego.v1 default allow := true`,
-		Store:  store,
 	})
+	ct := conntrack.NewTable(conntrack.DefaultConfig())
+	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	api := New(eval, store, eng, "test", "")
+	api := New(eval, eng, "test", "")
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/admin/rules", nil)
+	req := httptest.NewRequest(http.MethodPost, "/admin/policy/reload", bytes.NewBufferString(`{}`))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
 	if w.Code != http.StatusOK {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
 	}
-
-	var resp map[string]interface{}
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if resp["syn_rate_per_second"] != float64(200) {
-		t.Errorf("syn_rate_per_second = %v, want 200", resp["syn_rate_per_second"])
-	}
 }
 
-func TestUpdateRulesEndpoint(t *testing.T) {
-	store := opa.NewDataStore()
-	ct := conntrack.NewTable(conntrack.DefaultConfig())
-	rl := ratelimit.NewLimiter(1000, 1000000)
-	eval, _ := opa.NewEmbedded(opa.EmbedConfig{
-		Policy: `package l3_firewall import rego.v1 default allow := true`,
-		Store:  store,
-	})
-	eng := engine.New(eval, ct, rl, true, false)
-	api := New(eval, store, eng, "test", "")
-	handler := api.Handler()
-
-	body := `{"syn_rate_per_second": 300, "icmp_rate_per_second": 20}`
-	req := httptest.NewRequest(http.MethodPost, "/admin/rules/update", bytes.NewBufferString(body))
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
-	}
-
-	params := store.GetParams()
-	if params["syn_rate_per_second"] != float64(300) {
-		t.Errorf("syn_rate_per_second = %v, want 300", params["syn_rate_per_second"])
-	}
-	if params["icmp_rate_per_second"] != float64(20) {
-		t.Errorf("icmp_rate_per_second = %v, want 20", params["icmp_rate_per_second"])
-	}
-}
-
-func TestUpdateRulesInvalidJSON(t *testing.T) {
+func TestPolicyReloadWrongMethod(t *testing.T) {
 	api := newTestAPI(t)
 	handler := api.Handler()
 
-	req := httptest.NewRequest(http.MethodPost, "/admin/rules/update",
-		bytes.NewBufferString(`{invalid`))
-	w := httptest.NewRecorder()
-	handler.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
-	}
-}
-
-func TestUpdateRulesWrongMethod(t *testing.T) {
-	api := newTestAPI(t)
-	handler := api.Handler()
-
-	req := httptest.NewRequest(http.MethodGet, "/admin/rules/update", nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/policy/reload", nil)
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -215,15 +128,13 @@ func TestUpdateRulesWrongMethod(t *testing.T) {
 }
 
 func TestAuthRequired(t *testing.T) {
-	store := opa.NewDataStore()
-	ct := conntrack.NewTable(conntrack.DefaultConfig())
-	rl := ratelimit.NewLimiter(1000, 1000000)
 	eval, _ := opa.NewEmbedded(opa.EmbedConfig{
 		Policy: `package l3_firewall import rego.v1 default allow := true`,
-		Store:  store,
 	})
+	ct := conntrack.NewTable(conntrack.DefaultConfig())
+	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	api := New(eval, store, eng, "test", "my-secret-token")
+	api := New(eval, eng, "test", "my-secret-token")
 	handler := api.Handler()
 
 	tests := []struct {

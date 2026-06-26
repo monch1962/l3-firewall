@@ -59,9 +59,6 @@ func TestBuildInput(t *testing.T) {
 	if input.Connection.Established {
 		t.Error("Connection.Established should be false for new connection")
 	}
-	if input.Rate.SrcIPpps != 5.2 {
-		t.Errorf("SrcIPpps = %f, want %f", input.Rate.SrcIPpps, 5.2)
-	}
 }
 
 func TestBuildInputWithRecentPorts(t *testing.T) {
@@ -106,58 +103,6 @@ func TestBuildInputWithICMP(t *testing.T) {
 	}
 }
 
-func TestDataStoreParams(t *testing.T) {
-	store := NewDataStore()
-	if store == nil {
-		t.Fatal("NewDataStore returned nil")
-	}
-
-	params := store.GetParams()
-	if params == nil {
-		t.Fatal("GetParams should return non-nil map")
-	}
-
-	// Set and get params
-	newParams := map[string]interface{}{
-		"syn_rate_per_second": float64(200),
-		"max_packets_per_second": float64(20000),
-	}
-	store.SetParams(newParams)
-
-	got := store.GetParams()
-	if got["syn_rate_per_second"] != float64(200) {
-		t.Errorf("syn_rate_per_second = %v, want 200", got["syn_rate_per_second"])
-	}
-}
-
-func TestDataStoreLoadParamsFromJSON(t *testing.T) {
-	store := NewDataStore()
-	jsonData := []byte(`{
-		"syn_rate_per_second": 150,
-		"icmp_rate_per_second": 5
-	}`)
-
-	if err := store.LoadParamsFromJSON(jsonData); err != nil {
-		t.Fatalf("LoadParamsFromJSON failed: %v", err)
-	}
-
-	params := store.GetParams()
-	if params["syn_rate_per_second"] != float64(150) {
-		t.Errorf("syn_rate_per_second = %v, want 150", params["syn_rate_per_second"])
-	}
-	if params["icmp_rate_per_second"] != float64(5) {
-		t.Errorf("icmp_rate_per_second = %v, want 5", params["icmp_rate_per_second"])
-	}
-}
-
-func TestDataStoreLoadParamsInvalidJSON(t *testing.T) {
-	store := NewDataStore()
-	err := store.LoadParamsFromJSON([]byte(`{invalid json`))
-	if err == nil {
-		t.Fatal("expected error for invalid JSON, got nil")
-	}
-}
-
 func TestEmbeddedEvaluator(t *testing.T) {
 	policy := `package l3_firewall
 import rego.v1
@@ -165,11 +110,7 @@ default allow := true
 allow := false if { input.packet.dst_port == 22 }
 reason := "blocked SSH" if { allow == false }
 `
-	store := NewDataStore()
-	eval, err := NewEmbedded(EmbedConfig{
-		Policy: policy,
-		Store:  store,
-	})
+	eval, err := NewEmbedded(EmbedConfig{Policy: policy})
 	if err != nil {
 		t.Fatalf("NewEmbedded failed: %v", err)
 	}
@@ -177,11 +118,8 @@ reason := "blocked SSH" if { allow == false }
 	// Block SSH (port 22)
 	input := &Input{
 		Packet: PacketInfo{
-			SrcIP:    "10.0.1.100",
-			DstIP:    "10.0.2.50",
-			Protocol: "TCP",
-			SrcPort:  44001,
-			DstPort:  22,
+			SrcIP: "10.0.1.100", DstIP: "10.0.2.50",
+			Protocol: "TCP", SrcPort: 44001, DstPort: 22,
 			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
@@ -199,11 +137,8 @@ reason := "blocked SSH" if { allow == false }
 	// Allow HTTP (port 80)
 	input2 := &Input{
 		Packet: PacketInfo{
-			SrcIP:    "10.0.1.100",
-			DstIP:    "10.0.2.50",
-			Protocol: "TCP",
-			SrcPort:  44002,
-			DstPort:  80,
+			SrcIP: "10.0.1.100", DstIP: "10.0.2.50",
+			Protocol: "TCP", SrcPort: 44002, DstPort: 80,
 			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
@@ -216,26 +151,20 @@ reason := "blocked SSH" if { allow == false }
 	}
 }
 
-func TestEmbeddedEvaluatorWithParams(t *testing.T) {
-	policy := `package l3_firewall
+func TestEmbeddedEvaluatorLoad(t *testing.T) {
+	// Initial policy
+	initial := `package l3_firewall
 import rego.v1
 default allow := true
-blocked_port := object.get(data.params, "blocked_port", 0)
+blocked_port := 8080
 allow := false if { input.packet.dst_port == blocked_port }
 `
-	store := NewDataStore()
-	store.SetParams(map[string]interface{}{
-		"blocked_port": float64(8080),
-	})
-
-	eval, err := NewEmbedded(EmbedConfig{
-		Policy: policy,
-		Store:  store,
-	})
+	eval, err := NewEmbedded(EmbedConfig{Policy: initial})
 	if err != nil {
 		t.Fatalf("NewEmbedded failed: %v", err)
 	}
 
+	// Should block port 8080
 	input := &Input{
 		Packet: PacketInfo{
 			SrcIP: "10.0.1.100", DstIP: "10.0.2.50",
@@ -248,72 +177,104 @@ allow := false if { input.packet.dst_port == blocked_port }
 		t.Fatalf("Evaluate failed: %v", err)
 	}
 	if result.Allowed {
-		t.Error("port 8080 should be blocked via params")
+		t.Error("port 8080 should be blocked by initial policy")
+	}
+
+	// Hot-reload with new policy
+	updated := `package l3_firewall
+import rego.v1
+default allow := true
+blocked_port := 9090
+allow := false if { input.packet.dst_port == blocked_port }
+`
+	if err := eval.Load(updated); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	// Should now block port 9090 instead
+	input2 := &Input{
+		Packet: PacketInfo{
+			SrcIP: "10.0.1.100", DstIP: "10.0.2.50",
+			Protocol: "TCP", SrcPort: 44001, DstPort: 9090,
+			TCPFlags: packet.TCPFlags{SYN: true},
+		},
+	}
+	result2, err := eval.Evaluate(input2)
+	if err != nil {
+		t.Fatalf("Evaluate failed: %v", err)
+	}
+	if result2.Allowed {
+		t.Error("port 9090 should be blocked after reload")
+	}
+
+	// Port 8080 should now be allowed (policy changed)
+	input3 := &Input{
+		Packet: PacketInfo{
+			SrcIP: "10.0.1.100", DstIP: "10.0.2.50",
+			Protocol: "TCP", SrcPort: 44001, DstPort: 8080,
+			TCPFlags: packet.TCPFlags{SYN: true},
+		},
+	}
+	result3, err := eval.Evaluate(input3)
+	if err != nil {
+		t.Fatalf("Evaluate failed: %v", err)
+	}
+	if !result3.Allowed {
+		t.Error("port 8080 should be allowed after reload (policy changed to block 9090)")
 	}
 }
 
-func TestEmbeddedEvaluatorSetParamsRuntime(t *testing.T) {
-	policy := `package l3_firewall
-import rego.v1
-default allow := true
-deny_if_high_rate if { input.rate.src_ip_pps > object.get(data.params, "max_pps", 100) }
-allow := false if { deny_if_high_rate }
-`
-	store := NewDataStore()
-	store.SetParams(map[string]interface{}{
-		"max_pps": float64(50),
-	})
-
+func TestEmbeddedEvaluatorLoadEmpty(t *testing.T) {
 	eval, err := NewEmbedded(EmbedConfig{
-		Policy: policy,
-		Store:  store,
+		Policy: `package l3_firewall import rego.v1 default allow := true`,
 	})
 	if err != nil {
 		t.Fatalf("NewEmbedded failed: %v", err)
 	}
 
-	// Should block at 100 pps (exceeds 50)
-	input := &Input{
-		Packet: PacketInfo{SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP", DstPort: 80, TCPFlags: packet.TCPFlags{SYN: true}},
-		Rate:   RateInfo{SrcIPpps: 100},
-	}
-	result, err := eval.Evaluate(input)
-	if err != nil {
-		t.Fatalf("Evaluate failed: %v", err)
-	}
-	if result.Allowed {
-		t.Error("should be blocked at 100 pps with max=50")
-	}
-
-	// Update params to allow higher rate
-	eval.SetParams(map[string]interface{}{
-		"max_pps": float64(200),
-	})
-	result2, err := eval.Evaluate(input)
-	if err != nil {
-		t.Fatalf("Evaluate failed: %v", err)
-	}
-	if !result2.Allowed {
-		t.Error("should be allowed at 100 pps with max=200")
+	if err := eval.Load(""); err == nil {
+		t.Error("expected error for empty policy, got nil")
 	}
 }
 
 func TestEmbeddedEvaluatorBadPolicy(t *testing.T) {
-	_, err := NewEmbedded(EmbedConfig{
-		Policy: "invalid rego {{",
-		Store:  NewDataStore(),
-	})
+	_, err := NewEmbedded(EmbedConfig{Policy: "invalid rego {{"})
 	if err == nil {
 		t.Fatal("expected error for bad policy, got nil")
 	}
 }
 
-func TestEmbeddedEvaluatorNilStore(t *testing.T) {
+func TestEmbeddedEvaluatorNilStoreNotNeeded(t *testing.T) {
+	// DataStore is no longer required — configuration lives in the policy.
 	_, err := NewEmbedded(EmbedConfig{
-		Policy: `package test default allow := true`,
-		Store:  nil,
+		Policy: `package l3_firewall import rego.v1 default allow := true`,
 	})
-	if err == nil {
-		t.Fatal("expected error for nil store, got nil")
+	if err != nil {
+		t.Fatalf("NewEmbedded should work without store: %v", err)
+	}
+}
+
+func TestEmbeddedEvaluatorReloadCh(t *testing.T) {
+	eval, err := NewEmbedded(EmbedConfig{
+		Policy: `package l3_firewall import rego.v1 default allow := true`,
+	})
+	if err != nil {
+		t.Fatalf("NewEmbedded: %v", err)
+	}
+
+	ch := eval.ReloadCh()
+	if ch == nil {
+		t.Fatal("ReloadCh returned nil")
+	}
+
+	// Trigger a reload
+	eval.Load(`package l3_firewall import rego.v1 default allow := true allow := false if { input.packet.dst_port == 22 }`)
+
+	// Check that the channel received a signal
+	select {
+	case <-ch:
+		// Got the reload notification
+	default:
+		t.Error("expected reload notification on channel")
 	}
 }

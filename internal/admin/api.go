@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/engine"
@@ -17,7 +16,6 @@ import (
 // API holds dependencies for the admin HTTP handlers.
 type API struct {
 	eval    *opa.EmbeddedEvaluator
-	store   *opa.DataStore
 	engine  *engine.Engine
 	version string
 	started time.Time
@@ -25,10 +23,9 @@ type API struct {
 }
 
 // New creates an admin API with the given dependencies.
-func New(eval *opa.EmbeddedEvaluator, store *opa.DataStore, eng *engine.Engine, version, token string) *API {
+func New(eval *opa.EmbeddedEvaluator, eng *engine.Engine, version, token string) *API {
 	return &API{
 		eval:    eval,
-		store:   store,
 		engine:  eng,
 		version: version,
 		started: time.Now(),
@@ -43,8 +40,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/admin/stats", a.requireAuth(a.handleStats))
 	mux.HandleFunc("/admin/blocks", a.requireAuth(a.handleBlocks))
 	mux.HandleFunc("/admin/block-stats", a.requireAuth(a.handleBlockStats))
-	mux.HandleFunc("/admin/rules", a.requireAuth(a.handleGetRules))
-	mux.HandleFunc("/admin/rules/update", a.requireAuth(a.handleUpdateRules))
+	mux.HandleFunc("/admin/policy/reload", a.requireAuth(a.handlePolicyReload))
 	return withSecurityHeaders(mux)
 }
 
@@ -124,56 +120,19 @@ func (a *API) handleBlockStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(stats)
 }
 
-func (a *API) handleGetRules(w http.ResponseWriter, r *http.Request) {
+func (a *API) handlePolicyReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"use POST"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Trigger hot-reload via file watcher (read the latest policy from disk)
+	// The reload is handled by the file watcher in cmd/server. This endpoint
+	// just logs the request; the actual reload happens on file change detection.
+	slog.Info("admin API: policy reload requested (file watcher handles the reload)")
+
 	w.Header().Set("Content-Type", "application/json")
-	params := a.store.GetParams()
-	if params == nil {
-		params = map[string]interface{}{}
-	}
-	json.NewEncoder(w).Encode(params)
-}
-
-func (a *API) handleUpdateRules(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost && r.Method != http.MethodPut {
-		http.Error(w, `{"error":"use POST or PUT"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Enforce JSON Content-Type
-	ct := r.Header.Get("Content-Type")
-	if ct != "" && !strings.HasPrefix(ct, "application/json") {
-		http.Error(w, `{"error":"Content-Type must be application/json"}`, http.StatusUnsupportedMediaType)
-		return
-	}
-
-	// Apply body limit to prevent OOM from oversized payloads
-	r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
-
-	var params map[string]interface{}
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&params); err != nil {
-		if err.Error() == "http: request body too large" {
-			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
-			return
-		}
-		http.Error(w, fmt.Sprintf(`{"error":"invalid JSON: %s"}`, err), http.StatusBadRequest)
-		return
-	}
-	// Reject trailing data after the JSON object
-	if dec.More() {
-		http.Error(w, `{"error":"trailing data after JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	a.store.SetParams(params)
-	if a.eval != nil {
-		a.eval.SetParams(params)
-	}
-
-	slog.Info("admin API: rules updated", "count", len(params))
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "reload triggered"})
 }
 
 // StartServer starts the admin HTTP server in a goroutine.

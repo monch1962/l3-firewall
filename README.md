@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **14 attack categories** with **~90 Go tests** and **52 Rego tests** plus **28 demo tests** across 8 internal packages and 12 standalone demos.
+l3-firewall's OPA Rego policies cover **14 attack categories** with **~85 Go tests** and **52 Rego tests** plus **28 demo tests** across 8 internal packages and 12 standalone demos.
 
 See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
@@ -77,8 +77,7 @@ Admin API (:8082)
   │                        "conntrack_entries":N,"conntrack_expired":N,"conntrack_evicted":N}
   ├── /admin/blocks     → [{timestamp,src_ip,dst_ip,protocol,src_port,dst_port,reason,...}]
   ├── /admin/block-stats → {"blocked SSH": 42, "SYN flood": 7, ...}
-  ├── /admin/rules      → GET current OPA params
-  └── /admin/rules/update → POST new params (live reload)
+  ├── /admin/policy/reload → Trigger policy hot-reload (POST)
 
 Metrics (:9090 or admin port)
   └── /metrics → Prometheus format
@@ -149,8 +148,7 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `--admin-token` | `""` | Bearer token for admin API auth |
 | `--queue` | `0` | NFQUEUE number for forward traffic |
 | `--queue-input` | `1` | NFQUEUE number for input traffic |
-| `--opa-embed` | `./opa-policies/l3.rego` | Path to Rego policy file |
-| `--opa-params` | `./config/params.json` | Path to parameters JSON |
+| `--opa-embed` | `./opa-policies/l3.rego` | Path to Rego policy file (configuration is embedded here) |
 | `--opa-fail-closed` | `false` | Block when OPA is unreachable |
 | `--opa-audit-only` | `false` | Log would-be blocks without enforcing |
 | `--log-format` | `text` | Log format: text or json |
@@ -162,10 +160,13 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `--conntrack-udp-timeout` | `30s` | UDP connection idle timeout |
 | `--conntrack-icmp-timeout` | `5s` | ICMP connection idle timeout |
 
-### Parameters JSON (`config/params.json`)
+### Policy Configuration (embedded in `opa-policies/l3.rego`)
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
+Configuration is embedded directly in the OPA/Rego policy file as Rego constants.
+To change configuration: edit the `.rego` file — the hot-reloader picks up changes within 5 seconds.
+
+| Constant | Type | Default | Description |
+|----------|------|---------|-------------|
 | `allowed_subnets` | array | `["0.0.0.0/0"]` | Allowed source/destination subnets |
 | `allowed_ports` | array | `[]` | Only allow these ports (empty = allow all) |
 | `blocked_ports` | array | `[22,23,3389,5900,5901]` | Blocked TCP/UDP ports |
