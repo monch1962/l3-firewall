@@ -37,7 +37,7 @@ func TestAttack_BlockStatsMapUnbounded(t *testing.T) {
 	for i := 0; i < 1000; i++ {
 		eng.recordBlock(&packet.PacketInfo{
 			SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP", SrcPort: 44001, DstPort: 22,
-		}, "reason_"+itoa(i))
+		}, "reason_"+itoa(i), "")
 	}
 	stats := eng.BlockStats()
 	if len(stats) > maxBlockStatsReasons {
@@ -112,7 +112,7 @@ func TestAttack_ConcurrentBlockStats(t *testing.T) {
 			eng.recordBlock(&packet.PacketInfo{
 				SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP",
 				SrcPort: 44001, DstPort: 22,
-			}, "blocked SSH")
+			}, "blocked SSH", "")
 		}()
 	}
 	wg.Wait()
@@ -126,7 +126,7 @@ func TestAttack_BlockStatsReasonFlood(t *testing.T) {
 	eng := newAttackTestEngine(t)
 	for i := 0; i < maxBlockStatsReasons+100; i++ {
 		eng.recordBlock(&packet.PacketInfo{SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP", SrcPort: 44001, DstPort: 22},
-			"reason_"+itoa(i))
+			"reason_"+itoa(i), "")
 	}
 	stats := eng.BlockStats()
 	if len(stats) > maxBlockStatsReasons {

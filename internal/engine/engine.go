@@ -8,6 +8,8 @@ package engine
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -22,10 +24,20 @@ import (
 )
 
 const maxRecentBlocks = 100
-const maxBlockStatsReasons = 256 // Cap unique deny reasons to prevent memory exhaustion
-const maxReasonLength = 1024    // Truncate OPA reason strings to prevent memory bloat
+const maxBlockStatsReasons = 256
+const maxReasonLength = 1024
 
-// BlockLogEntry records a single blocked packet for the admin API.
+// traceIDLength is the number of random bytes used for a trace identifier.
+const traceIDLength = 4
+
+// newTraceID returns a short hex trace identifier for correlating log entries.
+func newTraceID() string {
+	b := make([]byte, traceIDLength)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// BlockLogEntry records a single blocked packet with metadata.
 type BlockLogEntry struct {
 	Timestamp  time.Time `json:"timestamp"`
 	SrcIP      string    `json:"src_ip"`
@@ -35,6 +47,7 @@ type BlockLogEntry struct {
 	DstPort    uint16    `json:"dst_port"`
 	Reason     string    `json:"reason"`
 	PacketSize int       `json:"packet_size"`
+	TraceID    string    `json:"trace_id"`
 }
 
 // Engine is the core firewall evaluation pipeline.
@@ -127,7 +140,7 @@ func (e *Engine) RecentBlocks() []BlockLogEntry {
 
 // recordBlock appends a block log entry and increments the per-reason counter.
 // Long reason strings are truncated to maxReasonLength to prevent memory bloat.
-func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
+func (e *Engine) recordBlock(pi *packet.PacketInfo, reason, traceID string) {
 	e.recentMu.Lock()
 	defer e.recentMu.Unlock()
 
@@ -145,6 +158,7 @@ func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
 		DstPort:    pi.DstPort,
 		Reason:     reason,
 		PacketSize: pi.PacketSize,
+		TraceID:    traceID,
 	}
 	if len(e.recentBlocks) >= maxRecentBlocks {
 		e.recentBlocks = e.recentBlocks[1:]
@@ -176,6 +190,9 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	}()
 
 	e.packetsProcessed++
+
+	// Generate a trace ID for correlating log entries across the pipeline
+	tid := newTraceID()
 
 	// 1. Connection tracking with TCP state machine
 	var flow *conntrack.Flow
@@ -214,8 +231,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			e.packetsBlocked++
 			reason := "evaluator unavailable — blocked for safety"
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
-				"protocol", pi.Protocol, "port", pi.DstPort)
-			e.recordBlock(pi, reason)
+				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
+			e.recordBlock(pi, reason, tid)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
 		e.packetsAllowed++
@@ -228,8 +245,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			e.packetsBlocked++
 			reason := fmt.Sprintf("OPA error: %v — blocked for safety", err)
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
-				"protocol", pi.Protocol, "port", pi.DstPort)
-			e.recordBlock(pi, reason)
+				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
+			e.recordBlock(pi, reason, tid)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
 		e.packetsAllowed++
@@ -253,8 +270,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			result.Reason = result.Reason[:maxReasonLength]
 		}
 		slog.Warn("blocked", "reason", result.Reason, "src", pi.SrcIP, "dst", pi.DstIP,
-			"protocol", pi.Protocol, "port", pi.DstPort)
-		e.recordBlock(pi, result.Reason)
+			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
+		e.recordBlock(pi, result.Reason, tid)
 	}
 
 	return result
