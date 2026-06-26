@@ -133,12 +133,14 @@ func (e *Engine) recordBlock(pi *packet.PacketInfo, reason string) {
 func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Result {
 	e.packetsProcessed++
 
-	// 1. Connection tracking lookup
-	flow := e.conntrack.LookupOrCreate(pi.SrcIP, pi.DstIP, pi.Protocol, pi.SrcPort, pi.DstPort)
-
-	// Track SYN-ACK as established
-	if pi.Protocol == "TCP" && pi.TCPFlags.SYN && pi.TCPFlags.ACK {
-		flow.SetEstablished()
+	// 1. Connection tracking with TCP state machine
+	var flow *conntrack.Flow
+	if pi.Protocol == "TCP" {
+		flow = e.conntrack.UpdateTCPState(pi.SrcIP, pi.DstIP, pi.Protocol,
+			pi.SrcPort, pi.DstPort,
+			pi.TCPFlags.SYN, pi.TCPFlags.ACK, pi.TCPFlags.RST, pi.TCPFlags.FIN)
+	} else {
+		flow = e.conntrack.LookupOrCreate(pi.SrcIP, pi.DstIP, pi.Protocol, pi.SrcPort, pi.DstPort)
 	}
 
 	// Track destination port for scan detection
@@ -153,7 +155,11 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) *opa.Resu
 	recentPorts := e.conntrack.GetRecentDestPorts(pi.SrcIP)
 
 	// 4. Build OPA input
-	input := opa.BuildInput(pi, pps, bps, flow.Established, recentPorts)
+	tcpState := ""
+	if pi.Protocol == "TCP" {
+		tcpState = flow.TCPState.String()
+	}
+	input := opa.BuildInput(pi, pps, bps, flow.Established, tcpState, recentPorts)
 
 	// 5. OPA evaluation
 	if e.eval == nil {

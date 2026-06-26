@@ -16,17 +16,25 @@ type TCPFlags struct {
 	FIN bool `json:"fin"`
 }
 
+// FragmentInfo holds IP fragmentation information.
+type FragmentInfo struct {
+	IsFragment bool `json:"is_fragment"`
+	MoreFragments bool `json:"more_fragments"`
+	Offset    int  `json:"offset"` // fragment offset in 8-byte units
+}
+
 // PacketInfo holds all parsed fields from a single L3/L4 packet.
 type PacketInfo struct {
-	SrcIP      string    `json:"src_ip"`
-	DstIP      string    `json:"dst_ip"`
-	Protocol   string    `json:"protocol"` // "TCP", "UDP", "ICMP", etc.
-	SrcPort    uint16    `json:"src_port"` // 0 for non-TCP/UDP
-	DstPort    uint16    `json:"dst_port"` // 0 for non-TCP/UDP
-	TCPFlags   TCPFlags  `json:"tcp_flags"`
-	ICMPType   *uint8    `json:"icmp_type"` // nil for non-ICMP
-	ICMPCode   *uint8    `json:"icmp_code"` // nil for non-ICMP
-	PacketSize int       `json:"packet_size"`
+	SrcIP      string       `json:"src_ip"`
+	DstIP      string       `json:"dst_ip"`
+	Protocol   string       `json:"protocol"` // "TCP", "UDP", "ICMP", etc.
+	SrcPort    uint16       `json:"src_port"`  // 0 for non-TCP/UDP
+	DstPort    uint16       `json:"dst_port"`  // 0 for non-TCP/UDP
+	TCPFlags   TCPFlags     `json:"tcp_flags"`
+	ICMPType   *uint8       `json:"icmp_type"`  // nil for non-ICMP
+	ICMPCode   *uint8       `json:"icmp_code"`  // nil for non-ICMP
+	Fragment   FragmentInfo `json:"fragment"`
+	PacketSize int          `json:"packet_size"`
 }
 
 // ParsePacket decodes a raw IP packet (IPv4 or IPv6) and returns parsed fields.
@@ -72,6 +80,11 @@ func parseIPv4Packet(raw []byte) (*PacketInfo, error) {
 		SrcIP:      ipv4.SrcIP.String(),
 		DstIP:      ipv4.DstIP.String(),
 		PacketSize: len(packet.Data()),
+		Fragment: FragmentInfo{
+			IsFragment:    ipv4.FragOffset > 0 || ipv4.Flags&layers.IPv4MoreFragments != 0,
+			MoreFragments: ipv4.Flags&layers.IPv4MoreFragments != 0,
+			Offset:        int(ipv4.FragOffset),
+		},
 	}
 
 	// Populate L4 fields based on the IP protocol number.

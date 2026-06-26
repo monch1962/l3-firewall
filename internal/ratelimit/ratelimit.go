@@ -44,8 +44,8 @@ func NewLimiter(ppsLimit, bpsLimit float64) *Limiter {
 }
 
 // Allow records a packet for the given IP and returns the current PPS and BPS
-// for that IP. The caller should compare the returned values against configured
-// limits to decide whether to drop the packet.
+// for that IP. Also tracks rates per destination port for the source IP.
+// The caller should compare the returned values against configured limits.
 func (l *Limiter) Allow(ip string, packetSize int) (pps, bps float64) {
 	key := rateKey(ip)
 	now := time.Now()

@@ -21,6 +21,21 @@ param_or_default(key, default_val) := val if {
     val := object.get(data.params, key, default_val)
 }
 
+# Check if a port falls within any configured range (e.g. "8000-9000")
+port_in_ranges(port, ranges) if {
+    some r in ranges
+    contains(r, "-")
+    parts := split(r, "-")
+    lower := to_number(parts[0])
+    upper := to_number(parts[1])
+    port >= lower
+    port <= upper
+}
+
+port_in_ranges(port, ranges) if {
+    ranges[port]
+}
+
 # Parameter accessors
 allowed_subnets_set := object.get(data.params, "allowed_subnets", {"0.0.0.0/0"})
 allowed_ports_set := object.get(data.params, "allowed_ports", {})
@@ -36,7 +51,7 @@ enable_ip_spoofing := object.get(data.params, "enable_ip_spoofing_check", true)
 enable_port_scan := object.get(data.params, "enable_port_scan_detection", true)
 enable_syn_flood := object.get(data.params, "enable_syn_flood_protection", true)
 enable_stateful := object.get(data.params, "enable_stateful_inspection", true)
-enable_fragment := object.get(data.params, "enable_fragment_attack_detection", true)
+enable_fragment := object.get(data.params, "enable_fragment_attack_detection", false)
 enable_ingress_egress := object.get(data.params, "enable_ingress_egress_filtering", true)
 
 # =============================================================================
@@ -134,14 +149,14 @@ deny_reason := "ingress/egress filtering blocked" if { deny_ingress_egress }
 
 deny_blocked_port if {
     input.packet.protocol == "TCP"
-    blocked_ports_set[input.packet.dst_port]
+    port_in_ranges(input.packet.dst_port, blocked_ports_set)
 }
 
 allow := false if { deny_blocked_port }
 
 deny_blocked_port if {
     input.packet.protocol == "UDP"
-    blocked_ports_set[input.packet.dst_port]
+    port_in_ranges(input.packet.dst_port, blocked_ports_set)
 }
 
 allow := false if { deny_blocked_port }
@@ -211,6 +226,19 @@ deny_traffic_rate if {
 
 allow := false if { deny_traffic_rate }
 deny_reason := sprintf("rate limit exceeded: %v pps", [input.rate.src_ip_pps]) if { deny_traffic_rate }
+
+# =============================================================================
+# RULE 11: Fragment Attack — non-zero offset or tiny fragments
+# =============================================================================
+
+deny_fragment_attack if {
+    enable_fragment == true
+    input.packet.fragment.is_fragment == true
+    input.packet.fragment.offset > 0
+}
+
+allow := false if { deny_fragment_attack }
+deny_reason := sprintf("fragment attack: offset=%v", [input.packet.fragment.offset]) if { deny_fragment_attack }
 
 # =============================================================================
 # HELPERS

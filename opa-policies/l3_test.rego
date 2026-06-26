@@ -253,3 +253,56 @@ test_combined_ssh_blocked_overrides_rate if {
     not allow with data.params as object.union(default_mock, {"enable_ip_spoofing_check": true, "allowed_subnets": {"10.0.0.0/8"}})
         with input.packet as {"src_ip": "10.0.1.100", "protocol": "TCP", "dst_port": 22}
 }
+
+# =============================================================================
+# RULE 11: FRAGMENT ATTACK
+# =============================================================================
+
+test_fragment_attack_nonzero_offset_blocked if {
+    not allow with data.params as object.union(default_mock, {"enable_fragment_attack_detection": true})
+        with input.packet as {"protocol": "TCP", "dst_port": 80, "fragment": {"is_fragment": true, "offset": 100, "more_fragments": true}}
+}
+
+test_fragment_attack_zero_offset_allowed if {
+    allow with data.params as object.union(default_mock, {"enable_fragment_attack_detection": true})
+        with input.packet as {"protocol": "TCP", "dst_port": 80, "fragment": {"is_fragment": true, "offset": 0, "more_fragments": true}}
+}
+
+test_fragment_attack_disabled if {
+    allow with data.params as default_mock
+        with input.packet as {"protocol": "TCP", "dst_port": 80, "fragment": {"is_fragment": true, "offset": 100, "more_fragments": true}}
+}
+
+# =============================================================================
+# PORT RANGES
+# =============================================================================
+
+test_port_range_single_port_blocked if {
+    not allow with data.params as object.union(default_mock, {"blocked_ports": {22, "8000-9000"}})
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+}
+
+test_port_range_lower_bound_blocked if {
+    not allow with data.params as object.union(default_mock, {"blocked_ports": {22, "8000-9000"}})
+        with input.packet as {"protocol": "TCP", "dst_port": 8000}
+}
+
+test_port_range_upper_bound_blocked if {
+    not allow with data.params as object.union(default_mock, {"blocked_ports": {22, "8000-9000"}})
+        with input.packet as {"protocol": "TCP", "dst_port": 9000}
+}
+
+test_port_range_midpoint_blocked if {
+    not allow with data.params as object.union(default_mock, {"blocked_ports": {22, "8000-9000"}})
+        with input.packet as {"protocol": "TCP", "dst_port": 8500}
+}
+
+test_port_range_outside_allowed if {
+    allow with data.params as object.union(default_mock, {"blocked_ports": {22, "8000-9000"}})
+        with input.packet as {"protocol": "TCP", "dst_port": 9090}
+}
+
+test_port_range_below_allowed if {
+    allow with data.params as object.union(default_mock, {"blocked_ports": {22, "8000-9000"}})
+        with input.packet as {"protocol": "TCP", "dst_port": 21}
+}

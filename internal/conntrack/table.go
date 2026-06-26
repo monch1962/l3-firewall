@@ -12,6 +12,48 @@ import (
 	"time"
 )
 
+// TCPState represents the TCP connection state in the finite state machine.
+type TCPState int
+
+// TCP state machine constants.
+const (
+	TCPSynSent      TCPState = iota // SYN sent, awaiting SYN-ACK
+	TCPSynReceived                  // SYN received, awaiting ACK
+	TCPEstablished                  // Connection established
+	TCPFinWait1                     // FIN sent, awaiting FIN-ACK
+	TCPFinWait2                     // FIN-ACK received, awaiting FIN
+	TCPClosing                      // Both sides have sent FIN
+	TCPTimeWait                     // All packets sent, waiting for timeout
+	TcpCloseWait                    // Received FIN, waiting for app close
+	TCPClosed                       // Connection closed
+)
+
+// String returns a human-readable TCP state name.
+func (s TCPState) String() string {
+	switch s {
+	case TCPSynSent:
+		return "SYN_SENT"
+	case TCPSynReceived:
+		return "SYN_RECEIVED"
+	case TCPEstablished:
+		return "ESTABLISHED"
+	case TCPFinWait1:
+		return "FIN_WAIT_1"
+	case TCPFinWait2:
+		return "FIN_WAIT_2"
+	case TCPClosing:
+		return "CLOSING"
+	case TCPTimeWait:
+		return "TIME_WAIT"
+	case TcpCloseWait:
+		return "CLOSE_WAIT"
+	case TCPClosed:
+		return "CLOSED"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 // Config controls the connection table behaviour.
 type Config struct {
 	MaxEntries       int           // Max flows before eviction (oldest first)
@@ -50,6 +92,7 @@ type Flow struct {
 	SrcPort     uint16
 	DstPort     uint16
 	Established bool
+	TCPState    TCPState  // TCP FSM state (zero for non-TCP)
 	Packets     int64
 	created     time.Time
 	lastSeen    time.Time
@@ -179,6 +222,12 @@ func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort u
 		created:  time.Now(),
 		lastSeen: time.Now(),
 	}
+
+	// Set initial TCP state based on protocol and flags
+	if protocol == "TCP" {
+		f.TCPState = TCPSynSent
+	}
+
 	t.flows[key] = f
 	t.stats.Created++
 
@@ -223,6 +272,107 @@ func (t *Table) NewConnectionRate() float64 {
 		}
 	}
 	return float64(count) / 10.0
+}
+
+// UpdateTCPState finds or creates a flow and transitions its TCP state based on
+// the given TCP flags. This implements a simplified TCP FSM sufficient for
+// firewall state tracking. Returns the flow.
+func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort uint16, syn, ack, rst, fin bool) *Flow {
+	key := flowKey{srcIP, dstIP, protocol, srcPort, dstPort}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var isNew bool
+	f, ok := t.flows[key]
+	if !ok {
+		if len(t.flows) >= t.cfg.MaxEntries {
+			t.evictOneLocked()
+			t.stats.Evicted++
+		}
+		isNew = true
+		f = &Flow{
+			SrcIP: srcIP, DstIP: dstIP, Protocol: protocol,
+			SrcPort: srcPort, DstPort: dstPort,
+			Packets: 1, created: time.Now(), lastSeen: time.Now(),
+		}
+		t.flows[key] = f
+		t.stats.Created++
+		t.recordNewConn()
+	} else {
+		f.touch()
+		t.stats.Hits++
+	}
+
+	switch {
+	case rst:
+		// RST closes the connection regardless of state
+		f.TCPState = TCPClosed
+		f.Established = false
+
+	case syn && ack && !fin:
+		// SYN-ACK transitions from SYN_SENT to ESTABLISHED
+		if f.TCPState == TCPSynSent {
+			f.TCPState = TCPEstablished
+			f.Established = true
+		}
+
+	case syn && !ack && !fin:
+		// SYN from the other direction transitions to SYN_RECEIVED
+		if f.TCPState == TCPSynSent {
+			f.TCPState = TCPSynReceived
+		}
+
+	case fin && ack:
+		// FIN-ACK
+		switch f.TCPState {
+		case TCPSynSent, TCPSynReceived:
+			// Server-side FIN+ACK on a reverse-path flow that hasn't seen SYN yet.
+			// This is part of an existing bidirectional connection closing.
+			f.TCPState = TCPFinWait1
+		case TCPEstablished:
+			f.TCPState = TCPFinWait1
+		case TCPFinWait1:
+			f.TCPState = TCPFinWait2
+		case TCPFinWait2:
+			f.TCPState = TCPTimeWait
+		case TcpCloseWait:
+			f.TCPState = TCPClosed
+			f.Established = false
+		}
+
+	case fin && !ack:
+		// Plain FIN
+		switch f.TCPState {
+		case TCPEstablished:
+			f.TCPState = TCPFinWait1
+		case TCPFinWait1:
+			f.TCPState = TCPClosing
+		}
+
+	case ack && !syn && !fin && !rst:
+		// ACK (data or handshake continuation)
+		switch f.TCPState {
+		case TCPSynSent:
+			f.TCPState = TCPEstablished
+			f.Established = true
+		case TCPFinWait1:
+			f.TCPState = TCPFinWait2
+		case TCPClosing:
+			f.TCPState = TCPTimeWait
+		case TCPTimeWait:
+			f.TCPState = TCPClosed
+			f.Established = false
+		}
+	}
+
+	// Also set via other side's perspective
+	if isNew && protocol == "TCP" && !syn && !rst && !fin {
+		// Non-SYN, non-FIN, non-RST flow started from the server side (e.g., pure ACK)
+		f.TCPState = TCPSynReceived
+	}
+
+	return f
 }
 
 // Delete removes a flow by 5-tuple.

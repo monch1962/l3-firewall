@@ -6,15 +6,23 @@ import (
 
 // PacketInfo mirrors the packet fields fed into OPA evaluation.
 type PacketInfo struct {
-	SrcIP      string   `json:"src_ip"`
-	DstIP      string   `json:"dst_ip"`
-	Protocol   string   `json:"protocol"`
-	SrcPort    uint16   `json:"src_port"`
-	DstPort    uint16   `json:"dst_port"`
-	TCPFlags   TCPFlags `json:"tcp_flags"`
-	ICMPType   *uint8   `json:"icmp_type"`
-	ICMPCode   *uint8   `json:"icmp_code"`
-	PacketSize int      `json:"packet_size"`
+	SrcIP      string        `json:"src_ip"`
+	DstIP      string        `json:"dst_ip"`
+	Protocol   string        `json:"protocol"`
+	SrcPort    uint16        `json:"src_port"`
+	DstPort    uint16        `json:"dst_port"`
+	TCPFlags   TCPFlags      `json:"tcp_flags"`
+	ICMPType   *uint8        `json:"icmp_type"`
+	ICMPCode   *uint8        `json:"icmp_code"`
+	Fragment   FragmentInfo  `json:"fragment"`
+	PacketSize int           `json:"packet_size"`
+}
+
+// FragmentInfo mirrors IP fragmentation fields for OPA input.
+type FragmentInfo struct {
+	IsFragment    bool `json:"is_fragment"`
+	MoreFragments bool `json:"more_fragments"`
+	Offset        int  `json:"offset"`
 }
 
 // TCPFlags mirrors the TCP control flags for OPA input.
@@ -27,10 +35,11 @@ type TCPFlags struct {
 
 // ConnectionInfo holds connection tracking state for OPA input.
 type ConnectionInfo struct {
-	Established  bool     `json:"established"`
-	PacketsInFlow int64   `json:"packets_in_flow"`
-	AgeMs        int64    `json:"age_ms"`
-	RecentPorts  []uint16 `json:"recent_ports"`
+	Established   bool     `json:"established"`
+	TCPState      string   `json:"tcp_state"`
+	PacketsInFlow int64    `json:"packets_in_flow"`
+	AgeMs         int64    `json:"age_ms"`
+	RecentPorts   []uint16 `json:"recent_ports"`
 }
 
 // RateInfo holds per-source rate tracking for OPA input.
@@ -47,8 +56,8 @@ type Input struct {
 }
 
 // BuildInput constructs the OPA input from parsed packet info, rate data,
-// connection state, and recent destination ports for port-scan detection.
-func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, recentPorts []uint16) *Input {
+// connection state, TCP state string, and recent destination ports for port-scan detection.
+func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpState string, recentPorts []uint16) *Input {
 	input := &Input{
 		Packet: PacketInfo{
 			SrcIP:      pi.SrcIP,
@@ -59,10 +68,16 @@ func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, recen
 			TCPFlags:   TCPFlags(pi.TCPFlags),
 			ICMPType:   pi.ICMPType,
 			ICMPCode:   pi.ICMPCode,
+			Fragment:   FragmentInfo{
+				IsFragment:    pi.Fragment.IsFragment,
+				MoreFragments: pi.Fragment.MoreFragments,
+				Offset:        pi.Fragment.Offset,
+			},
 			PacketSize: pi.PacketSize,
 		},
 		Connection: ConnectionInfo{
 			Established:  established,
+			TCPState:     tcpState,
 			PacketsInFlow: 1,
 		},
 		Rate: RateInfo{
