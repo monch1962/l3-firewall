@@ -17,6 +17,8 @@
   "enable_ingress_egress_filtering": true,
   "connection_table_size": 65536,
   "connection_idle_timeout_sec": 300,
+  "connection_udp_timeout_sec": 30,
+  "connection_icmp_timeout_sec": 5,
   "port_scan_threshold": 20,
   "port_scan_window_sec": 10
 }

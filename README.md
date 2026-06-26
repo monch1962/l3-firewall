@@ -12,33 +12,35 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover 10 attack categories with **49 Go tests** and **37 Rego tests** (**86 total**) across 7 internal packages:
+l3-firewall's OPA Rego policies cover **11 attack categories** with **63 Go tests** and **46 Rego tests** (**109 total**) across 7 internal packages:
 
-### OPA Policy Coverage (10 categories)
+### OPA Policy Coverage (11 categories)
 
 | # | Attack Vector | Detection | Status |
 |---|---|---|---|
-| 1 | **IP Spoofing** — Source IP not in allowed subnets | `allowed_subnets` check | ✅ |
+| 1 | **IP Spoofing** — Source IP not in allowed subnets | `allowed_subnets` check (CIDR) | ✅ |
 | 2 | **Port Scanning** — Rapid connections to multiple dest ports | `recent_ports` threshold | ✅ |
 | 3 | **SYN Flood** — Rate of SYN-only packets exceeds threshold | `syn_rate_per_second` | ✅ |
 | 4 | **Protocol Anomaly** — Invalid TCP flags (SYN+RST, FIN+RST, SYN+FIN) | Flag combination check | ✅ |
-| 5 | **Ingress/Egress Filtering** — Dest IP not in allowed subnets | `allowed_subnets` check | ✅ |
-| 6 | **Port Control** — Block specific TCP/UDP ports | `blocked_ports` list | ✅ |
+| 5 | **Ingress/Egress Filtering** — Dest IP not in allowed subnets | `allowed_subnets` check (CIDR) | ✅ |
+| 6 | **Port Control** — Block specific TCP/UDP ports (supports ranges) | `blocked_ports` list + `port_in_ranges()` | ✅ |
 | 7 | **ICMP Control** — Block ICMP types/codes, rate limit floods | `blocked_icmp_types/codes` + rate | ✅ |
-| 8 | **Connection State Violation** — RST to non-existent flow | Stateful inspection | ✅ |
+| 8 | **Connection State Violation** — RST to non-existent flow | TCP FSM state tracking | ✅ |
 | 9 | **Protocol Blocking** — Block traffic by IP protocol | `blocked_protocols` list | ✅ |
 | 10 | **Traffic Rate Limit** — Per-source-IP packets/sec budget | `max_packets_per_second` | ✅ |
+| 11 | **Fragment Attack** — Non-zero-offset IP fragments | `fragment.offset > 0` check | ✅ |
 
-### Verified Test Coverage (49 Go tests, 37 Rego tests)
+### Verified Test Coverage (63 Go tests, 46 Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
-| `internal/packet` | 8 | TCP (SYN/SYN-ACK-RST-FIN), UDP, ICMP echo, short/nil, size, IPv6 |
-| `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
-| `internal/conntrack` | 9 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, concurrent access, default config |
+| `internal/packet` | 11 | TCP (SYN/SYN-ACK-RST-FIN), UDP, ICMP echo, short/nil, size, IPv6, fragment detection (nonzero offset, first-fragment, non-fragment) |
+| `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
+| `internal/conntrack` | 17 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, TCP FSM (SYN→ESTABLISHED→FIN→RST→CLOSED), concurrent access |
 | `internal/ratelimit` | 11 | Basic allowance, burst handling, per-IP independence, byte rate limiting, stale cleanup, active key preservation, concurrent access, rate queries |
-| `internal/engine` | 9 | Allow, block, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, conntrack stats |
+| `internal/engine` | 9 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats |
 | `internal/admin` | 8 | Health, stats, blocks, rules GET/UPDATE, invalid JSON, wrong method, auth (no token, wrong token, valid token) |
+| OPA Policies (Rego) | 46 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), combined (1) |
 
 ## Architecture
 
@@ -174,7 +176,10 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | OPA fail-closed | `--opa-fail-closed` | Bypass via OPA DoS |
 | Audit-only mode | `--opa-audit-only` | Safe data collection before enforcement |
 | Deny-override model | Default `allow := true` | Safe phased rollout |
+| TCP FSM tracking | 9-state machine (SYN→ESTABLISHED→FIN→CLOSED) | Connection state violation, evasive handshakes |
+| Fragmentation detection | Parse IPv4 FragOffset + MoreFragments | Fragment-based evasion (overlap, tiny fragment) |
 | CIDR subnet matching | `net.cidr_contains` | Real subnet filtering (not string match) |
+| Port ranges | `port_in_ranges()` helper | Range-based rules (e.g. `"8000-9000"`) |
 | Per-protocol timeouts | TCP=300s, UDP=30s, ICMP=5s | Optimal memory usage per protocol |
 | Drop logging | Structured slog + ring buffer | Forensic analysis of blocked traffic |
 | Recent-blocks API | `/admin/blocks` | Real-time visibility into blocks |
