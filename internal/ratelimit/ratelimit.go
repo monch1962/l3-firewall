@@ -74,8 +74,11 @@ func (l *Limiter) Allow(ip string, packetSize int) (pps, bps float64) {
 
 	// EWMA update
 	if b.pps == 0 {
-		b.pps = instPPS
-		b.bps = instBPS
+		// First packet — use a conservative starting rate rather than
+		// the instantaneous rate which can be absurdly high (1/dt for
+		// very small dt).
+		b.pps = 1.0
+		b.bps = float64(packetSize)
 	} else {
 		b.pps = l.alpha*instPPS + (1-l.alpha)*b.pps
 		b.bps = l.alpha*instBPS + (1-l.alpha)*b.bps
