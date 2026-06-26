@@ -22,6 +22,7 @@ import (
 
 	"github.com/monch1962/l3-firewall/internal/admin"
 	"github.com/monch1962/l3-firewall/internal/audit"
+	"github.com/monch1962/l3-firewall/internal/alert"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/engine"
 	"github.com/monch1962/l3-firewall/internal/metrics"
@@ -51,6 +52,7 @@ func main() {
 		conntrackICMP    = flag.Duration("conntrack-icmp-timeout", 5*time.Second, "ICMP connection idle timeout")
 		conntrackMaxFlowsPerSrc = flag.Int("conntrack-max-flows-per-src", 0, "Max concurrent flows per source IP (0 = unlimited)")
 		auditLogPath   = flag.String("audit-log", "", "Path to structured audit log file (empty = no audit logging)")
+		alertWebhookURL = flag.String("alert-webhook-url", "", "Webhook URL for firewall alerts (e.g. Slack, Discord)")
 	)
 	flag.Parse()
 
@@ -116,9 +118,18 @@ func main() {
 		slog.Info("audit logging enabled", "path", *auditLogPath)
 	}
 
+	// Create alert router if webhook URL is specified
+	var alertRouter *alert.Router
+	if *alertWebhookURL != "" {
+		alertRouter = alert.NewRouter(alert.Config{
+			WebhookURL: *alertWebhookURL,
+		})
+		slog.Info("alerts enabled", "webhook", *alertWebhookURL)
+	}
+
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger)
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter)
 
 	// Initialize metrics
 	metrics.Init(func() int { return ct.Len() })

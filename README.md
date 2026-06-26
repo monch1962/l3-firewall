@@ -166,6 +166,7 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `--conntrack-icmp-timeout` | `5s` | ICMP connection idle timeout |
 | `--conntrack-max-flows-per-src` | `0` | Max concurrent flows per source IP (0 = unlimited) |
 | `--audit-log` | `""` | Path to structured JSON audit log (empty = no audit logging) |
+| `--alert-webhook-url` | `""` | Webhook URL for firewall alerts (e.g. Slack, Discord, PagerDuty) |
 
 ### Policy Configuration (embedded in `opa-policies/l3.rego`)
 
@@ -226,6 +227,7 @@ To change configuration: edit the `.rego` file — the hot-reloader picks up cha
 | Connection limit | Per-source flow counter capped by `MaxFlowsPerSrcIP` | DoS via excessive concurrent connections |
 | Time-based scheduling | `time_based_rules` in Rego policy with UTC hour/day | Access outside approved hours |
 | Audit logging | `--audit-log` writes structured JSON | SIEM integration, compliance audit trail |
+| Webhook alerts | `--alert-webhook-url` fires JSON POST on events | Real-time incident notification |
 
 ## Project Structure
 
@@ -243,6 +245,7 @@ l3-firewall/
 │   │   └── evaluator.go            #   Evaluator interface
 │   ├── conntrack/table.go          # 5-tuple connection tracking
 │   ├── ratelimit/ratelimit.go      # Per-IP EWMA rate limiter
+│   ├── alert/alert.go              # Webhook alerting with cooldown
 │   ├── audit/audit.go              # Structured JSON audit logging
 │   ├── metrics/metrics.go          # Prometheus metrics
 │   └── admin/api.go                # REST admin API

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/audit"
+	"github.com/monch1962/l3-firewall/internal/alert"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/packet"
@@ -60,6 +61,7 @@ type Engine struct {
 	failClosed  bool
 	running     bool
 	auditLogger *audit.Logger // nil = no audit logging
+	alertRouter *alert.Router // nil = no alerts
 
 	// Stats counters
 	packetsProcessed int64
@@ -80,8 +82,8 @@ type Engine struct {
 }
 
 // New creates a firewall engine with the given components.
-// Pass nil for auditLogger to disable audit logging.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger) *Engine {
+// Pass nil for auditLogger or alertRouter to disable those features.
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
@@ -89,6 +91,7 @@ func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClo
 		failClosed:   failClosed,
 		auditOnly:    auditOnly,
 		auditLogger:  al,
+		alertRouter:  ar,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 		blockStats:   make(map[string]int64),
 	}
@@ -196,6 +199,18 @@ func (e *Engine) logAudit(eventType, traceID string, pi *packet.PacketInfo, reas
 	})
 }
 
+// fireAlert dispatches an alert via the alert router if configured.
+func (e *Engine) fireAlert(alertType alert.AlertType, message string) {
+	if e.alertRouter != nil {
+		e.alertRouter.Send(alert.AlertEvent{
+			Type:      alertType,
+			Message:   message,
+			Source:    "engine",
+			Timestamp: time.Now(),
+		})
+	}
+}
+
 // evaluatePacket runs the full firewall evaluation pipeline on a parsed packet.
 // Returns the OPA result (Allowed + Reason). Panics are recovered and
 // returned as blocked results (fail-closed).
@@ -242,6 +257,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 		e.recordBlock(pi, reason, tid)
 		e.logAudit("packet_block", tid, pi, reason)
+		e.fireAlert(alert.AlertConnLimit, reason+" src="+pi.SrcIP)
 		return &opa.Result{Allowed: false, Reason: reason}
 	}
 
@@ -291,6 +307,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 			e.recordBlock(pi, reason, tid)
 			e.logAudit("packet_block", tid, pi, reason)
+			e.fireAlert(alert.AlertOPAError, reason)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
 		e.packetsAllowed++
