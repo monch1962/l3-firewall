@@ -8,6 +8,7 @@
 #   input.packet       — parsed packet headers (src_ip, dst_ip, protocol, ports, flags, fragment)
 #   input.connection   — connection state (established, tcp_state, packets_in_flow, age_ms, recent_ports)
 #   input.rate         — per-source rate info (src_ip_pps, src_ip_bps, src_port_pps, new_conns_per_sec)
+#   input.time         — current UTC time (utc_hour 0-23, utc_day 0=Sun 6=Sat)
 
 package l3_firewall
 
@@ -43,6 +44,18 @@ enable_ingress_egress := true
 
 # Port scan detection
 port_scan_threshold := 20
+
+# Time-based access schedule rules
+# Each rule: {ports: set(number), days: set(number), start_hour: number, end_hour: number, effect: "deny"|"allow"}
+#   ports — destination ports this rule applies to
+#   days — days of week (0=Sunday, 6=Saturday), empty means all days
+#   start_hour — inclusive hour (0-23 UTC)
+#   end_hour — exclusive hour (0-23 UTC)
+#   effect — "deny" to block during the window, "allow" to allow only during the window
+time_based_rules := [
+    # Example: block SSH on weekdays outside 9-5
+    # {"ports": {22}, "days": {1, 2, 3, 4, 5}, "start_hour": 9, "end_hour": 17, "effect": "deny"},
+]
 
 # =============================================================================
 # DEFAULT: allow all traffic
@@ -220,6 +233,68 @@ deny_reason := sprintf("new connection rate exceeded: %v/sec", [input.rate.new_c
 deny_port_rate if { input.rate.src_port_pps > max_port_pps }
 allow := false if { deny_port_rate }
 deny_reason := sprintf("per-port rate limit: %v pps to port %v", [input.rate.src_port_pps, input.packet.dst_port]) if { deny_port_rate }
+
+# =============================================================================
+# RULE 15: Time-Based Access Control — schedule-based port allow/deny
+# =============================================================================
+
+# Helper: check if current time matches a rule's schedule
+time_based_matches(rule) if {
+    # Check day of week (empty days = all days)
+    count(rule.days) == 0
+}
+time_based_matches(rule) if {
+    rule.days[input.time.utc_day]
+}
+
+# Helper: check if current hour is within the rule's window
+time_based_in_window(rule) if {
+    input.time.utc_hour >= rule.start_hour
+    input.time.utc_hour < rule.end_hour
+}
+
+# Deny rule for time-based blocks (effect = "deny")
+deny_time_based if {
+    some rule in time_based_rules
+    rule.effect == "deny"
+    port_in_ranges(input.packet.dst_port, rule.ports)
+    time_based_matches(rule)
+    time_based_in_window(rule)
+}
+
+allow := false if { deny_time_based }
+
+deny_reason := sprintf("time-based block: port=%v during restricted hours (UTC %v:00-%v:00)", [
+    input.packet.dst_port, rule.start_hour, rule.end_hour
+]) if {
+    some rule in time_based_rules
+    rule.effect == "deny"
+    port_in_ranges(input.packet.dst_port, rule.ports)
+    time_based_matches(rule)
+    time_based_in_window(rule)
+}
+
+# Allow rule for time-based exceptions (effect = "allow")
+# When an "allow" rule matches, the default allow is reversed — block outside the window
+deny_time_based_outside_window if {
+    some rule in time_based_rules
+    rule.effect == "allow"
+    port_in_ranges(input.packet.dst_port, rule.ports)
+    time_based_matches(rule)
+    not time_based_in_window(rule)
+}
+
+allow := false if { deny_time_based_outside_window }
+
+deny_reason := sprintf("time-based block outside window: port=%v (only allowed UTC %v:00-%v:00)", [
+    input.packet.dst_port, rule.start_hour, rule.end_hour
+]) if {
+    some rule in time_based_rules
+    rule.effect == "allow"
+    port_in_ranges(input.packet.dst_port, rule.ports)
+    time_based_matches(rule)
+    not time_based_in_window(rule)
+}
 
 # =============================================================================
 # HELPERS

@@ -238,3 +238,100 @@ test_per_port_rate_over_limit if {
 test_combined_ssh_blocked if {
     not allow with input.packet as {"src_ip": "10.0.1.100", "protocol": "TCP", "dst_port": 22}
 }
+
+# =============================================================================
+# RULE 15: TIME-BASED ACCESS CONTROL
+# =============================================================================
+# All tests override blocked_ports to {} to isolate from port control rules.
+
+test_time_based_default_empty_rules_no_block if {
+    allow with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 3, "utc_day": 3}
+}
+
+test_time_based_deny_within_window if {
+    not allow with time_based_rules as [{"ports": {22}, "days": {3}, "start_hour": 0, "end_hour": 23, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 14, "utc_day": 3}
+}
+
+test_time_based_deny_outside_window if {
+    allow with time_based_rules as [{"ports": {22}, "days": {3}, "start_hour": 9, "end_hour": 17, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 20, "utc_day": 3}
+}
+
+test_time_based_deny_wrong_day_allowed if {
+    allow with time_based_rules as [{"ports": {22}, "days": {1}, "start_hour": 0, "end_hour": 23, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 14, "utc_day": 3}
+}
+
+test_time_based_deny_wrong_port_allowed if {
+    allow with time_based_rules as [{"ports": {22}, "days": {3}, "start_hour": 0, "end_hour": 23, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 443}
+        with input.time as {"utc_hour": 14, "utc_day": 3}
+}
+
+test_time_based_deny_reason if {
+    deny_reason == "time-based block: port=22 during restricted hours (UTC 0:00-23:00)"
+        with time_based_rules as [{"ports": {22}, "days": {3}, "start_hour": 0, "end_hour": 23, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 14, "utc_day": 3}
+}
+
+test_time_based_allow_within_window if {
+    allow with time_based_rules as [{"ports": {443}, "days": {3}, "start_hour": 9, "end_hour": 17, "effect": "allow"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 443}
+        with input.time as {"utc_hour": 12, "utc_day": 3}
+}
+
+test_time_based_allow_outside_window_blocked if {
+    not allow with time_based_rules as [{"ports": {443}, "days": {3}, "start_hour": 9, "end_hour": 17, "effect": "allow"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 443}
+        with input.time as {"utc_hour": 20, "utc_day": 3}
+}
+
+test_time_based_allow_reason_outside_window if {
+    deny_reason == "time-based block outside window: port=443 (only allowed UTC 9:00-17:00)"
+        with time_based_rules as [{"ports": {443}, "days": {3}, "start_hour": 9, "end_hour": 17, "effect": "allow"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 443}
+        with input.time as {"utc_hour": 20, "utc_day": 3}
+}
+
+test_time_based_deny_all_days_empty_set if {
+    not allow with time_based_rules as [{"ports": {22}, "days": {}, "start_hour": 0, "end_hour": 23, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 14, "utc_day": 0}
+}
+
+test_time_based_deny_multiple_ports if {
+    not allow with time_based_rules as [{"ports": {22, 23, 3389}, "days": {3}, "start_hour": 0, "end_hour": 23, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 23}
+        with input.time as {"utc_hour": 14, "utc_day": 3}
+}
+
+test_time_based_deny_start_hour_edge_case if {
+    not allow with time_based_rules as [{"ports": {22}, "days": {3}, "start_hour": 9, "end_hour": 17, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 9, "utc_day": 3}
+}
+
+test_time_based_deny_end_hour_edge_case if {
+    allow with time_based_rules as [{"ports": {22}, "days": {3}, "start_hour": 9, "end_hour": 17, "effect": "deny"}]
+        with blocked_ports as {}
+        with input.packet as {"protocol": "TCP", "dst_port": 22}
+        with input.time as {"utc_hour": 17, "utc_day": 3}
+}

@@ -1,6 +1,8 @@
 package opa
 
 import (
+	"time"
+
 	"github.com/monch1962/l3-firewall/internal/packet"
 )
 
@@ -8,16 +10,16 @@ import (
 // Uses packet.TCPFlags and packet.FragmentInfo directly (DRY — avoids duplicating
 // identical type definitions from the packet package).
 type PacketInfo struct {
-	SrcIP      string             `json:"src_ip"`
-	DstIP      string             `json:"dst_ip"`
-	Protocol   string             `json:"protocol"`
-	SrcPort    uint16             `json:"src_port"`
-	DstPort    uint16             `json:"dst_port"`
-	TCPFlags   packet.TCPFlags    `json:"tcp_flags"`
-	ICMPType   *uint8             `json:"icmp_type"`
-	ICMPCode   *uint8             `json:"icmp_code"`
-	Fragment   packet.FragmentInfo `json:"fragment"`
-	PacketSize int                `json:"packet_size"`
+	SrcIP      string               `json:"src_ip"`
+	DstIP      string               `json:"dst_ip"`
+	Protocol   string               `json:"protocol"`
+	SrcPort    uint16               `json:"src_port"`
+	DstPort    uint16               `json:"dst_port"`
+	TCPFlags   packet.TCPFlags      `json:"tcp_flags"`
+	ICMPType   *uint8               `json:"icmp_type"`
+	ICMPCode   *uint8               `json:"icmp_code"`
+	Fragment   packet.FragmentInfo  `json:"fragment"`
+	PacketSize int                  `json:"packet_size"`
 }
 
 // ConnectionInfo holds connection tracking state for OPA input.
@@ -31,11 +33,17 @@ type ConnectionInfo struct {
 
 // RateInfo holds per-source rate tracking for OPA input.
 type RateInfo struct {
-	SrcIPpps      float64 `json:"src_ip_pps"`
-	SrcIPbps      float64 `json:"src_ip_bps"`
-	SrcPortPPS    float64 `json:"src_port_pps"`     // PPS to a specific destination port
-	SrcPortBPS    float64 `json:"src_port_bps"`     // BPS to a specific destination port
+	SrcIPpps       float64 `json:"src_ip_pps"`
+	SrcIPbps       float64 `json:"src_ip_bps"`
+	SrcPortPPS     float64 `json:"src_port_pps"`      // PPS to a specific destination port
+	SrcPortBPS     float64 `json:"src_port_bps"`      // BPS to a specific destination port
 	NewConnsPerSec float64 `json:"new_conns_per_sec"` // New connections/sec from this source
+}
+
+// TimeInfo holds current UTC time fields for time-based policy evaluation.
+type TimeInfo struct {
+	UtcHour int `json:"utc_hour"` // 0-23, current hour in UTC
+	UtcDay  int `json:"utc_day"`  // 0=Sunday, 6=Saturday
 }
 
 // Input is the complete OPA input document.
@@ -43,6 +51,7 @@ type Input struct {
 	Packet     PacketInfo     `json:"packet"`
 	Connection ConnectionInfo `json:"connection"`
 	Rate       RateInfo       `json:"rate"`
+	Time       TimeInfo       `json:"time"`
 }
 
 // BuildInput constructs the OPA input from parsed packet info, rate data,
@@ -50,6 +59,7 @@ type Input struct {
 // and recent destination ports for port-scan detection.
 func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpState string,
 	portPPS, portBPS, newConnRate float64, recentPorts []uint16) *Input {
+	now := time.Now().UTC()
 	input := &Input{
 		Packet: PacketInfo{
 			SrcIP:      pi.SrcIP,
@@ -69,11 +79,15 @@ func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpSt
 			PacketsInFlow: 1,
 		},
 		Rate: RateInfo{
-			SrcIPpps:      pps,
-			SrcIPbps:      bps,
-			SrcPortPPS:    portPPS,
-			SrcPortBPS:    portBPS,
+			SrcIPpps:       pps,
+			SrcIPbps:       bps,
+			SrcPortPPS:     portPPS,
+			SrcPortBPS:     portBPS,
 			NewConnsPerSec: newConnRate,
+		},
+		Time: TimeInfo{
+			UtcHour: now.Hour(),
+			UtcDay:  int(now.Weekday()),
 		},
 	}
 

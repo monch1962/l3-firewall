@@ -12,11 +12,11 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **15 attack categories** with **~91 Go tests** and **52 Rego tests** plus **28 demo tests** across 8 internal packages and 12 standalone demos.
+l3-firewall's OPA Rego policies cover **16 attack categories** with **~91 Go tests** and **65 Rego tests** plus **28 demo tests** across 8 internal packages and 12 standalone demos.
 
 See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
-### OPA Policy Coverage (15 categories)
+### OPA Policy Coverage (16 categories)
 
 | # | Attack Vector | Detection | Status |
 |---|---|---|---|
@@ -35,6 +35,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | 13 | **New Connection Rate** — Too many new flows from one source | `new_conns_per_sec` threshold | ✅ |
 | 14 | **Per-Port Rate Limit** — Too much traffic to a specific dst port | `src_port_pps` threshold | ✅ |
 | 15 | **Connection Limit** — Too many concurrent flows from one source IP | Per-source flow counter + `MaxFlowsPerSrcIP` | ✅ |
+| 16 | **Time-Based Access** — Block/allow by hour and day of week | `time_based_rules` with `utc_hour`/`utc_day` | ✅ |
 
 ### Red-Team Verified Transport Protection (9 attack simulation tests)
 
@@ -50,7 +51,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | R8 | **Rate limiter burst gap** — 60s cleanup window OOM | MaxEntries eviction handles bursts | ✅ |
 | R9 | **Per-source flow count unbounded** — Many src IPs exhaust `srcFlowCount` map | Per-IP counter naturally bounded by `MaxEntries` (65536) | ✅ |
 
-### Verified Test Coverage (75 Go tests, 52 Rego tests)
+### Verified Test Coverage (75 Go tests, 65 Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
@@ -60,7 +61,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | `internal/ratelimit` | 15 | Basic allowance, burst, per-IP independence, byte rate, stale cleanup, active key preservation, concurrent, rate queries, per-dst-port AllowPort, GetPortPPS, port independence, unknown port |
 | `internal/engine` | 11 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK |
 | `internal/admin` | 8 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth |
-| OPA Policies (Rego) | 52 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1) |
+| OPA Policies (Rego) | 65 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1), time-based rules (13) |
 
 ## Architecture
 
@@ -69,7 +70,7 @@ Packets → [nftables NFQUEUE] → engine.evaluatePacket()
                                   ├── packet.ParsePacket(raw bytes)
                                   ├── conntrack.LookupOrCreate(5-tuple)
                                   ├── ratelimit.Allow(srcIP, packetSize)
-                                  ├── opa.BuildInput(packet + rate + conn state)
+                                  ├── opa.BuildInput(packet + rate + conn state + time)
                                   ├── opaEval.Evaluate(input)
                                   └── NF_ACCEPT or NF_DROP + stats
 
@@ -192,6 +193,7 @@ To change configuration: edit the `.rego` file — the hot-reloader picks up cha
 | `port_scan_window_sec` | number | `10` | Port scan detection window |
 | `max_new_connections_per_second` | number | `1000` | Per-IP new connection rate limit |
 | `max_port_pps` | number | `500` | Per-destination-port PPS limit |
+| `time_based_rules` | array | `[]` | Scheduled access rules: `{ports, days(0-6), start_hour, end_hour, effect("deny"|"allow")}` |
 
 ## Security Features
 
@@ -219,6 +221,7 @@ To change configuration: edit the `.rego` file — the hot-reloader picks up cha
 | Graceful shutdown | Signal handling + context cancellation | Dropped connections on deploy |
 | Per-IP rate tracking | EWMA-based PPS/BPS | Memory-efficient rate estimation |
 | Connection limit | Per-source flow counter capped by `MaxFlowsPerSrcIP` | DoS via excessive concurrent connections |
+| Time-based scheduling | `time_based_rules` in Rego policy with UTC hour/day | Access outside approved hours |
 
 ## Project Structure
 
