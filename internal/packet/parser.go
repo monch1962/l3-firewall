@@ -28,6 +28,8 @@ type IPv6ExtHeaderType string
 
 // PacketInfo holds all parsed fields from a single L3/L4 packet.
 type PacketInfo struct {
+	SrcMAC        string             `json:"src_mac,omitempty"` // source MAC address
+	DstMAC        string             `json:"dst_mac,omitempty"` // destination MAC address
 	SrcIP         string             `json:"src_ip"`
 	DstIP         string             `json:"dst_ip"`
 	Protocol      string             `json:"protocol"` // "TCP", "UDP", "ICMP", etc.
@@ -80,10 +82,14 @@ func parseIPv4Packet(raw []byte) (*PacketInfo, error) {
 		return nil, fmt.Errorf("failed to cast IPv4 layer")
 	}
 
+	srcMAC, dstMAC := extractMAC(packet)
+
 	info := &PacketInfo{
-		SrcIP:      ipv4.SrcIP.String(),
-		DstIP:      ipv4.DstIP.String(),
-		PacketSize: len(packet.Data()),
+		SrcMAC:      srcMAC,
+		DstMAC:      dstMAC,
+		SrcIP:       ipv4.SrcIP.String(),
+		DstIP:       ipv4.DstIP.String(),
+		PacketSize:  len(packet.Data()),
 		Fragment: FragmentInfo{
 			IsFragment:    ipv4.FragOffset > 0 || ipv4.Flags&layers.IPv4MoreFragments != 0,
 			MoreFragments: ipv4.Flags&layers.IPv4MoreFragments != 0,
@@ -127,6 +133,9 @@ func parseIPv6Packet(raw []byte) (*PacketInfo, error) {
 	l4Proto := ipv6.NextHeader
 	extHeaders := []IPv6ExtHeaderType{}
 
+	// Extract MAC addresses from ethernet layer
+	srcMAC, dstMAC := extractMAC(packet)
+
 	// Check all layers for extension headers
 	for _, layer := range packet.Layers() {
 		if name, ok := extHeaderTypes[layer.LayerType()]; ok {
@@ -139,6 +148,8 @@ func parseIPv6Packet(raw []byte) (*PacketInfo, error) {
 	}
 
 	info := &PacketInfo{
+		SrcMAC:         srcMAC,
+		DstMAC:         dstMAC,
 		SrcIP:          ipv6.SrcIP.String(),
 		DstIP:          ipv6.DstIP.String(),
 		PacketSize:     len(packet.Data()),
@@ -227,4 +238,17 @@ func populateL4(info *PacketInfo, packet gopacket.Packet, proto layers.IPProtoco
 	default:
 		info.Protocol = fmt.Sprintf("IP-%d", proto)
 	}
+}
+
+// extractMAC returns the source and destination MAC addresses from the ethernet layer.
+func extractMAC(packet gopacket.Packet) (srcMAC, dstMAC string) {
+	ethLayer := packet.Layer(layers.LayerTypeEthernet)
+	if ethLayer == nil {
+		return "", ""
+	}
+	eth, ok := ethLayer.(*layers.Ethernet)
+	if !ok {
+		return "", ""
+	}
+	return eth.SrcMAC.String(), eth.DstMAC.String()
 }

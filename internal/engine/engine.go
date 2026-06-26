@@ -20,6 +20,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/capture"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/geoip"
+	"github.com/monch1962/l3-firewall/internal/l2filter"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/packet"
 	"github.com/monch1962/l3-firewall/internal/persist"
@@ -70,6 +71,7 @@ type Engine struct {
 	threatIntel *threatintel.Blocklist // nil = no threat intel blocking
 	pcapWriter  *capture.Writer       // nil = no pcap capture
 	statePath   string                // path for persisting state (empty = no persistence)
+	l2Filter    *l2filter.Filter      // nil = no L2 filtering
 
 	// Stats counters
 	packetsProcessed int64
@@ -91,7 +93,7 @@ type Engine struct {
 
 // New creates a firewall engine with the given components.
 // Pass nil for auditLogger or alertRouter to disable those features.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist, pw *capture.Writer, stateFile string) *Engine {
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist, pw *capture.Writer, stateFile string, l2 *l2filter.Filter) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
@@ -104,6 +106,7 @@ func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClo
 		threatIntel:  ti,
 		pcapWriter:   pw,
 		statePath:    stateFile,
+		l2Filter:     l2,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 		blockStats:   make(map[string]int64),
 	}
@@ -278,7 +281,19 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		e.conntrack.RecordDestPort(pi.SrcIP, pi.DstPort)
 	}
 
-	// 2. Rate tracking — per-IP and per-destination-port
+	// 3. L2 filtering — MAC address check
+	if e.l2Filter != nil {
+		if ok, reason := e.l2Filter.MACAllowed(pi.SrcMAC); !ok {
+			e.packetsBlocked++
+			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "mac", pi.SrcMAC,
+				"protocol", pi.Protocol, "trace_id", tid)
+			e.recordBlock(pi, reason, tid)
+			e.logAudit("packet_block", tid, pi, reason)
+			return &opa.Result{Allowed: false, Reason: reason}
+		}
+	}
+
+	// 4. Rate tracking — per-IP and per-destination-port
 	pps, bps := e.ratelimit.Allow(pi.SrcIP, packetSize)
 	portPPS, portBPS := e.ratelimit.AllowPort(pi.SrcIP, pi.DstPort, packetSize)
 	newConnRate := e.conntrack.NewConnectionRate()

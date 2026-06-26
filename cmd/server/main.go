@@ -178,7 +178,7 @@ func main() {
 
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist, pcapCapture, *stateFile)
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist, pcapCapture, *stateFile, nil)
 
 	// Initialize metrics
 	metrics.Init(func() int { return ct.Len() })
