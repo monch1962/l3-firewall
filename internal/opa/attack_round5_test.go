@@ -4,6 +4,8 @@ package opa
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/monch1962/l3-firewall/internal/packet"
 )
 
 // ── R41: OPA returns allow as string "false" ─────────────────────
@@ -26,7 +28,7 @@ allow := "false" if { input.packet.dst_port == 22 }
 		Packet: PacketInfo{
 			SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP",
 			SrcPort: 44001, DstPort: 22,
-			TCPFlags: TCPFlags{SYN: true},
+			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
 
@@ -135,7 +137,7 @@ reason := 42 if { input.packet.dst_port == 22 }
 		Packet: PacketInfo{
 			SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP",
 			SrcPort: 44001, DstPort: 22,
-			TCPFlags: TCPFlags{SYN: true},
+			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
 

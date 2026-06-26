@@ -134,7 +134,7 @@ func TestAttack_OPATimeoutHardcoded(t *testing.T) {
 		Packet: opa.PacketInfo{
 			SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP",
 			SrcPort: 44001, DstPort: 443,
-			TCPFlags: opa.TCPFlags{SYN: true},
+			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
 	result, err := eval.Evaluate(input)

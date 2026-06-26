@@ -5,32 +5,19 @@ import (
 )
 
 // PacketInfo mirrors the packet fields fed into OPA evaluation.
+// Uses packet.TCPFlags and packet.FragmentInfo directly (DRY — avoids duplicating
+// identical type definitions from the packet package).
 type PacketInfo struct {
-	SrcIP      string        `json:"src_ip"`
-	DstIP      string        `json:"dst_ip"`
-	Protocol   string        `json:"protocol"`
-	SrcPort    uint16        `json:"src_port"`
-	DstPort    uint16        `json:"dst_port"`
-	TCPFlags   TCPFlags      `json:"tcp_flags"`
-	ICMPType   *uint8        `json:"icmp_type"`
-	ICMPCode   *uint8        `json:"icmp_code"`
-	Fragment   FragmentInfo  `json:"fragment"`
-	PacketSize int           `json:"packet_size"`
-}
-
-// FragmentInfo mirrors IP fragmentation fields for OPA input.
-type FragmentInfo struct {
-	IsFragment    bool `json:"is_fragment"`
-	MoreFragments bool `json:"more_fragments"`
-	Offset        int  `json:"offset"`
-}
-
-// TCPFlags mirrors the TCP control flags for OPA input.
-type TCPFlags struct {
-	SYN bool `json:"syn"`
-	ACK bool `json:"ack"`
-	RST bool `json:"rst"`
-	FIN bool `json:"fin"`
+	SrcIP      string             `json:"src_ip"`
+	DstIP      string             `json:"dst_ip"`
+	Protocol   string             `json:"protocol"`
+	SrcPort    uint16             `json:"src_port"`
+	DstPort    uint16             `json:"dst_port"`
+	TCPFlags   packet.TCPFlags    `json:"tcp_flags"`
+	ICMPType   *uint8             `json:"icmp_type"`
+	ICMPCode   *uint8             `json:"icmp_code"`
+	Fragment   packet.FragmentInfo `json:"fragment"`
+	PacketSize int                `json:"packet_size"`
 }
 
 // ConnectionInfo holds connection tracking state for OPA input.
@@ -70,14 +57,10 @@ func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpSt
 			Protocol:   pi.Protocol,
 			SrcPort:    pi.SrcPort,
 			DstPort:    pi.DstPort,
-			TCPFlags:   TCPFlags(pi.TCPFlags),
+			TCPFlags:   pi.TCPFlags,
 			ICMPType:   pi.ICMPType,
 			ICMPCode:   pi.ICMPCode,
-			Fragment:   FragmentInfo{
-				IsFragment:    pi.Fragment.IsFragment,
-				MoreFragments: pi.Fragment.MoreFragments,
-				Offset:        pi.Fragment.Offset,
-			},
+			Fragment:   pi.Fragment,
 			PacketSize: pi.PacketSize,
 		},
 		Connection: ConnectionInfo{

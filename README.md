@@ -12,7 +12,9 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **14 attack categories** with **75 Go tests** and **52 Rego tests** (**127 total**) across 7 internal packages + 8 red-team security tests:
+l3-firewall's OPA Rego policies cover **14 attack categories** with **~90 Go tests** and **52 Rego tests** plus **28 demo tests** across 8 internal packages and 12 standalone demos.
+
+See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
 ### OPA Policy Coverage (14 categories)
 

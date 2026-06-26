@@ -182,7 +182,7 @@ reason := "blocked SSH" if { allow == false }
 			Protocol: "TCP",
 			SrcPort:  44001,
 			DstPort:  22,
-			TCPFlags: TCPFlags{SYN: true},
+			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
 	result, err := eval.Evaluate(input)
@@ -204,7 +204,7 @@ reason := "blocked SSH" if { allow == false }
 			Protocol: "TCP",
 			SrcPort:  44002,
 			DstPort:  80,
-			TCPFlags: TCPFlags{SYN: true},
+			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
 	result2, err := eval.Evaluate(input2)
@@ -240,7 +240,7 @@ allow := false if { input.packet.dst_port == blocked_port }
 		Packet: PacketInfo{
 			SrcIP: "10.0.1.100", DstIP: "10.0.2.50",
 			Protocol: "TCP", SrcPort: 44001, DstPort: 8080,
-			TCPFlags: TCPFlags{SYN: true},
+			TCPFlags: packet.TCPFlags{SYN: true},
 		},
 	}
 	result, err := eval.Evaluate(input)
@@ -274,7 +274,7 @@ allow := false if { deny_if_high_rate }
 
 	// Should block at 100 pps (exceeds 50)
 	input := &Input{
-		Packet: PacketInfo{SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP", DstPort: 80, TCPFlags: TCPFlags{SYN: true}},
+		Packet: PacketInfo{SrcIP: "10.0.1.100", DstIP: "10.0.2.50", Protocol: "TCP", DstPort: 80, TCPFlags: packet.TCPFlags{SYN: true}},
 		Rate:   RateInfo{SrcIPpps: 100},
 	}
 	result, err := eval.Evaluate(input)

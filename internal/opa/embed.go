@@ -1,3 +1,8 @@
+// Package opa provides embedded OPA/Rego evaluation for firewall policies.
+// Supports two modes: in-process embedded evaluation (EmbeddedEvaluator) and
+// external sidecar. The package handles input document construction from
+// parsed packet data, thread-safe parameter management via DataStore, and
+// OPA result parsing with type-safe allow/reason extraction.
 package opa
 
 import (
