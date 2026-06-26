@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover 10 attack categories with 46 Go tests and 3 Rego tests across 7 internal packages:
+l3-firewall's OPA Rego policies cover 10 attack categories with **49 Go tests** and **37 Rego tests** (**86 total**) across 7 internal packages:
 
 ### OPA Policy Coverage (10 categories)
 
@@ -29,16 +29,16 @@ l3-firewall's OPA Rego policies cover 10 attack categories with 46 Go tests and 
 | 9 | **Protocol Blocking** — Block traffic by IP protocol | `blocked_protocols` list | ✅ |
 | 10 | **Traffic Rate Limit** — Per-source-IP packets/sec budget | `max_packets_per_second` | ✅ |
 
-### Verified Test Coverage (46 Go tests, 3 Rego tests)
+### Verified Test Coverage (49 Go tests, 37 Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
 | `internal/packet` | 8 | TCP (SYN/SYN-ACK-RST-FIN), UDP, ICMP echo, short/nil, size, IPv6 |
 | `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
-| `internal/conntrack` | 17 | CRUD, establishment, 5-tuple uniqueness, idle expiry, active flow refresh, max-entry eviction, concurrent access, port recording/dedup, flow age |
+| `internal/conntrack` | 9 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, concurrent access, default config |
 | `internal/ratelimit` | 11 | Basic allowance, burst handling, per-IP independence, byte rate limiting, stale cleanup, active key preservation, concurrent access, rate queries |
-| `internal/engine` | 9 | Allow, block, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, packet counting, Run/Stop lifecycle |
-| `internal/admin` | 7 | Health, stats, rules GET/UPDATE, invalid JSON, wrong method, auth (no token, wrong token, valid token) |
+| `internal/engine` | 9 | Allow, block, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, conntrack stats |
+| `internal/admin` | 8 | Health, stats, blocks, rules GET/UPDATE, invalid JSON, wrong method, auth (no token, wrong token, valid token) |
 
 ## Architecture
 
@@ -52,8 +52,10 @@ Packets → [nftables NFQUEUE] → engine.evaluatePacket()
                                   └── NF_ACCEPT or NF_DROP + stats
 
 Admin API (:8082)
-  ├── /admin/health     → {"status":"ok","version":"0.1.0","uptime":"..."}
-  ├── /admin/stats      → {"packets_processed":N,"packets_allowed":N,"packets_blocked":N}
+  ├── /admin/health     → {"status":"ok","version":"0.1.0","uptime":"...","engine_running":bool}
+  ├── /admin/stats      → {"packets_processed":N,"packets_allowed":N,"packets_blocked":N,
+  │                        "conntrack_entries":N,"conntrack_expired":N,"conntrack_evicted":N}
+  ├── /admin/blocks     → [{timestamp,src_ip,dst_ip,protocol,src_port,dst_port,reason,...}]
   ├── /admin/rules      → GET current OPA params
   └── /admin/rules/update → POST new params (live reload)
 
@@ -135,7 +137,9 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `--rate-limit-pps` | `0` | Per-IP packet rate limit (0 = unlimited) |
 | `--rate-limit-bps` | `0` | Per-IP byte rate limit (0 = unlimited) |
 | `--conntrack-max` | `65536` | Max tracked connections |
-| `--conntrack-idle` | `5m` | Connection idle timeout |
+| `--conntrack-idle` | `5m` | TCP connection idle timeout |
+| `--conntrack-udp-timeout` | `30s` | UDP connection idle timeout |
+| `--conntrack-icmp-timeout` | `5s` | ICMP connection idle timeout |
 
 ### Parameters JSON (`config/params.json`)
 
@@ -156,7 +160,9 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | `enable_stateful_inspection` | bool | `true` | Enable connection state tracking |
 | `enable_ingress_egress_filtering` | bool | `true` | Enable ingress/egress filtering |
 | `connection_table_size` | number | `65536` | Max tracked connections |
-| `connection_idle_timeout_sec` | number | `300` | Connection idle timeout |
+| `connection_idle_timeout_sec` | number | `300` | TCP connection idle timeout (s) |
+| `connection_udp_timeout_sec` | number | `30` | UDP connection idle timeout (s) |
+| `connection_icmp_timeout_sec` | number | `5` | ICMP connection idle timeout (s) |
 | `port_scan_threshold` | number | `20` | Unique ports before scan detection |
 | `port_scan_window_sec` | number | `10` | Port scan detection window |
 
@@ -168,6 +174,12 @@ The entrypoint (`deploy/entrypoint.sh`) configures nftables to QUEUE forward and
 | OPA fail-closed | `--opa-fail-closed` | Bypass via OPA DoS |
 | Audit-only mode | `--opa-audit-only` | Safe data collection before enforcement |
 | Deny-override model | Default `allow := true` | Safe phased rollout |
+| CIDR subnet matching | `net.cidr_contains` | Real subnet filtering (not string match) |
+| Per-protocol timeouts | TCP=300s, UDP=30s, ICMP=5s | Optimal memory usage per protocol |
+| Drop logging | Structured slog + ring buffer | Forensic analysis of blocked traffic |
+| Recent-blocks API | `/admin/blocks` | Real-time visibility into blocks |
+| Conntrack stats | `/admin/stats` | Monitoring connection table health |
+| Engine health | `/admin/health` endpoint | Liveness and readiness probes |
 | Bodies size limit | `http.MaxBytesReader` | Admin API OOM |
 | Server timeouts | `ReadHeaderTimeout`, `IdleTimeout` | Slow loris / connection exhaustion |
 | Graceful shutdown | Signal handling + context cancellation | Dropped connections on deploy |

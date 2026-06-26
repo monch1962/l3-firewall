@@ -45,7 +45,9 @@ func main() {
 		rateLimitPPS     = flag.Float64("rate-limit-pps", 0, "Per-IP packet rate limit (0 = unlimited)")
 		rateLimitBPS     = flag.Float64("rate-limit-bps", 0, "Per-IP byte rate limit (0 = unlimited)")
 		conntrackMax     = flag.Int("conntrack-max", 65536, "Max tracked connections")
-		conntrackIdle    = flag.Duration("conntrack-idle", 5*time.Minute, "Connection idle timeout")
+		conntrackIdle    = flag.Duration("conntrack-idle", 5*time.Minute, "TCP connection idle timeout")
+		conntrackUDP     = flag.Duration("conntrack-udp-timeout", 30*time.Second, "UDP connection idle timeout")
+		conntrackICMP    = flag.Duration("conntrack-icmp-timeout", 5*time.Second, "ICMP connection idle timeout")
 	)
 	flag.Parse()
 
@@ -106,6 +108,8 @@ func main() {
 	ctConfig := conntrack.Config{
 		MaxEntries:  *conntrackMax,
 		IdleTimeout: *conntrackIdle,
+		UDPTimeout:  *conntrackUDP,
+		ICMPTimeout: *conntrackICMP,
 	}
 	ct := conntrack.NewTable(ctConfig)
 
