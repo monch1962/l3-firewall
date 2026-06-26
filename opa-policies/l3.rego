@@ -138,7 +138,6 @@ deny_blocked_port if {
 }
 
 allow := false if { deny_blocked_port }
-deny_reason := sprintf("blocked TCP port %v", [input.packet.dst_port]) if { deny_blocked_port }
 
 deny_blocked_port if {
     input.packet.protocol == "UDP"
@@ -146,7 +145,8 @@ deny_blocked_port if {
 }
 
 allow := false if { deny_blocked_port }
-deny_reason := sprintf("blocked UDP port %v", [input.packet.dst_port]) if { deny_blocked_port }
+
+deny_reason := sprintf("blocked port %v (%s)", [input.packet.dst_port, input.packet.protocol]) if { deny_blocked_port }
 
 # =============================================================================
 # RULE 7: ICMP Control — block specific ICMP types/codes
@@ -158,7 +158,6 @@ deny_icmp if {
 }
 
 allow := false if { deny_icmp }
-deny_reason := sprintf("blocked ICMP type %v", [input.packet.icmp_type]) if { deny_icmp }
 
 deny_icmp if {
     input.packet.protocol == "ICMP"
@@ -166,7 +165,8 @@ deny_icmp if {
 }
 
 allow := false if { deny_icmp }
-deny_reason := sprintf("blocked ICMP code %v", [input.packet.icmp_code]) if { deny_icmp }
+
+deny_reason := sprintf("blocked ICMP type=%v code=%v", [input.packet.icmp_type, input.packet.icmp_code]) if { deny_icmp }
 
 deny_icmp_flood if {
     input.packet.protocol == "ICMP"
@@ -216,9 +216,17 @@ deny_reason := sprintf("rate limit exceeded: %v pps", [input.rate.src_ip_pps]) i
 # HELPERS
 # =============================================================================
 
-# Check if an IP belongs to any subnet in the set
+# Check if an IP belongs to any subnet in the set.
+# Supports exact IPs (e.g. "10.0.0.1") and CIDR notation (e.g. "10.0.0.0/8").
+# Uses net.cidr_contains for proper subnet matching.
 ip_in_subnets(ip, subnets) if {
-    subnets[_] == ip
+    some cidr in subnets
+    contains(cidr, "/")
+    net.cidr_contains(cidr, ip)
+}
+
+ip_in_subnets(ip, subnets) if {
+    subnets[ip]
 }
 
 # =============================================================================
