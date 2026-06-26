@@ -22,6 +22,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/geoip"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/packet"
+	"github.com/monch1962/l3-firewall/internal/persist"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
 	"github.com/monch1962/l3-firewall/internal/threatintel"
 
@@ -68,6 +69,7 @@ type Engine struct {
 	geoipReader *geoip.Reader // nil = no GeoIP lookups
 	threatIntel *threatintel.Blocklist // nil = no threat intel blocking
 	pcapWriter  *capture.Writer       // nil = no pcap capture
+	statePath   string                // path for persisting state (empty = no persistence)
 
 	// Stats counters
 	packetsProcessed int64
@@ -89,7 +91,7 @@ type Engine struct {
 
 // New creates a firewall engine with the given components.
 // Pass nil for auditLogger or alertRouter to disable those features.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist, pw *capture.Writer) *Engine {
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist, pw *capture.Writer, stateFile string) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
@@ -101,6 +103,7 @@ func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClo
 		geoipReader:  gr,
 		threatIntel:  ti,
 		pcapWriter:   pw,
+		statePath:    stateFile,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 		blockStats:   make(map[string]int64),
 	}
@@ -401,8 +404,48 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) int {
 	return 1
 }
 
+// saveState persists the engine's block stats to a JSON file.
+func (e *Engine) saveState() {
+	if e.statePath == "" {
+		return
+	}
+	e.blockStatsMu.RLock()
+	stats := make(map[string]int64, len(e.blockStats))
+	for k, v := range e.blockStats {
+		stats[k] = v
+	}
+	e.blockStatsMu.RUnlock()
+	persist.SaveState(e.statePath, &persist.EngineState{BlockStats: stats})
+}
+
+// restoreState loads previously persisted state into the engine.
+func (e *Engine) restoreState() {
+	if e.statePath == "" {
+		return
+	}
+	state, err := persist.LoadState(e.statePath)
+	if err != nil {
+		slog.Warn("failed to load persisted state", "path", e.statePath, "error", err)
+		return
+	}
+	if state == nil || len(state.BlockStats) == 0 {
+		return
+	}
+	e.blockStatsMu.Lock()
+	for k, v := range state.BlockStats {
+		if len(e.blockStats) < maxBlockStatsReasons {
+			e.blockStats[k] = v
+		}
+	}
+	e.blockStatsMu.Unlock()
+	slog.Info("restored block stats from state file", "count", len(state.BlockStats))
+}
+
 // Run starts the NFQUEUE listener on the given queue number.
 func (e *Engine) Run(queueNum uint16) error {
+	// Restore state from previous run
+	e.restoreState()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	e.ctx = ctx
 	e.cancel = cancel
@@ -437,10 +480,12 @@ func (e *Engine) Run(queueNum uint16) error {
 		for {
 			select {
 			case <-ctx.Done():
+				e.saveState()
 				return
 			case <-ticker.C:
 				e.conntrack.Expire()
 				e.ratelimit.Cleanup(5 * time.Minute)
+				e.saveState()
 			}
 		}
 	}()

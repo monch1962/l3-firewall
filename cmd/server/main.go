@@ -60,6 +60,7 @@ func main() {
 		geoipDBPath   = flag.String("geoip-db", "", "Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup")
 		threatIntelURL = flag.String("threat-intel-url", "", "URL(s) to IP reputation blocklists (comma-separated)")
 		pcapDir       = flag.String("pcap-dir", "", "Directory for blocked packet pcap captures")
+		stateFile     = flag.String("state-file", "", "Path for persisting firewall state across restarts")
 	)
 	flag.Parse()
 
@@ -177,7 +178,7 @@ func main() {
 
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist, pcapCapture)
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist, pcapCapture, *stateFile)
 
 	// Initialize metrics
 	metrics.Init(func() int { return ct.Len() })
