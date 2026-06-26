@@ -17,6 +17,7 @@ import (
 
 	"github.com/monch1962/l3-firewall/internal/alert"
 	"github.com/monch1962/l3-firewall/internal/audit"
+	"github.com/monch1962/l3-firewall/internal/capture"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/geoip"
 	"github.com/monch1962/l3-firewall/internal/opa"
@@ -66,6 +67,7 @@ type Engine struct {
 	alertRouter *alert.Router // nil = no alerts
 	geoipReader *geoip.Reader // nil = no GeoIP lookups
 	threatIntel *threatintel.Blocklist // nil = no threat intel blocking
+	pcapWriter  *capture.Writer       // nil = no pcap capture
 
 	// Stats counters
 	packetsProcessed int64
@@ -87,7 +89,7 @@ type Engine struct {
 
 // New creates a firewall engine with the given components.
 // Pass nil for auditLogger or alertRouter to disable those features.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist) *Engine {
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist, pw *capture.Writer) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
@@ -98,6 +100,7 @@ func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClo
 		alertRouter:  ar,
 		geoipReader:  gr,
 		threatIntel:  ti,
+		pcapWriter:   pw,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 		blockStats:   make(map[string]int64),
 	}
@@ -390,6 +393,10 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) int {
 	result := e.evaluatePacket(pi, len(*attr.Payload))
 	if result.Allowed {
 		return 0
+	}
+	// Capture blocked packet to pcap if enabled
+	if e.pcapWriter != nil {
+		e.pcapWriter.WriteBlock(*attr.Payload)
 	}
 	return 1
 }

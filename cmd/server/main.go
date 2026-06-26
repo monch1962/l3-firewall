@@ -24,6 +24,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/admin"
 	"github.com/monch1962/l3-firewall/internal/alert"
 	"github.com/monch1962/l3-firewall/internal/audit"
+	"github.com/monch1962/l3-firewall/internal/capture"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/engine"
 	"github.com/monch1962/l3-firewall/internal/geoip"
@@ -58,6 +59,7 @@ func main() {
 		alertWebhookURL = flag.String("alert-webhook-url", "", "Webhook URL for firewall alerts (e.g. Slack, Discord)")
 		geoipDBPath   = flag.String("geoip-db", "", "Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup")
 		threatIntelURL = flag.String("threat-intel-url", "", "URL(s) to IP reputation blocklists (comma-separated)")
+		pcapDir       = flag.String("pcap-dir", "", "Directory for blocked packet pcap captures")
 	)
 	flag.Parse()
 
@@ -162,9 +164,20 @@ func main() {
 		slog.Info("threat intel enabled", "urls", *threatIntelURL)
 	}
 
+	// Create pcap capture writer if directory is specified
+	var pcapCapture *capture.Writer
+	if *pcapDir != "" {
+		var err error
+		pcapCapture, err = capture.NewWriter(capture.Config{Dir: *pcapDir})
+		if err != nil {
+			log.Fatalf("failed to create pcap writer: %v", err)
+		}
+		slog.Info("pcap capture enabled", "dir", *pcapDir)
+	}
+
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist)
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist, pcapCapture)
 
 	// Initialize metrics
 	metrics.Init(func() int { return ct.Len() })
