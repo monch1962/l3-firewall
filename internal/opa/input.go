@@ -46,12 +46,19 @@ type TimeInfo struct {
 	UtcDay  int `json:"utc_day"`  // 0=Sunday, 6=Saturday
 }
 
+// GeoInfo holds GeoIP country information for the packet's endpoints.
+type GeoInfo struct {
+	SrcCountry string `json:"src_country,omitempty"` // ISO 3166-1 alpha-2
+	DstCountry string `json:"dst_country,omitempty"` // ISO 3166-1 alpha-2
+}
+
 // Input is the complete OPA input document.
 type Input struct {
 	Packet     PacketInfo     `json:"packet"`
 	Connection ConnectionInfo `json:"connection"`
 	Rate       RateInfo       `json:"rate"`
 	Time       TimeInfo       `json:"time"`
+	Geo        GeoInfo        `json:"geo,omitempty"`
 }
 
 // BuildInput constructs the OPA input from parsed packet info, rate data,

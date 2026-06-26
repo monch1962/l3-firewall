@@ -15,9 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/monch1962/l3-firewall/internal/audit"
 	"github.com/monch1962/l3-firewall/internal/alert"
+	"github.com/monch1962/l3-firewall/internal/audit"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
+	"github.com/monch1962/l3-firewall/internal/geoip"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/packet"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
@@ -62,6 +63,7 @@ type Engine struct {
 	running     bool
 	auditLogger *audit.Logger // nil = no audit logging
 	alertRouter *alert.Router // nil = no alerts
+	geoipReader *geoip.Reader // nil = no GeoIP lookups
 
 	// Stats counters
 	packetsProcessed int64
@@ -83,7 +85,7 @@ type Engine struct {
 
 // New creates a firewall engine with the given components.
 // Pass nil for auditLogger or alertRouter to disable those features.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router) *Engine {
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
@@ -92,6 +94,7 @@ func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClo
 		auditOnly:    auditOnly,
 		auditLogger:  al,
 		alertRouter:  ar,
+		geoipReader:  gr,
 		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
 		blockStats:   make(map[string]int64),
 	}
@@ -282,7 +285,15 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	input := opa.BuildInput(pi, pps, bps, flow.Established, tcpState,
 		portPPS, portBPS, newConnRate, recentPorts)
 
-	// 5. OPA evaluation
+	// 5. GeoIP lookup (if GeoIP database is configured)
+	if e.geoipReader != nil {
+		input.Geo = opa.GeoInfo{
+			SrcCountry: e.geoipReader.LookupCountry(pi.SrcIP),
+			DstCountry: e.geoipReader.LookupCountry(pi.DstIP),
+		}
+	}
+
+	// 6. OPA evaluation
 	if e.eval == nil {
 		if e.failClosed {
 			e.packetsBlocked++

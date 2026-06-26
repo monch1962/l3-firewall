@@ -25,6 +25,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/alert"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/engine"
+	"github.com/monch1962/l3-firewall/internal/geoip"
 	"github.com/monch1962/l3-firewall/internal/metrics"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
@@ -53,6 +54,7 @@ func main() {
 		conntrackMaxFlowsPerSrc = flag.Int("conntrack-max-flows-per-src", 0, "Max concurrent flows per source IP (0 = unlimited)")
 		auditLogPath   = flag.String("audit-log", "", "Path to structured audit log file (empty = no audit logging)")
 		alertWebhookURL = flag.String("alert-webhook-url", "", "Webhook URL for firewall alerts (e.g. Slack, Discord)")
+		geoipDBPath   = flag.String("geoip-db", "", "Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup")
 	)
 	flag.Parse()
 
@@ -127,9 +129,20 @@ func main() {
 		slog.Info("alerts enabled", "webhook", *alertWebhookURL)
 	}
 
+	// Create GeoIP reader if database path is specified
+	var geoIPReader *geoip.Reader
+	if *geoipDBPath != "" {
+		r, err := geoip.NewReader(*geoipDBPath)
+		if err != nil {
+			log.Fatalf("failed to open GeoIP database: %v", err)
+		}
+		geoIPReader = r
+		slog.Info("GeoIP enabled", "db", *geoipDBPath)
+	}
+
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter)
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader)
 
 	// Initialize metrics
 	metrics.Init(func() int { return ct.Len() })

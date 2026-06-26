@@ -9,6 +9,7 @@
 #   input.connection   — connection state (established, tcp_state, packets_in_flow, age_ms, recent_ports)
 #   input.rate         — per-source rate info (src_ip_pps, src_ip_bps, src_port_pps, new_conns_per_sec)
 #   input.time         — current UTC time (utc_hour 0-23, utc_day 0=Sun 6=Sat)
+#   input.geo          — GeoIP country info (src_country, dst_country — ISO 3166-1 alpha-2)
 
 package l3_firewall
 
@@ -44,6 +45,17 @@ enable_ingress_egress := true
 
 # Port scan detection
 port_scan_threshold := 20
+
+# GeoIP country filtering
+# Block traffic from specific source countries (ISO 3166-1 alpha-2 codes)
+# Requires --geoip-db pointing to a MaxMind .mmdb database
+blocked_src_countries := {"KP"}  # North Korea
+
+# Only allow traffic from specific source countries (empty = allow all)
+allowed_src_countries := {}       # e.g. {"US", "CA", "GB"}
+
+# Only allow traffic to specific destination countries (empty = allow all)
+allowed_dst_countries := {}       # e.g. {"US"}
 
 # Time-based access schedule rules
 # Each rule: {ports: set(number), days: set(number), start_hour: number, end_hour: number, effect: "deny"|"allow"}
@@ -233,6 +245,39 @@ deny_reason := sprintf("new connection rate exceeded: %v/sec", [input.rate.new_c
 deny_port_rate if { input.rate.src_port_pps > max_port_pps }
 allow := false if { deny_port_rate }
 deny_reason := sprintf("per-port rate limit: %v pps to port %v", [input.rate.src_port_pps, input.packet.dst_port]) if { deny_port_rate }
+
+# =============================================================================
+# RULE 16: GeoIP Country Blocking — block by source/destination country
+# =============================================================================
+
+# Block traffic from blocked countries
+deny_geoip_blocked_src if {
+    count(blocked_src_countries) > 0
+    input.geo.src_country == blocked_src_countries[_]
+}
+
+allow := false if { deny_geoip_blocked_src }
+deny_reason := sprintf("blocked source country: %v", [input.geo.src_country]) if { deny_geoip_blocked_src }
+
+# Only allow traffic from allowed countries (if any are specified)
+deny_geoip_src_not_allowed if {
+    count(allowed_src_countries) > 0
+    input.geo.src_country != ""
+    not allowed_src_countries[input.geo.src_country]
+}
+
+allow := false if { deny_geoip_src_not_allowed }
+deny_reason := sprintf("source country %v not in allowed list", [input.geo.src_country]) if { deny_geoip_src_not_allowed }
+
+# Only allow traffic to allowed destination countries (if any are specified)
+deny_geoip_dst_not_allowed if {
+    count(allowed_dst_countries) > 0
+    input.geo.dst_country != ""
+    not allowed_dst_countries[input.geo.dst_country]
+}
+
+allow := false if { deny_geoip_dst_not_allowed }
+deny_reason := sprintf("destination country %v not in allowed list", [input.geo.dst_country]) if { deny_geoip_dst_not_allowed }
 
 # =============================================================================
 # RULE 15: Time-Based Access Control — schedule-based port allow/deny

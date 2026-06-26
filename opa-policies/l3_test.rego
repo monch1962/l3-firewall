@@ -335,3 +335,62 @@ test_time_based_deny_end_hour_edge_case if {
         with input.packet as {"protocol": "TCP", "dst_port": 22}
         with input.time as {"utc_hour": 17, "utc_day": 3}
 }
+
+# =============================================================================
+# RULE 16: GEOIP COUNTRY BLOCKING
+# =============================================================================
+
+test_geoip_blocked_src_default_kp if {
+    not allow with input.geo as {"src_country": "KP", "dst_country": ""}
+}
+
+test_geoip_blocked_src_override_empty if {
+    allow with blocked_src_countries as {}
+        with input.geo as {"src_country": "KP", "dst_country": ""}
+}
+
+test_geoip_blocked_src_us_allowed if {
+    allow with input.geo as {"src_country": "US", "dst_country": ""}
+}
+
+test_geoip_allowed_src_list_blocked if {
+    not allow with allowed_src_countries as {"US", "CA"}
+        with input.geo as {"src_country": "CN", "dst_country": ""}
+}
+
+test_geoip_allowed_src_list_allowed if {
+    allow with allowed_src_countries as {"US", "CA"}
+        with input.geo as {"src_country": "US", "dst_country": ""}
+}
+
+test_geoip_allowed_src_empty_not_blocked if {
+    allow with allowed_src_countries as {"US", "CA"}
+        with input.geo as {"src_country": "", "dst_country": ""}
+}
+
+test_geoip_allowed_dst_list_blocked if {
+    not allow with allowed_dst_countries as {"US"}
+        with input.geo as {"src_country": "", "dst_country": "CN"}
+}
+
+test_geoip_allowed_dst_list_allowed if {
+    allow with allowed_dst_countries as {"US"}
+        with input.geo as {"src_country": "", "dst_country": "US"}
+}
+
+test_geoip_blocked_src_reason if {
+    deny_reason == "blocked source country: KP"
+        with input.geo as {"src_country": "KP", "dst_country": ""}
+}
+
+test_geoip_allowed_src_reason if {
+    deny_reason == "source country CN not in allowed list"
+        with allowed_src_countries as {"US", "CA"}
+        with input.geo as {"src_country": "CN", "dst_country": ""}
+}
+
+test_geoip_allowed_dst_reason if {
+    deny_reason == "destination country CN not in allowed list"
+        with allowed_dst_countries as {"US"}
+        with input.geo as {"src_country": "", "dst_country": "CN"}
+}
