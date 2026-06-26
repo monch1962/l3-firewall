@@ -20,7 +20,7 @@ func TestAttack_RulesUpdateWrongContentType(t *testing.T) {
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	api := New(eval, eng, "test", "")
+	api := New(eval, eng, "test", "", "")
 	handler := api.Handler()
 
 	body := `{"syn_rate_per_second": 300}`
@@ -41,7 +41,7 @@ func TestAttack_MissingSecurityHeaders(t *testing.T) {
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	api := New(eval, eng, "test", "")
+	api := New(eval, eng, "test", "", "")
 	handler := api.Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/health", nil)

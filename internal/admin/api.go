@@ -1,4 +1,3 @@
-// Package admin provides the REST admin API for live rule management.
 package admin
 
 import (
@@ -16,32 +15,38 @@ import (
 
 // API holds dependencies for the admin HTTP handlers.
 type API struct {
-	eval    *opa.EmbeddedEvaluator
-	engine  *engine.Engine
-	version string
-	started time.Time
-	token   string
+	eval      *opa.EmbeddedEvaluator
+	engine    *engine.Engine
+	version   string
+	started   time.Time
+	token     string
+	readToken string // read-only token; optional
 }
 
 // New creates an admin API with the given dependencies.
-func New(eval *opa.EmbeddedEvaluator, eng *engine.Engine, version, token string) *API {
+// token is the full-access admin token. readToken is an optional read-only token.
+// If both are empty, auth is disabled.
+func New(eval *opa.EmbeddedEvaluator, eng *engine.Engine, version, token, readToken string) *API {
 	return &API{
-		eval:    eval,
-		engine:  eng,
-		version: version,
-		started: time.Now(),
-		token:   token,
+		eval:      eval,
+		engine:    eng,
+		version:   version,
+		started:   time.Now(),
+		token:     token,
+		readToken: readToken,
 	}
 }
 
 // Handler returns the admin HTTP handler with all routes and security headers.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// Read-only endpoints (accessible with readToken or full token)
 	mux.HandleFunc("/admin/health", a.handleHealth)
-	mux.HandleFunc("/admin/stats", a.requireAuth(a.handleStats))
-	mux.HandleFunc("/admin/blocks", a.requireAuth(a.handleBlocks))
-	mux.HandleFunc("/admin/block-stats", a.requireAuth(a.handleBlockStats))
-	mux.HandleFunc("/admin/policy/reload", a.requireAuth(a.handlePolicyReload))
+	mux.HandleFunc("/admin/stats", a.requireReadAuth(a.handleStats))
+	mux.HandleFunc("/admin/blocks", a.requireReadAuth(a.handleBlocks))
+	mux.HandleFunc("/admin/block-stats", a.requireReadAuth(a.handleBlockStats))
+	// Write endpoints (require full token)
+	mux.HandleFunc("/admin/policy/reload", a.requireWriteAuth(a.handlePolicyReload))
 	return withSecurityHeaders(mux)
 }
 
@@ -54,28 +59,65 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-// requireAuth wraps a handler with bearer token authentication.
-func (a *API) requireAuth(next http.HandlerFunc) http.HandlerFunc {
+// extractToken reads the bearer token from the Authorization header.
+func extractToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return ""
+	}
+	if len(auth) > 7 && auth[:7] == "Bearer " {
+		return auth[7:]
+	}
+	return auth
+}
+
+// tokenMatches does a constant-time comparison of two tokens.
+func tokenMatches(given, expected string) bool {
+	if expected == "" {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(given), []byte(expected)) == 1
+}
+
+// requireReadAuth accepts the read-only token OR the full admin token.
+func (a *API) requireReadAuth(next http.HandlerFunc) http.HandlerFunc {
+	if a.token == "" && a.readToken == "" {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		given := extractToken(r)
+		if given == "" {
+			http.Error(w, `{"error":"authorization required"}`, http.StatusUnauthorized)
+			return
+		}
+		if tokenMatches(given, a.token) || (a.readToken != "" && tokenMatches(given, a.readToken)) {
+			next(w, r)
+			return
+		}
+		http.Error(w, `{"error":"invalid authorization token"}`, http.StatusForbidden)
+	}
+}
+
+// requireWriteAuth only accepts the full admin token.
+func (a *API) requireWriteAuth(next http.HandlerFunc) http.HandlerFunc {
 	if a.token == "" {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		auth := r.Header.Get("Authorization")
-		if auth == "" {
+		given := extractToken(r)
+		if given == "" {
 			http.Error(w, `{"error":"authorization required"}`, http.StatusUnauthorized)
 			return
 		}
-		var token string
-		if len(auth) > 7 && auth[:7] == "Bearer " {
-			token = auth[7:]
-		} else {
-			token = auth
-		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(a.token)) != 1 {
-			http.Error(w, `{"error":"invalid authorization token"}`, http.StatusForbidden)
+		if tokenMatches(given, a.token) {
+			next(w, r)
 			return
 		}
-		next(w, r)
+		if a.readToken != "" && tokenMatches(given, a.readToken) {
+			http.Error(w, `{"error":"read-only token cannot modify resources"}`, http.StatusForbidden)
+			return
+		}
+		http.Error(w, `{"error":"invalid authorization token"}`, http.StatusForbidden)
 	}
 }
 
@@ -145,7 +187,6 @@ func (a *API) StartServer(addr string) *http.Server {
 
 // StartServerTLS starts the admin HTTP server with TLS in a goroutine.
 // If certFile or keyFile is empty, falls back to plain HTTP.
-// Returns the server and the actual listening address.
 func (a *API) StartServerTLS(addr, certFile, keyFile string) (*http.Server, string, error) {
 	if certFile == "" || keyFile == "" {
 		srv := a.StartServer(addr)
@@ -157,7 +198,6 @@ func (a *API) StartServerTLS(addr, certFile, keyFile string) (*http.Server, stri
 		srv := a.StartServer(addr)
 		return srv, srv.Addr, nil
 	}
-	// Create listener first to get the actual port
 	listener, err := tls.Listen("tcp", addr, &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,

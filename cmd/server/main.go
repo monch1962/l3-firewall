@@ -33,7 +33,8 @@ const version = "0.1.0"
 func main() {
 	var (
 		listenAddr       = flag.String("admin-listen", ":8082", "Admin API listen address")
-		adminToken       = flag.String("admin-token", "", "Bearer token for admin API auth")
+		adminToken       = flag.String("admin-token", "", "Bearer token for admin API auth (full access)")
+		adminReadToken   = flag.String("admin-read-token", "", "Bearer token for read-only admin API access")
 		queueNum         = flag.Uint("queue", 0, "NFQUEUE number for forward traffic")
 		queueNumInput    = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic")
 		opaEmbed         = flag.String("opa-embed", "./opa-policies/l3.rego", "Path to Rego policy file")
@@ -107,7 +108,7 @@ func main() {
 	slog.Info("metrics initialized")
 
 	// Admin API — configuration is in the policy file, no external params needed
-	adminAPI := admin.New(opaEval, eng, version, *adminToken)
+	adminAPI := admin.New(opaEval, eng, version, *adminToken, *adminReadToken)
 	var adminServer *http.Server
 	if *listenAddr != "" {
 		adminServer = adminAPI.StartServer(*listenAddr)

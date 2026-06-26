@@ -24,7 +24,7 @@ func newTestAPI(t *testing.T) *API {
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	return New(eval, eng, "test", "")
+	return New(eval, eng, "test", "", "")
 }
 
 func TestHealthEndpoint(t *testing.T) {
@@ -75,7 +75,7 @@ func TestStatsEndpoint(t *testing.T) {
 func TestBlocksEndpoint(t *testing.T) {
 	eng := engine.New(nil, conntrack.NewTable(conntrack.DefaultConfig()),
 		ratelimit.NewLimiter(1000, 1000000), true, false)
-	api := New(nil, eng, "test", "")
+	api := New(nil, eng, "test", "", "")
 	handler := api.Handler()
 
 	req := httptest.NewRequest(http.MethodGet, "/admin/blocks", nil)
@@ -102,7 +102,7 @@ func TestPolicyReload(t *testing.T) {
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	api := New(eval, eng, "test", "")
+	api := New(eval, eng, "test", "", "")
 	handler := api.Handler()
 
 	req := httptest.NewRequest(http.MethodPost, "/admin/policy/reload", bytes.NewBufferString(`{}`))
@@ -134,7 +134,7 @@ func TestAuthRequired(t *testing.T) {
 	ct := conntrack.NewTable(conntrack.DefaultConfig())
 	rl := ratelimit.NewLimiter(1000, 1000000)
 	eng := engine.New(eval, ct, rl, true, false)
-	api := New(eval, eng, "test", "my-secret-token")
+	api := New(eval, eng, "test", "my-secret-token", "")
 	handler := api.Handler()
 
 	tests := []struct {
