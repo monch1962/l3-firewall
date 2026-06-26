@@ -48,6 +48,7 @@ func main() {
 		conntrackIdle    = flag.Duration("conntrack-idle", 5*time.Minute, "TCP connection idle timeout")
 		conntrackUDP     = flag.Duration("conntrack-udp-timeout", 30*time.Second, "UDP connection idle timeout")
 		conntrackICMP    = flag.Duration("conntrack-icmp-timeout", 5*time.Second, "ICMP connection idle timeout")
+		conntrackMaxFlowsPerSrc = flag.Int("conntrack-max-flows-per-src", 0, "Max concurrent flows per source IP (0 = unlimited)")
 	)
 	flag.Parse()
 
@@ -92,10 +93,11 @@ func main() {
 
 	// Create components
 	ctConfig := conntrack.Config{
-		MaxEntries:  *conntrackMax,
-		IdleTimeout: *conntrackIdle,
-		UDPTimeout:  *conntrackUDP,
-		ICMPTimeout: *conntrackICMP,
+		MaxEntries:       *conntrackMax,
+		MaxFlowsPerSrcIP: *conntrackMaxFlowsPerSrc,
+		IdleTimeout:      *conntrackIdle,
+		UDPTimeout:       *conntrackUDP,
+		ICMPTimeout:      *conntrackICMP,
 	}
 	ct := conntrack.NewTable(ctConfig)
 

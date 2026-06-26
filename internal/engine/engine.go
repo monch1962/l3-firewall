@@ -196,12 +196,29 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 
 	// 1. Connection tracking with TCP state machine
 	var flow *conntrack.Flow
+	var flowLimited bool
 	if pi.Protocol == "TCP" {
 		flow = e.conntrack.UpdateTCPState(pi.SrcIP, pi.DstIP, pi.Protocol,
 			pi.SrcPort, pi.DstPort,
 			pi.TCPFlags.SYN, pi.TCPFlags.ACK, pi.TCPFlags.RST, pi.TCPFlags.FIN)
+		if flow == nil {
+			flowLimited = true
+		}
 	} else {
 		flow = e.conntrack.LookupOrCreate(pi.SrcIP, pi.DstIP, pi.Protocol, pi.SrcPort, pi.DstPort)
+		if flow == nil {
+			flowLimited = true
+		}
+	}
+
+	// Connection limit exceeded — block immediately
+	if flowLimited {
+		e.packetsBlocked++
+		reason := "connection limit exceeded for source IP"
+		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
+			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
+		e.recordBlock(pi, reason, tid)
+		return &opa.Result{Allowed: false, Reason: reason}
 	}
 
 	// Track destination port for scan detection

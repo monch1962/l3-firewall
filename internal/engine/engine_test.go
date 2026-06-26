@@ -2,6 +2,7 @@ package engine
 
 import (
 	"testing"
+	"time"
 
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/opa"
@@ -190,6 +191,78 @@ func TestBlockLogContainsMetadata(t *testing.T) {
 	}
 	if blocks[0].Reason != "blocked SSH" {
 		t.Errorf("Reason = %q, want %q", blocks[0].Reason, "blocked SSH")
+	}
+}
+
+func TestEngineConnectionLimit(t *testing.T) {
+	cfg := conntrack.Config{
+		MaxEntries:       1000,
+		MaxFlowsPerSrcIP: 1,
+		IdleTimeout:      300 * time.Second,
+		UDPTimeout:       30 * time.Second,
+		ICMPTimeout:      5 * time.Second,
+		PortScanMaxPorts: 100,
+	}
+	eval, _ := opa.NewEmbedded(opa.EmbedConfig{Policy: testPolicy})
+	eng := &Engine{
+		eval:         eval,
+		conntrack:    conntrack.NewTable(cfg),
+		ratelimit:    ratelimit.NewLimiter(10000, 100000000),
+		auditOnly:    false,
+		failClosed:   true,
+		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
+		blockStats:   make(map[string]int64),
+	}
+
+	// First flow from this src should be allowed
+	pi1 := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
+	r1 := eng.evaluatePacket(pi1, 64)
+	if r1 == nil || !r1.Allowed {
+		t.Errorf("first flow expected allowed, got blocked: %v", r1)
+	}
+
+	// Second flow from same src should be blocked due to connection limit
+	pi2 := buildTestPacket("10.0.1.100", "10.0.2.51", 44002, 80, true, false)
+	r2 := eng.evaluatePacket(pi2, 64)
+	if r2 == nil || r2.Allowed {
+		t.Errorf("second flow expected blocked (connection limit), got allowed: %v", r2)
+	}
+	if r2.Reason != "connection limit exceeded for source IP" {
+		t.Errorf("block reason = %q, want %q", r2.Reason, "connection limit exceeded for source IP")
+	}
+}
+
+func TestEngineConnectionLimitDifferentSrcOK(t *testing.T) {
+	cfg := conntrack.Config{
+		MaxEntries:       1000,
+		MaxFlowsPerSrcIP: 1,
+		IdleTimeout:      300 * time.Second,
+		UDPTimeout:       30 * time.Second,
+		ICMPTimeout:      5 * time.Second,
+		PortScanMaxPorts: 100,
+	}
+	eval, _ := opa.NewEmbedded(opa.EmbedConfig{Policy: testPolicy})
+	eng := &Engine{
+		eval:         eval,
+		conntrack:    conntrack.NewTable(cfg),
+		ratelimit:    ratelimit.NewLimiter(10000, 100000000),
+		auditOnly:    false,
+		failClosed:   true,
+		recentBlocks: make([]BlockLogEntry, 0, maxRecentBlocks),
+		blockStats:   make(map[string]int64),
+	}
+
+	pi1 := buildTestPacket("10.0.1.100", "10.0.2.50", 44001, 443, true, false)
+	r1 := eng.evaluatePacket(pi1, 64)
+	if r1 == nil || !r1.Allowed {
+		t.Fatalf("first flow expected allowed")
+	}
+
+	// Different source should be allowed
+	pi2 := buildTestPacket("10.0.2.100", "10.0.2.50", 44001, 80, true, false)
+	r2 := eng.evaluatePacket(pi2, 64)
+	if r2 == nil || !r2.Allowed {
+		t.Errorf("flow from different source expected allowed, got blocked: %v", r2)
 	}
 }
 

@@ -57,6 +57,7 @@ func (s TCPState) String() string {
 // Config controls the connection table behaviour.
 type Config struct {
 	MaxEntries       int           // Max flows before eviction (oldest first)
+	MaxFlowsPerSrcIP int           // Max concurrent flows per source IP (0 = unlimited)
 	IdleTimeout      time.Duration // TCP flow idle timeout
 	UDPTimeout       time.Duration // UDP flow idle timeout
 	ICMPTimeout      time.Duration // ICMP flow idle timeout
@@ -78,10 +79,11 @@ func DefaultConfig() Config {
 
 // Stats holds cumulative connection tracking counters.
 type Stats struct {
-	Hits    int64 // Existing flow found
-	Created int64 // New flow created
-	Expired int64 // Flow expired by timeout
-	Evicted int64 // Flow evicted due to max entries
+	Hits              int64 // Existing flow found
+	Created           int64 // New flow created
+	Expired           int64 // Flow expired by timeout
+	Evicted           int64 // Flow evicted due to max entries
+	FlowLimitExceeded int64 // Flow creation blocked by per-source limit
 }
 
 // Flow represents a single tracked connection with state and metrics.
@@ -143,6 +145,8 @@ type Table struct {
 	// New connection rate tracking
 	newConns     []time.Time
 	rateMu       sync.Mutex
+	// Per-source flow count tracking
+	srcFlowCount map[string]int // srcIP -> number of active flows
 }
 
 // NewTable creates a connection tracking table with the given configuration.
@@ -160,9 +164,10 @@ func NewTable(cfg Config) *Table {
 		cfg.ICMPTimeout = 5 * time.Second
 	}
 	return &Table{
-		flows:    make(map[flowKey]*Flow),
-		cfg:      cfg,
-		srcPorts: make(map[string][]uint16),
+		flows:        make(map[flowKey]*Flow),
+		cfg:          cfg,
+		srcPorts:     make(map[string][]uint16),
+		srcFlowCount: make(map[string]int),
 	}
 }
 
@@ -194,6 +199,7 @@ func (t *Table) idleTimeoutFor(protocol string) time.Duration {
 
 // LookupOrCreate finds an existing flow by 5-tuple or creates a new one.
 // Returns the flow with its packet counter already incremented.
+// Returns nil if the per-source flow limit has been exceeded.
 func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort uint16) *Flow {
 	key := flowKey{srcIP, dstIP, protocol, srcPort, dstPort}
 
@@ -204,6 +210,12 @@ func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort u
 		f.touch()
 		t.stats.Hits++
 		return f
+	}
+
+	// Check per-source flow limit
+	if t.reachedFlowLimitLocked(srcIP) {
+		t.stats.FlowLimitExceeded++
+		return nil
 	}
 
 	// Evict if at capacity
@@ -230,6 +242,7 @@ func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort u
 
 	t.flows[key] = f
 	t.stats.Created++
+	t.incrFlowCountLocked(srcIP)
 
 	// Track new connection timestamp for rate calculation
 	t.recordNewConn()
@@ -286,6 +299,11 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 	var isNew bool
 	f, ok := t.flows[key]
 	if !ok {
+		// Check per-source flow limit before creating
+		if t.reachedFlowLimitLocked(srcIP) {
+			t.stats.FlowLimitExceeded++
+			return nil
+		}
 		if len(t.flows) >= t.cfg.MaxEntries {
 			t.evictOneLocked()
 			t.stats.Evicted++
@@ -298,6 +316,7 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 		}
 		t.flows[key] = f
 		t.stats.Created++
+		t.incrFlowCountLocked(srcIP)
 		t.recordNewConn()
 	} else {
 		f.touch()
@@ -375,12 +394,15 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 	return f
 }
 
-// Delete removes a flow by 5-tuple.
+// Delete removes a flow by 5-tuple and decrements the per-source flow count.
 func (t *Table) Delete(srcIP, dstIP, protocol string, srcPort, dstPort uint16) {
 	key := flowKey{srcIP, dstIP, protocol, srcPort, dstPort}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.flows, key)
+	if _, ok := t.flows[key]; ok {
+		delete(t.flows, key)
+		t.decrFlowCountLocked(srcIP)
+	}
 }
 
 // expireBefore removes flows that have been idle longer than the given duration.
@@ -398,6 +420,7 @@ func (t *Table) expireBefore(idle time.Duration) int {
 	}
 	for _, key := range expired {
 		delete(t.flows, key)
+		t.decrFlowCountLocked(key.srcIP)
 	}
 	t.stats.Expired += int64(len(expired))
 	return len(expired)
@@ -419,6 +442,7 @@ func (t *Table) Expire() int {
 	}
 	for _, key := range expired {
 		delete(t.flows, key)
+		t.decrFlowCountLocked(key.srcIP)
 	}
 	t.stats.Expired += int64(len(expired))
 	return len(expired)
@@ -438,6 +462,7 @@ func (t *Table) evictOneLocked() {
 	}
 	if !first {
 		delete(t.flows, oldestKey)
+		t.decrFlowCountLocked(oldestKey.srcIP)
 	}
 }
 
@@ -471,4 +496,35 @@ func (t *Table) GetRecentDestPorts(srcIP string) []uint16 {
 	result := make([]uint16, len(ports))
 	copy(result, ports)
 	return result
+}
+
+// reachedFlowLimitLocked checks if the source IP has reached its per-source flow
+// limit. Must be called with t.mu held (read or write).
+func (t *Table) reachedFlowLimitLocked(srcIP string) bool {
+	if t.cfg.MaxFlowsPerSrcIP <= 0 {
+		return false
+	}
+	return t.srcFlowCount[srcIP] >= t.cfg.MaxFlowsPerSrcIP
+}
+
+// incrFlowCountLocked increments the flow count for a source IP.
+// Must be called with t.mu write lock held.
+func (t *Table) incrFlowCountLocked(srcIP string) {
+	t.srcFlowCount[srcIP]++
+}
+
+// decrFlowCountLocked decrements the flow count for a source IP and cleans up
+// the entry if it reaches zero. Must be called with t.mu write lock held.
+func (t *Table) decrFlowCountLocked(srcIP string) {
+	t.srcFlowCount[srcIP]--
+	if t.srcFlowCount[srcIP] <= 0 {
+		delete(t.srcFlowCount, srcIP)
+	}
+}
+
+// GetSrcFlowCount returns the number of active flows for a given source IP.
+func (t *Table) GetSrcFlowCount(srcIP string) int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.srcFlowCount[srcIP]
 }
