@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/engine"
@@ -35,7 +36,7 @@ func New(eval *opa.EmbeddedEvaluator, store *opa.DataStore, eng *engine.Engine, 
 	}
 }
 
-// Handler returns the admin HTTP handler with all routes.
+// Handler returns the admin HTTP handler with all routes and security headers.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/admin/health", a.handleHealth)
@@ -44,7 +45,16 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/admin/block-stats", a.requireAuth(a.handleBlockStats))
 	mux.HandleFunc("/admin/rules", a.requireAuth(a.handleGetRules))
 	mux.HandleFunc("/admin/rules/update", a.requireAuth(a.handleUpdateRules))
-	return mux
+	return withSecurityHeaders(mux)
+}
+
+// withSecurityHeaders wraps an http.Handler to set security headers on all responses.
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // requireAuth wraps a handler with bearer token authentication.
@@ -129,11 +139,30 @@ func (a *API) handleUpdateRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce JSON Content-Type
+	ct := r.Header.Get("Content-Type")
+	if ct != "" && !strings.HasPrefix(ct, "application/json") {
+		http.Error(w, `{"error":"Content-Type must be application/json"}`, http.StatusUnsupportedMediaType)
+		return
+	}
+
+	// Apply body limit to prevent OOM from oversized payloads
 	r.Body = http.MaxBytesReader(w, r.Body, 10*1024*1024)
 
 	var params map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&params); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&params); err != nil {
+		if err.Error() == "http: request body too large" {
+			http.Error(w, `{"error":"request body too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, fmt.Sprintf(`{"error":"invalid JSON: %s"}`, err), http.StatusBadRequest)
+		return
+	}
+	// Reject trailing data after the JSON object
+	if dec.More() {
+		http.Error(w, `{"error":"trailing data after JSON"}`, http.StatusBadRequest)
 		return
 	}
 
