@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -12,10 +13,11 @@ import (
 
 // Syncer watches an etcd key for policy updates and triggers hot-reload.
 type Syncer struct {
-	client  *clientv3.Client
-	key     string
+	client   *clientv3.Client
+	key      string
 	onUpdate func(string) error // called with new policy content
-	stopCh  chan struct{}
+	stopCh   chan struct{}
+	closeOnce sync.Once
 }
 
 // Config controls the etcd syncer.
@@ -67,6 +69,9 @@ func (s *Syncer) Start(ctx context.Context) {
 }
 
 func (s *Syncer) loadCurrent(ctx context.Context) {
+	if s == nil || s.client == nil {
+		return
+	}
 	resp, err := s.client.Get(ctx, s.key)
 	if err != nil {
 		slog.Warn("etcd: failed to get initial policy", "key", s.key, "error", err)
@@ -83,6 +88,9 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 }
 
 func (s *Syncer) watch(ctx context.Context) {
+	if s == nil || s.client == nil {
+		return
+	}
 	wch := s.client.Watch(ctx, s.key)
 	for {
 		select {
@@ -108,6 +116,11 @@ func (s *Syncer) Close() error {
 	if s == nil {
 		return nil
 	}
-	close(s.stopCh)
+	s.closeOnce.Do(func() {
+		close(s.stopCh)
+	})
+	if s.client == nil {
+		return nil
+	}
 	return s.client.Close()
 }

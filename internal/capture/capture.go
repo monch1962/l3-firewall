@@ -29,6 +29,7 @@ type Writer struct {
 	fw       *pcapgo.Writer
 	curFileN int
 	pktCount int
+	closed   bool
 }
 
 // NewWriter creates a pcap writer. Returns nil if Dir is empty.
@@ -55,6 +56,10 @@ func (w *Writer) WriteBlock(raw []byte) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.closed {
+		return fmt.Errorf("pcap writer is closed")
+	}
 
 	if w.curFile == nil || w.pktCount >= w.cfg.MaxPackets {
 		if err := w.rotateLocked(); err != nil {
@@ -122,6 +127,7 @@ func (w *Writer) Close() error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.closed = true
 	if w.curFile != nil {
 		return w.curFile.Close()
 	}

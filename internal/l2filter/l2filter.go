@@ -58,18 +58,20 @@ func (f *Filter) MACAllowed(srcMAC string) (bool, string) {
 	defer f.mu.RUnlock()
 
 	norm := normalizeMAC(srcMAC)
-	if norm == "" {
-		return true, ""
-	}
 
 	// Check blocked list first
 	if f.blockedMACs[norm] {
 		return false, fmt.Sprintf("blocked MAC: %s", srcMAC)
 	}
 
-	// If allowlist is empty, all are allowed
+	// If allowlist is empty, all are allowed (including empty MAC)
 	if len(f.allowedMACs) == 0 {
 		return true, ""
+	}
+
+	// If allowlist is set, empty MAC is denied
+	if norm == "" {
+		return false, "empty MAC not in allowlist"
 	}
 
 	// Check allowlist
