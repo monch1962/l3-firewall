@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **17 attack categories** with **190 Go tests** and **76 Rego tests** plus **28 demo tests** across 15 internal packages and 12 standalone demos.
+l3-firewall's OPA Rego policies cover **17 attack categories** with **251 Go tests** and **76 Rego tests** plus **28 demo tests** across 15 internal packages and 12 standalone demos.
 
 See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
@@ -38,7 +38,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | 16 | **Time-Based Access** — Block/allow by hour and day of week | `time_based_rules` with `utc_hour`/`utc_day` | ✅ |
 | 17 | **GeoIP Blocking** — Block/allow by source/destination country | MaxMind .mmdb + `blocked_src_countries` / `allowed_src_countries` | ✅ |
 
-### Red-Team Verified Transport Protection (9 attack simulation tests)
+### Red-Team Verified Transport Protection (12 attack simulation tests)
 
 | # | Attack Vector | Defense | Status |
 |---|---|---|---|
@@ -51,8 +51,11 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | R7 | **Block stats reason flood** — Many unique reasons | Cap prevents new entries after 256 | ✅ |
 | R8 | **Rate limiter burst gap** — 60s cleanup window OOM | MaxEntries eviction handles bursts | ✅ |
 | R9 | **Per-source flow count unbounded** — Many src IPs exhaust `srcFlowCount` map | Per-IP counter naturally bounded by `MaxEntries` (65536) | ✅ |
+| R10 | **State file memory exhaustion** — Large/malicious JSON state file | `io.LimitReader` (10MB cap) in LoadState | ✅ |
+| R11 | **Nil block stats panic** — Reloaded nil `BlockStats` map panics on write | Auto-initialize map in LoadState | ✅ |
+| R12 | **Threat feed body size** — Malicious feed server sends large response | `io.LimitReader` (50MB cap) on FetchFromURL resp.Body | ✅ |
 
-### Verified Test Coverage (190 Go tests, 76 Rego tests)
+### Verified Test Coverage (251 Go tests, 76 Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
@@ -60,16 +63,16 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment/rate/time/geo), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
 | `internal/conntrack` | 25 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, TCP FSM (SYN→ESTABLISHED→FIN→RST→CLOSED), concurrent access, per-source flow limit (blocks under limit, multiple sources, after delete, after expire, stats, TCP state, default unlimited) |
 | `internal/geoip` | 6 | NewReader nil path, bad path, lookup nil reader, invalid IP, nil DB, real file (skip) |
-| `internal/threatintel` | 13 | NewBlocklist, add/contains/remove, CIDR, duplicate, concurrent, URL fetch, HTTP error, refresh, nil safety, OPA data |
+| `internal/threatintel` | 20 | NewBlocklist, add/contains/remove, CIDR, duplicate, concurrent, URL fetch, HTTP error, refresh, nil safety, OPA data, body size limit, refresh growth, fast refresh, URL-encoded IP, empty blocklist remove |
 | `internal/ratelimit` | 15 | Basic allowance, burst, per-IP independence, byte rate, stale cleanup, active key preservation, concurrent, rate queries, per-dst-port AllowPort, GetPortPPS, port independence, unknown port |
 | `internal/audit` | 7 | NewLogger default path, block events, allow events, concurrent safety, rotation, close, invalid path |
-| `internal/capture` | 7 | NewWriter nil dir, dir creation, write block, rotation, nil safety, close |
+| `internal/capture` | 11 | NewWriter nil dir, dir creation, write block, rotation, nil safety, close, dir traversal, high file number, concurrent close/write, large packet |
 | `internal/engine` | 11 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK |
 | `internal/alert` | 9 | Type strings, defaults, webhook payload, cooldown suppression, multi-type, async non-blocking, nil safety, concurrent |
-| `internal/l2filter` | 11 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC |
+| `internal/l2filter` | 16 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC, non-hex chars, broadcast/multicast, length extremes, concurrent normalize, large MAC list |
 | `internal/admin` | 11 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth, policy versions |
-| `internal/persist` | 6 | Save/load, missing file, empty path, corrupt file, nil safety |
-| `internal/syncer` | 5 | Empty endpoints, bad endpoints, nil start, nil close, callback |
+| `internal/persist` | 10 | Save/load, missing file, empty path, corrupt file, nil safety, huge file, path traversal, sparse file, nil block stats |
+| `internal/syncer` | 9 | Empty endpoints, bad endpoints, nil start, nil close, callback, context cancel, nil onUpdate, start after close, nil client watch |
 | OPA Policies (Rego) | 76 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1), time-based rules (13), GeoIP rules (11) |
 
 ## Architecture
@@ -253,8 +256,11 @@ To change configuration: edit the `.rego` file — the hot-reloader picks up cha
 | ARP/DHCP inspection | IP→MAC binding table, change detection | ARP spoofing, DHCP poisoning |
 | Packet capture | `--pcap-dir` writes blocked packets to pcap | Forensic analysis |
 | State persistence | `--state-file` saves block stats to JSON | Survive restarts without losing counters |
+| State persistence size limit | `io.LimitReader` (10MB) in LoadState | Memory exhaustion via malicious state file |
 | Policy versioning | `/admin/policy/versions` endpoint | Audit trail for rule changes |
 | Distributed sync | `--etcd-endpoints` watches etcd for policy updates | Multi-instance rule consistency |
+| Threat feed body limit | `io.LimitReader` (50MB) on FetchFromURL resp.Body | Memory exhaustion via malicious feed server |
+| Nil block stats guard | Auto-initialize `BlockStats` map in LoadState | Nil map panic on state reload |
 
 ## Project Structure
 

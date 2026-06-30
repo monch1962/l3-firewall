@@ -17,6 +17,10 @@ import (
 // maxBlocklistEntries prevents memory exhaustion from a very large blocklist.
 const maxBlocklistEntries = 500000
 
+// maxFeedResponseSize limits the response body from a threat intel feed to
+// prevent memory exhaustion attacks (50MB).
+const maxFeedResponseSize = 50 * 1024 * 1024
+
 // Blocklist holds a set of blocked IPs and CIDR networks, refreshed from
 // external threat intelligence feeds.
 type Blocklist struct {
@@ -158,7 +162,7 @@ func (bl *Blocklist) FetchFromURL(url string) (int, error) {
 		return 0, fmt.Errorf("blocklist %s returned status %d", url, resp.StatusCode)
 	}
 
-	return bl.parseReader(resp.Body)
+	return bl.parseReader(io.LimitReader(resp.Body, maxFeedResponseSize))
 }
 
 // parseReader reads IP/CIDR entries from a reader and adds them to the blocklist.

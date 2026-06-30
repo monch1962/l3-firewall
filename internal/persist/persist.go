@@ -4,9 +4,19 @@ package persist
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 )
+
+// saveMu serializes SaveState calls to prevent race conditions on the
+// shared temp file path.
+var saveMu sync.Mutex
+
+// maxStateFileSize is the maximum allowed state file size (10MB).
+// Prevents memory exhaustion from malicious/overly large state files.
+const maxStateFileSize = 10 * 1024 * 1024
 
 // EngineState holds the serializable state of the firewall engine.
 type EngineState struct {
@@ -14,7 +24,11 @@ type EngineState struct {
 }
 
 // SaveState writes the engine state to a JSON file atomically.
+// Uses a package-level mutex to serialize concurrent calls on the
+// shared .tmp file path.
 func SaveState(path string, state *EngineState) error {
+	saveMu.Lock()
+	defer saveMu.Unlock()
 	if path == "" || state == nil {
 		return nil
 	}
@@ -40,7 +54,8 @@ func SaveState(path string, state *EngineState) error {
 }
 
 // LoadState reads the engine state from a JSON file.
-// Returns nil if the file does not exist (first run).
+// Returns nil if the file does not exist (first run). A size limit of
+// maxStateFileSize is enforced to prevent memory exhaustion attacks.
 func LoadState(path string) (*EngineState, error) {
 	if path == "" {
 		return nil, nil
@@ -54,8 +69,11 @@ func LoadState(path string) (*EngineState, error) {
 	}
 	defer f.Close()
 	var state EngineState
-	if err := json.NewDecoder(f).Decode(&state); err != nil {
+	if err := json.NewDecoder(io.LimitReader(f, maxStateFileSize+1)).Decode(&state); err != nil {
 		return nil, fmt.Errorf("decoding state: %w", err)
+	}
+	if state.BlockStats == nil {
+		state.BlockStats = make(map[string]int64)
 	}
 	return &state, nil
 }
