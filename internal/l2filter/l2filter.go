@@ -42,10 +42,17 @@ func NewFilter(cfg Config) *Filter {
 	return f
 }
 
-// normalizeMAC normalizes a MAC address to lowercase with no separators.
+// normalizeMAC normalizes a MAC address to lowercase with no separators
+// or Unicode whitespace. Strips all Unicode whitespace characters (spaces,
+// NBSP, thin space, ideographic space, etc.) to prevent bypass attacks.
 func normalizeMAC(mac string) string {
-	return strings.NewReplacer(":", "", "-", "", ".", "", " ", "").
-		Replace(strings.ToLower(mac))
+	// First strip ASCII space and separators
+	replacer := strings.NewReplacer(":", "", "-", "", ".", "", " ", "")
+	result := replacer.Replace(strings.ToLower(mac))
+	// Strip remaining Unicode whitespace characters (NBSP, thin space, etc.)
+	// that are not caught by the ASCII-space replacement
+	cleaned := strings.Fields(result)
+	return strings.Join(cleaned, "")
 }
 
 // MACAllowed checks if a source MAC is allowed. If AllowedMACs is empty, all are

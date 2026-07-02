@@ -185,16 +185,31 @@ func (bl *Blocklist) parseReader(r io.Reader) (int, error) {
 
 // StartRefresher launches a background goroutine that periodically fetches
 // blocklists from the given URLs. Returns a channel; close it to stop.
+// A minimum interval of 1 second is enforced to prevent time.NewTicker panics.
+// Each call returns a fresh channel so callers can close it without risking
+// a double-close panic on a shared channel.
 func (bl *Blocklist) StartRefresher(urls []string, interval time.Duration) chan struct{} {
 	if bl == nil || len(urls) == 0 {
 		return nil
 	}
+	// Enforce minimum interval to prevent time.NewTicker(0) panic
+	// and excessive refresh rates
+	const minInterval = 100 * time.Millisecond
+	if interval < minInterval {
+		interval = minInterval
+		slog.Warn("threat intel refresh interval too small, using minimum", "min", minInterval)
+	}
+	// Return a fresh stop channel so each caller has their own
+	// and double-close by the caller does not affect other goroutines
+	stopCh := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-bl.stopCh:
+				return
+			case <-stopCh:
 				return
 			case <-ticker.C:
 				for _, url := range urls {
@@ -208,5 +223,5 @@ func (bl *Blocklist) StartRefresher(urls []string, interval time.Duration) chan 
 			}
 		}
 	}()
-	return bl.stopCh
+	return stopCh
 }

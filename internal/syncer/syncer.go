@@ -79,7 +79,8 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	}
 	if len(resp.Kvs) > 0 {
 		policy := string(resp.Kvs[0].Value)
-		if err := s.onUpdate(policy); err != nil {
+		// Wrap callback in panic recovery to prevent goroutine death
+		if err := safeOnUpdate(s.onUpdate, policy); err != nil {
 			slog.Warn("etcd: failed to load initial policy", "error", err)
 		} else {
 			slog.Info("etcd: loaded policy from", "key", s.key)
@@ -103,12 +104,28 @@ func (s *Syncer) watch(ctx context.Context) {
 			for _, ev := range wresp.Events {
 				policy := string(ev.Kv.Value)
 				slog.Info("etcd: policy updated", "key", s.key, "type", ev.Type)
-				if err := s.onUpdate(policy); err != nil {
+				// Wrap callback in panic recovery to prevent goroutine death
+				if err := safeOnUpdate(s.onUpdate, policy); err != nil {
 					slog.Warn("etcd: failed to apply policy update", "error", err)
 				}
 			}
 		}
 	}
+}
+
+// safeOnUpdate calls the onUpdate callback with panic recovery.
+// If the callback panics, the panic is recovered and returned as an error.
+func safeOnUpdate(fn func(string) error, policy string) (err error) {
+	if fn == nil {
+		return fmt.Errorf("onUpdate callback is nil")
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("onUpdate panic: %v", r)
+			slog.Error("etcd: recovered panic in onUpdate callback", "panic", fmt.Sprintf("%v", r))
+		}
+	}()
+	return fn(policy)
 }
 
 // Close shuts down the syncer and closes the etcd connection.
