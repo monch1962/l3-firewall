@@ -164,7 +164,16 @@ func (bl *Blocklist) DataForOPA() map[string]interface{} {
 // Returns the number of new entries added. Supports one-IP/CIDR-per-line format.
 // Lines starting with # are comments and are ignored.
 func (bl *Blocklist) FetchFromURL(url string) (int, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		// Do not follow redirects to prevent SSRF attacks where a malicious
+		// feed server redirects to internal services (e.g., cloud metadata
+		// endpoints, internal APIs). Threat intel feeds should serve content
+		// directly; redirects are not expected.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	resp, err := client.Get(url)
 	if err != nil {
 		return 0, fmt.Errorf("fetching blocklist %s: %w", url, err)
