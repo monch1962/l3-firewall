@@ -38,7 +38,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | 16 | **Time-Based Access** — Block/allow by hour and day of week | `time_based_rules` with `utc_hour`/`utc_day` | ✅ |
 | 17 | **GeoIP Blocking** — Block/allow by source/destination country | MaxMind .mmdb + `blocked_src_countries` / `allowed_src_countries` | ✅ |
 
-### Red-Team Verified Transport Protection (15 attack simulation tests)
+### Red-Team Verified Transport Protection (19 attack simulation tests)
 
 | # | Attack Vector | Defense | Status |
 |---|---|---|---|
@@ -57,8 +57,12 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | R13 | **onUpdate callback panic** — Panic in policy callback kills goroutine | `safeOnUpdate()` panic recovery wrapper around all callback invocations | ✅ |
 | R14 | **Unicode MAC bypass** — Unicode whitespace (NBSP, thin space, etc.) bypasses MAC normalization | `strings.Fields()` strips all Unicode whitespace categories in `normalizeMAC` | ✅ |
 | R15 | **Zero-interval ticker panic** — `StartRefresher(0)` crashes via `time.NewTicker(0)` panic | Minimum interval guard (100ms) clamps sub-minimum values | ✅ |
+| R16 | **pcap WriteBlock panic fail-open** — Panic in `WriteBlock` causes `packetHandler` to return 0 (NF_ACCEPT) instead of 1 (NF_DROP) | Named return in `packetHandler` sets `ret=1` on panic recovery | ✅ |
+| R17 | **pcap WriteBlock error silent discard** — Pcap capture failures not visible to operators | Error logged via `slog.Warn` | ✅ |
+| R18 | **saveState error silent discard** — State persistence failures not visible to operators | Error logged via `slog.Warn` | ✅ |
+| R19 | **IPv4-mapped IPv6 blocklist bypass** — `::ffff:10.0.0.1` does not match `10.0.0.1` in threat intel | `To4()` normalization in both `Add` and `Contains` | ✅ |
 
-### Verified Test Coverage (296 Go tests, 76 Rego tests)
+### Verified Test Coverage (339 Go+Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
@@ -66,11 +70,11 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | `internal/opa` | 13 | Result JSON, input building (TCP/UDP/ICMP/ports/fragment/rate/time/geo), data store CRUD, embedded eval blocking/allowing, runtime params, bad policy, nil store |
 | `internal/conntrack` | 25 | Per-protocol timeouts, TCP/UDP/ICMP expiry, stats (hits/created/expired/evicted), new connection rate, TCP FSM (SYN→ESTABLISHED→FIN→RST→CLOSED), concurrent access, per-source flow limit (blocks under limit, multiple sources, after delete, after expire, stats, TCP state, default unlimited) |
 | `internal/geoip` | 6 | NewReader nil path, bad path, lookup nil reader, invalid IP, nil DB, real file (skip) |
-| `internal/threatintel` | 26 | NewBlocklist, add/contains/remove, CIDR, duplicate, concurrent, URL fetch, HTTP error, refresh, nil safety, OPA data, body size limit, refresh growth, fast refresh, URL-encoded IP, empty blocklist remove, zero-interval guard, double-close prevention, slow server, concurrent CIDR/contains, IPv6 contains, DataForOPA with CIDR |
+| `internal/threatintel` | 30 | NewBlocklist, add/contains/remove, CIDR, duplicate, concurrent, URL fetch, HTTP error, refresh, nil safety, OPA data, body size limit, refresh growth, fast refresh, URL-encoded IP, empty blocklist remove, zero-interval guard, double-close prevention, slow server, concurrent CIDR/contains, IPv6 contains, DataForOPA with CIDR, IPv4-mapped IPv6 normalization, IP edge cases, very long string, nil stopCh |
 | `internal/ratelimit` | 15 | Basic allowance, burst, per-IP independence, byte rate, stale cleanup, active key preservation, concurrent, rate queries, per-dst-port AllowPort, GetPortPPS, port independence, unknown port |
 | `internal/audit` | 7 | NewLogger default path, block events, allow events, concurrent safety, rotation, close, invalid path |
 | `internal/capture` | 15 | NewWriter nil dir, dir creation, write block, rotation, nil safety, close, dir traversal, high file number, concurrent close/write, large packet, no max packet size, cleanup many files, write after close, concurrent write |
-| `internal/engine` | 11 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK |
+| `internal/engine` | 17 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK, pcap panic fail-open, pcap error silent discard, saveState error silent discard, engine+threatintel edge cases, state persistence integration, engine+threatintel blocked, panic recovery |
 | `internal/alert` | 9 | Type strings, defaults, webhook payload, cooldown suppression, multi-type, async non-blocking, nil safety, concurrent |
 | `internal/l2filter` | 21 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC, non-hex chars, broadcast/multicast, length extremes, concurrent normalize, large MAC list, unicode whitespace bypass, MAC homoglyph, DHCP empty IP, ARP long IP, concurrent CheckARP |
 | `internal/admin` | 11 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth, policy versions |

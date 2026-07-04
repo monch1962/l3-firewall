@@ -17,7 +17,6 @@ import (
 
 	"github.com/monch1962/l3-firewall/internal/alert"
 	"github.com/monch1962/l3-firewall/internal/audit"
-	"github.com/monch1962/l3-firewall/internal/capture"
 	"github.com/monch1962/l3-firewall/internal/conntrack"
 	"github.com/monch1962/l3-firewall/internal/geoip"
 	"github.com/monch1962/l3-firewall/internal/l2filter"
@@ -29,6 +28,13 @@ import (
 
 	"github.com/florianl/go-nfqueue"
 )
+
+// PcapWriter is the interface for writing blocked packets to pcap files.
+// Using an interface allows tests to mock capture failures and panics.
+// production.NewWriter returns a *capture.Writer which implements this.
+type PcapWriter interface {
+	WriteBlock(raw []byte) error
+}
 
 const maxRecentBlocks = 100
 const maxBlockStatsReasons = 256
@@ -69,7 +75,7 @@ type Engine struct {
 	alertRouter *alert.Router // nil = no alerts
 	geoipReader *geoip.Reader // nil = no GeoIP lookups
 	threatIntel *threatintel.Blocklist // nil = no threat intel blocking
-	pcapWriter  *capture.Writer       // nil = no pcap capture
+	pcapWriter  PcapWriter            // nil = no pcap capture
 	statePath   string                // path for persisting state (empty = no persistence)
 	l2Filter    *l2filter.Filter      // nil = no L2 filtering
 
@@ -93,7 +99,7 @@ type Engine struct {
 
 // New creates a firewall engine with the given components.
 // Pass nil for auditLogger or alertRouter to disable those features.
-func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist, pw *capture.Writer, stateFile string, l2 *l2filter.Filter) *Engine {
+func New(eval opa.Evaluator, ct *conntrack.Table, rl *ratelimit.Limiter, failClosed, auditOnly bool, al *audit.Logger, ar *alert.Router, gr *geoip.Reader, ti *threatintel.Blocklist, pw PcapWriter, stateFile string, l2 *l2filter.Filter) *Engine {
 	return &Engine{
 		eval:         eval,
 		conntrack:    ct,
@@ -389,13 +395,17 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 }
 
 // packetHandler is the NFQUEUE callback with panic recovery.
-func (e *Engine) packetHandler(attr nfqueue.Attribute) int {
+// Uses named return so that a panic in post-decision cleanup (e.g.,
+// pcap WriteBlock) still returns 1 (NF_DROP / block) instead of
+// the zero value 0 (NF_ACCEPT / allow), preventing fail-open bypass.
+func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			e.packetsProcessed++
 			e.packetsAllowed++
 			slog.Error("panic recovered in packet handler",
 				"panic", fmt.Sprintf("%v", rec))
+			ret = 1 // fail-closed: blocked packets stay blocked on panic
 		}
 	}()
 
@@ -414,7 +424,9 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) int {
 	}
 	// Capture blocked packet to pcap if enabled
 	if e.pcapWriter != nil {
-		e.pcapWriter.WriteBlock(*attr.Payload)
+		if err := e.pcapWriter.WriteBlock(*attr.Payload); err != nil {
+			slog.Warn("pcap write failed", "error", err)
+		}
 	}
 	return 1
 }
@@ -430,7 +442,9 @@ func (e *Engine) saveState() {
 		stats[k] = v
 	}
 	e.blockStatsMu.RUnlock()
-	persist.SaveState(e.statePath, &persist.EngineState{BlockStats: stats})
+	if err := persist.SaveState(e.statePath, &persist.EngineState{BlockStats: stats}); err != nil {
+		slog.Warn("failed to persist state", "path", e.statePath, "error", err)
+	}
 }
 
 // restoreState loads previously persisted state into the engine.

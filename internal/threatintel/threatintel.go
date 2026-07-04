@@ -40,6 +40,8 @@ func NewBlocklist() *Blocklist {
 
 // Add inserts an IP or CIDR into the blocklist. Supports both exact IPs
 // (e.g. "10.0.0.1") and CIDR notation (e.g. "10.0.0.0/24").
+// IPv4-mapped IPv6 addresses (e.g. "::ffff:10.0.0.1") are normalized
+// to their IPv4 form via To4() so they match bare IPv4 entries.
 func (bl *Blocklist) Add(entry string) {
 	if bl == nil {
 		return
@@ -60,12 +62,19 @@ func (bl *Blocklist) Add(entry string) {
 	} else {
 		ip := net.ParseIP(entry)
 		if ip != nil {
-			bl.ips[ip.String()] = struct{}{}
+			// Normalize IPv4-mapped IPv6 to IPv4 form for consistent matching
+			if ip4 := ip.To4(); ip4 != nil {
+				bl.ips[ip4.String()] = struct{}{}
+			} else {
+				bl.ips[ip.String()] = struct{}{}
+			}
 		}
 	}
 }
 
 // Contains checks if the given IP is in the blocklist (exact or within a CIDR).
+// IPv4-mapped IPv6 addresses (e.g. "::ffff:10.0.0.1") are normalized to IPv4
+// to match entries added in bare IPv4 form.
 func (bl *Blocklist) Contains(ipStr string) bool {
 	if bl == nil {
 		return false
@@ -73,6 +82,10 @@ func (bl *Blocklist) Contains(ipStr string) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false
+	}
+	// Normalize IPv4-mapped IPv6 to IPv4 form for consistent matching
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
 	}
 
 	bl.mu.RLock()
