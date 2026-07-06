@@ -14,7 +14,12 @@ type Config struct {
 	BlockedMACs     []string // MAC addresses blocked (empty = none blocked)
 	EnableARPCheck  bool     // enable ARP spoofing detection
 	EnableDHCPCheck bool     // enable DHCP snooping
+	MaxARPEntries   int      // max entries in ARP table (0 = default 65536)
 }
+
+// defaultMaxARPEntries prevents unbounded ARP table growth from memory
+// exhaustion attacks where an attacker sends many unique IP→MAC bindings.
+const defaultMaxARPEntries = 65536
 
 // Filter provides MAC-based access control and L2 attack detection.
 type Filter struct {
@@ -23,15 +28,21 @@ type Filter struct {
 	allowedMACs map[string]bool // normalized MAC -> true
 	blockedMACs map[string]bool // normalized MAC -> true
 	arpTable    map[string]string // IP -> MAC binding (from DHCP snooping)
+	maxARP     int               // max ARP table entries (from cfg, with default)
 }
 
 // NewFilter creates an L2 filter.
 func NewFilter(cfg Config) *Filter {
+	maxARP := cfg.MaxARPEntries
+	if maxARP <= 0 {
+		maxARP = defaultMaxARPEntries
+	}
 	f := &Filter{
 		cfg:         cfg,
 		allowedMACs: make(map[string]bool),
 		blockedMACs: make(map[string]bool),
 		arpTable:    make(map[string]string),
+		maxARP:      maxARP,
 	}
 	for _, m := range cfg.AllowedMACs {
 		f.allowedMACs[normalizeMAC(m)] = true
@@ -91,6 +102,7 @@ func (f *Filter) MACAllowed(srcMAC string) (bool, string) {
 
 // RecordDHCP snoops a DHCP ACK to build an IP→MAC binding.
 // Returns true if the binding was recorded or updated.
+// The ARP table is capped at maxARP entries to prevent memory exhaustion.
 func (f *Filter) RecordDHCP(ip, mac string) bool {
 	if f == nil {
 		return false
@@ -98,6 +110,13 @@ func (f *Filter) RecordDHCP(ip, mac string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	norm := normalizeMAC(mac)
+	// Evict one entry if table is full and this is a new key
+	if _, exists := f.arpTable[ip]; !exists && len(f.arpTable) >= f.maxARP {
+		for k := range f.arpTable {
+			delete(f.arpTable, k)
+			break
+		}
+	}
 	f.arpTable[ip] = norm
 	return true
 }
@@ -119,7 +138,13 @@ func (f *Filter) CheckARP(ip, mac string) (bool, string) {
 
 	knownMAC, exists := f.arpTable[ip]
 	if !exists {
-		// Learn new binding
+		// Learn new binding (cap table size for memory protection)
+		if len(f.arpTable) >= f.maxARP {
+			for k := range f.arpTable {
+				delete(f.arpTable, k)
+				break
+			}
+		}
 		f.arpTable[ip] = norm
 		return true, ""
 	}

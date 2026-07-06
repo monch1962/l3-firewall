@@ -38,7 +38,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | 16 | **Time-Based Access** — Block/allow by hour and day of week | `time_based_rules` with `utc_hour`/`utc_day` | ✅ |
 | 17 | **GeoIP Blocking** — Block/allow by source/destination country | MaxMind .mmdb + `blocked_src_countries` / `allowed_src_countries` | ✅ |
 
-### Red-Team Verified Transport Protection (19 attack simulation tests)
+### Red-Team Verified Transport Protection (25 attack simulation tests)
 
 | # | Attack Vector | Defense | Status |
 |---|---|---|---|
@@ -60,9 +60,15 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | R16 | **pcap WriteBlock panic fail-open** — Panic in `WriteBlock` causes `packetHandler` to return 0 (NF_ACCEPT) instead of 1 (NF_DROP) | Named return in `packetHandler` sets `ret=1` on panic recovery | ✅ |
 | R17 | **pcap WriteBlock error silent discard** — Pcap capture failures not visible to operators | Error logged via `slog.Warn` | ✅ |
 | R18 | **saveState error silent discard** — State persistence failures not visible to operators | Error logged via `slog.Warn` | ✅ |
-| R19 | **IPv4-mapped IPv6 blocklist bypass** — `::ffff:10.0.0.1` does not match `10.0.0.1` in threat intel | `To4()` normalization in both `Add` and `Contains` | ✅ |
+|| R19 | **IPv4-mapped IPv6 blocklist bypass** — `::ffff:10.0.0.1` does not match `10.0.0.1` in threat intel | `To4()` normalization in both `Add` and `Contains` | ✅ |
+|| R20 | **syncer Multiple Start() goroutine leak** — Duplicate watcher goroutines from repeated Start() calls | `sync.Once` guard makes `Start()` idempotent | ✅ |
+|| R21 | **syncer No MaxPolicySize** — Oversized etcd policy value (1GB+) exhausts memory in `loadCurrent` | 10MB `maxPolicySize` guard skips oversized values | ✅ |
+|| R22 | **l2filter ARP table unbounded growth** — Unique IP→MAC bindings exhaust memory via RecordDHCP / CheckARP | `MaxARPEntries` cap (65536 default) with random eviction | ✅ |
+|| R23 | **capture Glob error silent discard** — `filepath.Glob` error silently ignored in `cleanupLocked` | Error logged via `slog.Warn` | ✅ |
+|| R24 | **capture MaxPacketSize** — Multi-GB "packet" writes GB to disk in single WriteBlock call | 64KB `maxPacketSize` cap rejects oversized writes | ✅ |
+|| R25 | **capture cleanupLocked early-return on error** — Glob error could leave stale files | Early return prevents incorrect file removal | ✅ |
 
-### Verified Test Coverage (339 Go+Rego tests)
+### Verified Test Coverage (346 Go+Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
@@ -73,13 +79,13 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | `internal/threatintel` | 30 | NewBlocklist, add/contains/remove, CIDR, duplicate, concurrent, URL fetch, HTTP error, refresh, nil safety, OPA data, body size limit, refresh growth, fast refresh, URL-encoded IP, empty blocklist remove, zero-interval guard, double-close prevention, slow server, concurrent CIDR/contains, IPv6 contains, DataForOPA with CIDR, IPv4-mapped IPv6 normalization, IP edge cases, very long string, nil stopCh |
 | `internal/ratelimit` | 15 | Basic allowance, burst, per-IP independence, byte rate, stale cleanup, active key preservation, concurrent, rate queries, per-dst-port AllowPort, GetPortPPS, port independence, unknown port |
 | `internal/audit` | 7 | NewLogger default path, block events, allow events, concurrent safety, rotation, close, invalid path |
-| `internal/capture` | 15 | NewWriter nil dir, dir creation, write block, rotation, nil safety, close, dir traversal, high file number, concurrent close/write, large packet, no max packet size, cleanup many files, write after close, concurrent write |
+| `internal/capture` | 17 | NewWriter nil dir, dir creation, write block, rotation, nil safety, close, dir traversal, high file number, concurrent close/write, large packet cap, no max packet size, cleanup many files, write after close, concurrent write, Glob error logging |
 | `internal/engine` | 17 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK, pcap panic fail-open, pcap error silent discard, saveState error silent discard, engine+threatintel edge cases, state persistence integration, engine+threatintel blocked, panic recovery |
 | `internal/alert` | 9 | Type strings, defaults, webhook payload, cooldown suppression, multi-type, async non-blocking, nil safety, concurrent |
-| `internal/l2filter` | 21 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC, non-hex chars, broadcast/multicast, length extremes, concurrent normalize, large MAC list, unicode whitespace bypass, MAC homoglyph, DHCP empty IP, ARP long IP, concurrent CheckARP |
+| `internal/l2filter` | 24 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC, non-hex chars, broadcast/multicast, length extremes, concurrent normalize, large MAC list, unicode whitespace bypass, MAC homoglyph, DHCP empty IP, ARP long IP, concurrent CheckARP, ARP table cap, CheckARP learning cap, ARP eviction |
 | `internal/admin` | 11 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth, policy versions |
 | `internal/persist` | 13 | Save/load, missing file, empty path, corrupt file, nil safety, huge file, path traversal, sparse file, nil block stats, tmp tombstone, huge BlockStats, concurrent save |
-| `internal/syncer` | 13 | Empty endpoints, bad endpoints, nil start, nil close, callback, context cancel, nil onUpdate, start after close, nil client watch, multiple Start leak, no policy size limit, safeOnUpdate panic recovery, empty endpoint in list |
+| `internal/syncer` | 15 | Empty endpoints, bad endpoints, nil start, nil close, callback, context cancel, nil onUpdate, start after close, nil client watch, multiple Start leak, no policy size limit, safeOnUpdate panic recovery, empty endpoint in list, idempotent Start, max policy size |
 | OPA Policies (Rego) | 76 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1), time-based rules (13), GeoIP rules (11) |
 
 ## Architecture

@@ -11,6 +11,10 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
+// maxPolicySize prevents memory exhaustion from an oversized etcd policy value.
+// A firewall policy is typically a few KB; 10MB is an extreme upper bound.
+const maxPolicySize = 10 * 1024 * 1024
+
 // Syncer watches an etcd key for policy updates and triggers hot-reload.
 type Syncer struct {
 	client   *clientv3.Client
@@ -18,6 +22,8 @@ type Syncer struct {
 	onUpdate func(string) error // called with new policy content
 	stopCh   chan struct{}
 	closeOnce sync.Once
+	startOnce sync.Once // ensures Start() is idempotent
+	started   bool
 }
 
 // Config controls the etcd syncer.
@@ -56,16 +62,18 @@ func New(cfg Config, onUpdate func(string) error) (*Syncer, error) {
 }
 
 // Start begins watching the etcd key for changes.
+// Idempotent — subsequent calls are no-ops.
 func (s *Syncer) Start(ctx context.Context) {
 	if s == nil {
 		return
 	}
-
-	// Load initial policy
-	s.loadCurrent(ctx)
-
-	// Start watcher
-	go s.watch(ctx)
+	s.startOnce.Do(func() {
+		s.started = true
+		// Load initial policy
+		s.loadCurrent(ctx)
+		// Start watcher
+		go s.watch(ctx)
+	})
 }
 
 func (s *Syncer) loadCurrent(ctx context.Context) {
@@ -79,6 +87,12 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	}
 	if len(resp.Kvs) > 0 {
 		policy := string(resp.Kvs[0].Value)
+		// Enforce policy size limit to prevent memory exhaustion
+		if len(policy) > maxPolicySize {
+			slog.Warn("etcd: initial policy exceeds max size, skipping",
+				"key", s.key, "size", len(policy), "max", maxPolicySize)
+			return
+		}
 		// Wrap callback in panic recovery to prevent goroutine death
 		if err := safeOnUpdate(s.onUpdate, policy); err != nil {
 			slog.Warn("etcd: failed to load initial policy", "error", err)

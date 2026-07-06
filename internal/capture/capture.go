@@ -4,6 +4,7 @@ package capture
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -13,6 +14,11 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 )
+
+// maxPacketSize prevents disk exhaustion from oversized packet writes.
+// Standard Ethernet MTU is 1500 bytes; jumbo frames are up to 9000 bytes.
+// A 64KB cap covers all realistic packet sizes with margin.
+const maxPacketSize = 65536
 
 // Config controls the pcap writer behaviour.
 type Config struct {
@@ -50,9 +56,13 @@ func NewWriter(cfg Config) (*Writer, error) {
 }
 
 // WriteBlock writes a blocked packet to the current pcap file.
+// Packets larger than maxPacketSize are rejected to prevent disk exhaustion.
 func (w *Writer) WriteBlock(raw []byte) error {
 	if w == nil {
 		return nil
+	}
+	if len(raw) > maxPacketSize {
+		return fmt.Errorf("packet too large: %d bytes (max %d)", len(raw), maxPacketSize)
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -111,7 +121,11 @@ func (w *Writer) rotateLocked() error {
 
 func (w *Writer) cleanupLocked() {
 	pattern := filepath.Join(w.cfg.Dir, "blocked_*.pcap")
-	matches, _ := filepath.Glob(pattern)
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		slog.Warn("pcap cleanup: Glob error", "pattern", pattern, "error", err)
+		return
+	}
 	if len(matches) <= w.cfg.MaxFiles {
 		return
 	}
