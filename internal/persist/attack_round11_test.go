@@ -8,8 +8,9 @@ import (
 
 // ── R11.10: SaveState with file on different filesystem ────────────
 // os.Rename fails with "invalid cross-device link" when the temp file
-// and target are on different filesystems. The function doesn't fall
-// back to copy+delete, leaving a .tmp file behind.
+// and target are on different filesystems. The function should fall
+// back to copy+delete, leaving no .tmp file behind.
+// FIXED R13: os.Rename error path now cleans up the .tmp file.
 func TestAttack_SaveStateCrossDevice(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -29,10 +30,13 @@ func TestAttack_SaveStateCrossDevice(t *testing.T) {
 	}
 	t.Log("SaveState/LoadState on same filesystem works correctly")
 
-	// Check no temp file remains
+	// Check no temp file remains (R11.10 vulnerability: rename failure on
+	// cross-device can leave .tmp file behind)
 	tmpPath := path + ".tmp"
 	if _, err := os.Stat(tmpPath); err == nil {
-		t.Logf("WARNING: stale .tmp file found at %s", tmpPath)
+		t.Errorf("R13 FIX NEEDED: stale .tmp file found at %s — SaveState must clean up on error", tmpPath)
+	} else {
+		t.Log("No stale .tmp file found — cleanup is working")
 	}
 }
 

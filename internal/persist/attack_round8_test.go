@@ -62,19 +62,28 @@ func TestAttack_LoadStateHugeFile(t *testing.T) {
 // SaveState creates directories and files at the given path without
 // validation. An attacker who can control --state-file could write
 // files outside the intended directory.
+// FIXED R13: SaveState now rejects paths containing ".." to prevent
+// path traversal outside the expected directory.
 func TestAttack_SaveStatePathTraversal(t *testing.T) {
 	dir := t.TempDir()
-	traversalPath := filepath.Join(dir, "..", "..", "escape_test", "state.json")
+	// Use raw path with ".." — filepath.Join resolves .. elements,
+	// but the --state-file flag value comes as a raw string from config.
+	traversalPath := dir + "/../../escape_test/state.json"
 	state := &EngineState{BlockStats: map[string]int64{"test": 1}}
 
 	err := SaveState(traversalPath, state)
-	if err != nil {
-		t.Logf("SaveState with traversal path returned error: %v", err)
-	} else {
-		expectedOutside := filepath.Join(dir, "..", "..", "escape_test", "state.json")
-		if _, err := os.Stat(expectedOutside); err == nil {
-			t.Log("WARNING: SaveState wrote file outside intended directory via path traversal (config input, low risk)")
+
+	// After R13 fix: SaveState should reject path traversal
+	if err == nil {
+		// If no error, verify file was NOT written outside intended dir
+		expectedOutside := dir + "/../../escape_test/state.json"
+		if _, statErr := os.Stat(expectedOutside); statErr == nil {
+			t.Error("R13 FIX NEEDED: SaveState wrote file outside intended directory via path traversal")
+		} else {
+			t.Logf("SaveState with traversal path did not write file (path rejected or file not found)")
 		}
+	} else {
+		t.Logf("SaveState correctly rejected path traversal: %v", err)
 	}
 }
 

@@ -117,6 +117,14 @@ func (s *Syncer) watch(ctx context.Context) {
 			}
 			for _, ev := range wresp.Events {
 				policy := string(ev.Kv.Value)
+				// Enforce policy size limit to prevent memory exhaustion from
+				// oversized etcd values arriving via watcher updates.
+				// Matching the same check in loadCurrent().
+				if len(policy) > maxPolicySize {
+					slog.Warn("etcd: policy update exceeds max size, skipping",
+						"key", s.key, "size", len(policy), "max", maxPolicySize)
+					continue
+				}
 				slog.Info("etcd: policy updated", "key", s.key, "type", ev.Type)
 				// Wrap callback in panic recovery to prevent goroutine death
 				if err := safeOnUpdate(s.onUpdate, policy); err != nil {

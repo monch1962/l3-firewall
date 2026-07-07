@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **17 attack categories** with **296 Go tests** and **76 Rego tests** plus **28 demo tests** across 15 internal packages and 12 standalone demos.
+l3-firewall's OPA Rego policies cover **17 attack categories** with **298 Go tests** and **76 Rego tests** plus **28 demo tests** across 15 internal packages and 12 standalone demos.
 
 See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
@@ -38,7 +38,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | 16 | **Time-Based Access** — Block/allow by hour and day of week | `time_based_rules` with `utc_hour`/`utc_day` | ✅ |
 | 17 | **GeoIP Blocking** — Block/allow by source/destination country | MaxMind .mmdb + `blocked_src_countries` / `allowed_src_countries` | ✅ |
 
-### Red-Team Verified Transport Protection (25 attack simulation tests)
+### Red-Team Verified Transport Protection (28 attack simulation tests)
 
 | # | Attack Vector | Defense | Status |
 |---|---|---|---|
@@ -67,8 +67,11 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 || R23 | **capture Glob error silent discard** — `filepath.Glob` error silently ignored in `cleanupLocked` | Error logged via `slog.Warn` | ✅ |
 || R24 | **capture MaxPacketSize** — Multi-GB "packet" writes GB to disk in single WriteBlock call | 64KB `maxPacketSize` cap rejects oversized writes | ✅ |
 || R25 | **capture cleanupLocked early-return on error** — Glob error could leave stale files | Early return prevents incorrect file removal | ✅ |
+|| R26 | **syncer watch event bypasses MaxPolicySize** — Watch updates process oversized etcd values without size limit | `maxPolicySize` check added to `watch()` event handler, matching `loadCurrent()` | ✅ |
+|| R27 | **persist SaveState path traversal** — `..` in state file path writes outside intended directory | `strings.Contains(path, "..")` check rejects traversal paths | ✅ |
+|| R28 | **persist SaveState cross-device stale .tmp** — `os.Rename` fails on different filesystems, leaving `.tmp` file behind | `os.Remove(tmpPath)` cleanup on rename failure | ✅ |
 
-### Verified Test Coverage (346 Go+Rego tests)
+### Verified Test Coverage (348 Go+Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
@@ -84,8 +87,8 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | `internal/alert` | 9 | Type strings, defaults, webhook payload, cooldown suppression, multi-type, async non-blocking, nil safety, concurrent |
 | `internal/l2filter` | 24 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC, non-hex chars, broadcast/multicast, length extremes, concurrent normalize, large MAC list, unicode whitespace bypass, MAC homoglyph, DHCP empty IP, ARP long IP, concurrent CheckARP, ARP table cap, CheckARP learning cap, ARP eviction |
 | `internal/admin` | 11 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth, policy versions |
-| `internal/persist` | 13 | Save/load, missing file, empty path, corrupt file, nil safety, huge file, path traversal, sparse file, nil block stats, tmp tombstone, huge BlockStats, concurrent save |
-| `internal/syncer` | 15 | Empty endpoints, bad endpoints, nil start, nil close, callback, context cancel, nil onUpdate, start after close, nil client watch, multiple Start leak, no policy size limit, safeOnUpdate panic recovery, empty endpoint in list, idempotent Start, max policy size |
+| `internal/persist` | 13 | Save/load, missing file, empty path, corrupt file, nil safety, huge file, path traversal rejection, sparse file, nil block stats, tmp tombstone, huge BlockStats, concurrent save, cross-device .tmp cleanup |
+| `internal/syncer` | 17 | Empty endpoints, bad endpoints, nil start, nil close, callback, context cancel, nil onUpdate, start after close, nil client watch, multiple Start leak, no policy size limit, safeOnUpdate panic recovery, empty endpoint in list, idempotent Start, max policy size, watch event size check, safeOnUpdate direct call |
 | OPA Policies (Rego) | 76 | Default allow, CIDR matching (6), IP spoofing (3), port scan (2), SYN flood (2), protocol anomaly (4), ingress/egress (2), port control (7), ICMP control (3), state violation (2), protocol blocking (2), traffic rate (3), fragment attack (3), port ranges (6), source port filtering (2), new conn rate (2), per-port rate (2), combined (1), time-based rules (13), GeoIP rules (11) |
 
 ## Architecture

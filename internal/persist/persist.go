@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -25,12 +26,18 @@ type EngineState struct {
 
 // SaveState writes the engine state to a JSON file atomically.
 // Uses a package-level mutex to serialize concurrent calls on the
-// shared .tmp file path.
+// shared .tmp file path. Rejects paths with ".." to prevent path
+// traversal attacks when --state-file is attacker-influenced.
 func SaveState(path string, state *EngineState) error {
 	saveMu.Lock()
 	defer saveMu.Unlock()
 	if path == "" || state == nil {
 		return nil
+	}
+	// Reject path traversal (..) to prevent writing files outside
+	// the intended directory.
+	if strings.Contains(path, "..") {
+		return fmt.Errorf("path traversal rejected: %s", path)
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -48,6 +55,7 @@ func SaveState(path string, state *EngineState) error {
 	}
 	f.Close()
 	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath) // Clean up temp file on rename failure (e.g., cross-device link)
 		return fmt.Errorf("renaming state file: %w", err)
 	}
 	return nil
