@@ -64,15 +64,27 @@ func SaveState(path string, state *EngineState) error {
 // LoadState reads the engine state from a JSON file.
 // Returns nil if the file does not exist (first run). A size limit of
 // maxStateFileSize is enforced to prevent memory exhaustion attacks.
+// Non-regular files (named pipes, device files, directories) are
+// rejected to prevent blocking on FIFO hangs (DoS via --state-file).
 func LoadState(path string) (*EngineState, error) {
 	if path == "" {
 		return nil, nil
 	}
-	f, err := os.Open(path)
+	// Check file type before opening to prevent blocking on FIFO/named pipes.
+	// os.Stat follows symlinks, so symlinks to regular files work, but
+	// symlinks to FIFOs are correctly rejected.
+	fi, err := os.Stat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
+		return nil, fmt.Errorf("stating state file: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("state path is not a regular file: %s", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
 		return nil, fmt.Errorf("opening state file: %w", err)
 	}
 	defer f.Close()
