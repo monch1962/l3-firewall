@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 // saveMu serializes SaveState calls to prevent race conditions on the
@@ -70,24 +71,32 @@ func LoadState(path string) (*EngineState, error) {
 	if path == "" {
 		return nil, nil
 	}
-	// Check file type before opening to prevent blocking on FIFO/named pipes.
-	// os.Stat follows symlinks, so symlinks to regular files work, but
-	// symlinks to FIFOs are correctly rejected.
-	fi, err := os.Stat(path)
+	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes.
+	// On Linux, O_NONBLOCK has no effect on regular file reads, so
+	// subsequent JSON decoding works normally. By opening first and
+	// checking the file type via f.Stat() on the opened fd, we
+	// eliminate the TOCTOU race between an os.Stat(path) check and
+	// the subsequent os.Open(path) — an attacker cannot replace the
+	// file between the type check and the open, because the type
+	// check operates on the already-opened file descriptor.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
+		return nil, fmt.Errorf("opening state file: %w", err)
+	}
+	defer f.Close()
+
+	// Check file type on the opened fd (no TOCTOU — the fd is already open).
+	fi, err := f.Stat()
+	if err != nil {
 		return nil, fmt.Errorf("stating state file: %w", err)
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("state path is not a regular file: %s", path)
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("opening state file: %w", err)
-	}
-	defer f.Close()
+
 	var state EngineState
 	if err := json.NewDecoder(io.LimitReader(f, maxStateFileSize+1)).Decode(&state); err != nil {
 		return nil, fmt.Errorf("decoding state: %w", err)
