@@ -38,7 +38,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | 16 | **Time-Based Access** — Block/allow by hour and day of week | `time_based_rules` with `utc_hour`/`utc_day` | ✅ |
 | 17 | **GeoIP Blocking** — Block/allow by source/destination country | MaxMind .mmdb + `blocked_src_countries` / `allowed_src_countries` | ✅ |
 
-### Red-Team Verified Transport Protection (29 attack simulation tests)
+### Red-Team Verified Transport Protection (34 attack simulation tests)
 
 | # | Attack Vector | Defense | Status |
 |---|---|---|---|
@@ -71,8 +71,9 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 || R27 | **persist SaveState path traversal** — `..` in state file path writes outside intended directory | `strings.Contains(path, "..")` check rejects traversal paths | ✅ |
 || R28 | **persist SaveState cross-device stale .tmp** — `os.Rename` fails on different filesystems, leaving `.tmp` file behind | `os.Remove(tmpPath)` cleanup on rename failure | ✅ |
 | R29 | **persist LoadState FIFO hang (DoS)** — `--state-file` pointing to a named pipe blocks `os.Open` indefinitely, preventing engine startup | `os.Stat` file-type check rejects non-regular files (FIFOs, directories, sockets) before opening | ✅ |
+| R30 | **l2filter zero-width char MAC bypass** — Unicode format chars (U+200B ZWS, U+200C ZWNJ, U+200D ZWJ, U+FEFF BOM, etc.) bypass `normalizeMAC` | `strings.Map` pre-filter strips all non-hex, non-separator characters before normalization | ✅ |
 
-### Verified Test Coverage (352 Go+Rego tests)
+### Verified Test Coverage (357 Go+Rego tests)
 
 | Package | Tests | What's Covered |
 |---------|-------|----------------|
@@ -86,7 +87,7 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 | `internal/capture` | 17 | NewWriter nil dir, dir creation, write block, rotation, nil safety, close, dir traversal, high file number, concurrent close/write, large packet cap, no max packet size, cleanup many files, write after close, concurrent write, Glob error logging |
 | `internal/engine` | 17 | Allow, block, TCP state tracking, conntrack updates, audit-only, fail-closed, rate limiting, ICMP, recent blocks, block metadata, running status, stats, connection limit blocking, different src OK, pcap panic fail-open, pcap error silent discard, saveState error silent discard, engine+threatintel edge cases, state persistence integration, engine+threatintel blocked, panic recovery |
 | `internal/alert` | 9 | Type strings, defaults, webhook payload, cooldown suppression, multi-type, async non-blocking, nil safety, concurrent |
-| `internal/l2filter` | 24 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC, non-hex chars, broadcast/multicast, length extremes, concurrent normalize, large MAC list, unicode whitespace bypass, MAC homoglyph, DHCP empty IP, ARP long IP, concurrent CheckARP, ARP table cap, CheckARP learning cap, ARP eviction |
+| `internal/l2filter` | 29 | MAC allow/block, normalization, nil filter, ARP learn/mismatch/consistent, DHCP, empty MAC, non-hex chars, broadcast/multicast, length extremes, concurrent normalize, large MAC list, unicode whitespace bypass, MAC homoglyph, DHCP empty IP, ARP long IP, concurrent CheckARP, ARP table cap, CheckARP learning cap, ARP eviction, zero-width char MAC bypass |
 | `internal/admin` | 11 | Health, stats, blocks, block-stats, rules GET/UPDATE, invalid JSON, wrong method, auth, policy versions |
 || `internal/persist` | 17 | Save/load, missing file, empty path, corrupt file, nil safety, huge file, path traversal rejection, sparse file, nil block stats, tmp tombstone, huge BlockStats, concurrent save, cross-device .tmp cleanup, FIFO hang rejection, symlink-to-FIFO rejection, regular file regression, missing file regression |
 || `internal/syncer` | 17 | Empty endpoints, bad endpoints, nil start, nil close, callback, context cancel, nil onUpdate, start after close, nil client watch, multiple Start leak, no policy size limit, safeOnUpdate panic recovery, empty endpoint in list, idempotent Start, max policy size, watch event size check, safeOnUpdate direct call |

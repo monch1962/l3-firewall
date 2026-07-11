@@ -67,24 +67,42 @@ func TestAttack_MACHomoglyphCharacters(t *testing.T) {
 	})
 
 	homoglyphInputs := []struct {
-		name string
-		mac  string
+		name    string
+		mac     string
+		wantOK  bool // true if MAC should be allowed after normalization
+		explain string
 	}{
-		// Cyrillic а (U+0430) looks like Latin 'a'
+		// Cyrillic а (U+0430) looks like Latin 'a', but is stripped as non-hex.
+		// "аа:bb:cc:dd:ee:ff" becomes "bb:cc:dd:ee:ff" → "bbccddeeff" ≠ "aabbccddeeff"
 		{"Cyrillic a instead of Latin a",
-			"\u0430\u0430:bb:cc:dd:ee:ff"},
-		// Greek ο (U+03BF) looks like 'o' or '0'
-		{"Greek omicron instead of 'o'",
-			"aa:bb:cc:dd:ee:f\u03bff"},
+			"\u0430\u0430:bb:cc:dd:ee:ff",
+			false,
+			"stripped Cyrillic chars, leaving non-matching MAC",
+		},
+		// Greek ο (U+03BF) looks like 'o', but is stripped as non-hex.
+		// "aa:bb:cc:dd:ee:fo(micron)ff" becomes "aa:bb:cc:dd:ee:ff" → "aabbccddeeff" = allowed
+		{"Greek omicron instead of hex char",
+			"aa:bb:cc:dd:ee:f\u03bff",
+			true,
+			"non-hex omicron stripped, remaining hex matches allowed MAC",
+		},
 	}
 
 	for _, tt := range homoglyphInputs {
 		t.Run(tt.name, func(t *testing.T) {
 			ok, reason := f.MACAllowed(tt.mac)
-			if ok {
-				t.Errorf("MAC %q with homoglyph characters was allowed — bypass: reason=%q", tt.mac, reason)
+			if tt.wantOK {
+				if !ok {
+					t.Errorf("MAC %q should be allowed after normalization (%s): reason=%q", tt.mac, tt.explain, reason)
+				} else {
+					t.Logf("MAC %q correctly allowed: %s", tt.mac, tt.explain)
+				}
 			} else {
-				t.Logf("MAC %q correctly rejected: %s", tt.mac, reason)
+				if ok {
+					t.Errorf("MAC %q should be denied (%s): reason=%q", tt.mac, tt.explain, reason)
+				} else {
+					t.Logf("MAC %q correctly rejected: %s — %s", tt.mac, reason, tt.explain)
+				}
 			}
 		})
 	}

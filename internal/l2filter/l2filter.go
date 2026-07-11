@@ -57,7 +57,22 @@ func NewFilter(cfg Config) *Filter {
 // or Unicode whitespace. Strips all Unicode whitespace characters (spaces,
 // NBSP, thin space, ideographic space, etc.) to prevent bypass attacks.
 func normalizeMAC(mac string) string {
-	// First strip ASCII space and separators
+	// Strip all characters that are not valid hex digits (0-9, a-f, A-F) or
+	// known MAC separators (:, -, ., space). This catches zero-width format
+	// characters (U+200B, U+FEFF, U+200C, etc.) and any other non-standard
+	// Unicode characters that would bypass the existing normalization.
+	mac = strings.Map(func(r rune) rune {
+		switch {
+		case (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F'):
+			return r
+		case r == ':' || r == '-' || r == '.' || r == ' ':
+			return r
+		default:
+			return -1 // drop this character
+		}
+	}, mac)
+
+	// Replace separators and lowercase
 	replacer := strings.NewReplacer(":", "", "-", "", ".", "", " ", "")
 	result := replacer.Replace(strings.ToLower(mac))
 	// Strip remaining Unicode whitespace characters (NBSP, thin space, etc.)
