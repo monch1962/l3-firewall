@@ -12,7 +12,7 @@ A **Layer 3 firewall sidecar** that intercepts, inspects, and filters IP packets
 
 ## Attack Coverage
 
-l3-firewall's OPA Rego policies cover **17 attack categories** with **302 Go tests** and **76 Rego tests** plus **28 demo tests** across 15 internal packages and 12 standalone demos. All packages are **terminally hardened** — red-team round 17 confirmed zero new vulnerabilities across all 5 target packages (syncer, l2filter, persist, capture, threatintel) and their integration points.
+l3-firewall's OPA Rego policies cover **17 attack categories** with **302 Go tests** and **76 Rego tests** plus **28 demo tests** across 15 internal packages and 12 standalone demos. All packages are **terminally hardened** — red-team rounds 17–18 confirmed zero new vulnerabilities across all 5 target packages (syncer, l2filter, persist, capture, threatintel) and their integration points.
 
 See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy demonstrations covering every capability.
 
@@ -70,9 +70,10 @@ See the [`opa-demos/`](opa-demos/) directory for runnable, self-contained policy
 || R26 | **syncer watch event bypasses MaxPolicySize** — Watch updates process oversized etcd values without size limit | `maxPolicySize` check added to `watch()` event handler, matching `loadCurrent()` | ✅ |
 || R27 | **persist SaveState path traversal** — `..` in state file path writes outside intended directory | `strings.Contains(path, "..")` check rejects traversal paths | ✅ |
 || R28 | **persist SaveState cross-device stale .tmp** — `os.Rename` fails on different filesystems, leaving `.tmp` file behind | `os.Remove(tmpPath)` cleanup on rename failure | ✅ |
-| R29 | **persist LoadState FIFO hang (DoS)** — `--state-file` pointing to a named pipe blocks `os.Open` indefinitely, preventing engine startup | `os.Stat` file-type check rejects non-regular files (FIFOs, directories, sockets) before opening | ✅ |
+|| R29 | **persist LoadState FIFO hang (DoS)** — `--state-file` pointing to a named pipe blocks `os.Open` indefinitely, preventing engine startup | `os.Stat` file-type check rejects non-regular files (FIFOs, directories, sockets) before opening | ✅ |
 || R30 | **l2filter zero-width char MAC bypass** — Unicode format chars (U+200B ZWS, U+200C ZWNJ, U+200D ZWJ, U+FEFF BOM, etc.) bypass `normalizeMAC` | `strings.Map` pre-filter strips all non-hex, non-separator characters before normalization | ✅ |
 || **R31** | **Terminal round** — 5 packages (syncer, l2filter, persist, capture, threatintel) + engine integration evaluated across all 15 adversarial vectors. All prior-round defenses active. No new vulnerabilities found. | Terminally hardened | ✅ |
+|| **R32** | **Confirmation round** — All 5 target packages re-verified + cross-package integration audit + documentation-debt scan. 64 prior-round attack tests pass. All 16 Go packages + 76 Rego tests green. No new vulnerabilities found. | Terminal status confirmed | ✅ |
 
 ### Verified Test Coverage (357 Go+Rego tests)
 
