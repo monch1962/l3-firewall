@@ -72,9 +72,8 @@ func TestAttack_CleanupLockedMustLogGlobError(t *testing.T) {
 		t.Logf("cleanupLocked: %d files remaining (max %d)", len(files), w.cfg.MaxFiles)
 	}
 
-	// Note: the Glob error is silently discarded in cleanupLocked.
-	// A permissions change between rotation calls could cause Glob to
-	// return an error, which would be silently ignored, potentially
-	// leaving too many pcap files on disk.
-	t.Log("cleanupLocked error from Glob is silently discarded — should log for observability")
+	// FIXED (R12+): The Glob error is now logged via slog.Warn in
+	// cleanupLocked. A permissions change between rotation calls causes
+	// the Glob error to be logged, leaving too many pcap files behind.
+	t.Log("FIXED: cleanupLocked logs Glob error via slog.Warn — observability confirmed")
 }
