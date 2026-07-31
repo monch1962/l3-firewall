@@ -71,8 +71,20 @@ func NewRouter(cfg Config) *Router {
 		cfg.Cooldown = 30 * time.Second
 	}
 	return &Router{
-		cfg:      cfg,
-		client:   &http.Client{Timeout: 10 * time.Second},
+		cfg: cfg,
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			// Do not follow redirects to prevent SSRF: a compromised or
+			// malicious webhook endpoint could 302/307 the alert POST
+			// (containing src IPs and messages) to an internal service
+			// (cloud metadata endpoints, etcd, admin API). Webhook
+			// endpoints should serve directly; redirects serve no
+			// legitimate purpose and turn the firewall into an SSRF
+			// proxy that leaks alert payloads to internal targets.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		lastSent: make(map[AlertType]time.Time),
 	}
 }

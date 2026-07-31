@@ -4,12 +4,21 @@ package geoip
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
+	"syscall"
 
 	"github.com/oschwald/maxminddb-golang/v2"
 )
+
+// maxGeoIPFileSize is the maximum allowed GeoIP database file size (512MB).
+// Prevents memory exhaustion from an attacker-influenced --geoip-db path
+// pointing at an oversized file (R8 class). GeoLite2/GeoIP2 databases are
+// typically 3-100MB; 512MB is a generous upper bound.
+const maxGeoIPFileSize = 512 * 1024 * 1024
 
 // geoipRecord mirrors the relevant fields from a MaxMind GeoIP2 response.
 type geoipRecord struct {
@@ -26,11 +35,44 @@ type Reader struct {
 
 // NewReader opens a MaxMind .mmdb database file.
 // Returns (nil, nil) if path is empty — callers can pass "" to disable.
+//
+// Hardened R38: the file is opened with O_NONBLOCK first (never blocks on
+// FIFO/named pipes — startup DoS via attacker-influenced --geoip-db path),
+// the file type is checked via f.Stat() on the already-opened fd (no TOCTOU),
+// and the size is capped before the database is loaded into memory.
+// OpenBytes is used on the verified fd content so the library never
+// re-opens the path itself.
 func NewReader(path string) (*Reader, error) {
 	if path == "" {
 		return nil, nil
 	}
-	db, err := maxminddb.Open(path)
+	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes.
+	// On Linux, O_NONBLOCK has no effect on regular file reads.
+	// Checking the type and size on the already-opened fd eliminates the
+	// TOCTOU race between a path-based Stat check and a later Open.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening GeoIP database %s: %w", path, err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stating GeoIP database %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("GeoIP database path is not a regular file: %s", path)
+	}
+	if fi.Size() > maxGeoIPFileSize {
+		return nil, fmt.Errorf("GeoIP database %s too large: %d bytes (max %d)", path, fi.Size(), maxGeoIPFileSize)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxGeoIPFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading GeoIP database %s: %w", path, err)
+	}
+
+	db, err := maxminddb.OpenBytes(data)
 	if err != nil {
 		return nil, fmt.Errorf("opening GeoIP database %s: %w", path, err)
 	}

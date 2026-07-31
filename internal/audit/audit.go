@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -21,6 +22,29 @@ const (
 	DefaultMaxBackups = 5    // keep 5 rotated files
 	DefaultDirMode    = 0755 // directory permissions
 )
+
+// openAuditFile opens the audit log file with the R15 hardened pattern:
+// O_NONBLOCK prevents blocking on FIFO/named pipes (startup DoS via an
+// attacker-influenced --audit-log path), and the file type is checked via
+// f.Stat() on the already-opened fd — no TOCTOU between a Stat and an Open.
+// On Linux O_NONBLOCK has no effect on regular file writes, so normal
+// append logging is unaffected.
+func openAuditFile(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NONBLOCK, 0644)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("audit log path is not a regular file: %s", path)
+	}
+	return f, nil
+}
 
 // AuditEvent represents a single structured audit log entry.
 type AuditEvent struct {
@@ -72,8 +96,8 @@ func NewLogger(cfg Config) (*Logger, error) {
 		return nil, fmt.Errorf("creating audit log directory %s: %w", dir, err)
 	}
 
-	// Open the log file for append
-	file, err := os.OpenFile(cfg.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Open the log file for append (FIFO-hardened — see openAuditFile)
+	file, err := openAuditFile(cfg.Path)
 	if err != nil {
 		return nil, fmt.Errorf("opening audit log %s: %w", cfg.Path, err)
 	}
@@ -134,8 +158,8 @@ func (l *Logger) rotateLocked() error {
 		return fmt.Errorf("renaming audit log: %w", err)
 	}
 
-	// Open new file
-	file, err := os.OpenFile(l.cfg.Path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// Open new file (FIFO-hardened — see openAuditFile)
+	file, err := openAuditFile(l.cfg.Path)
 	if err != nil {
 		return fmt.Errorf("opening new audit log: %w", err)
 	}
