@@ -515,10 +515,15 @@ func (t *Table) incrFlowCountLocked(srcIP string) {
 
 // decrFlowCountLocked decrements the flow count for a source IP and cleans up
 // the entry if it reaches zero. Must be called with t.mu write lock held.
+// Also prunes the srcPorts port-scan history: port-scan tracking is only
+// meaningful while the source has active flows. Without this prune, srcPorts
+// grows unboundedly — every unique (possibly spoofed) srcIP leaves a permanent
+// entry, enabling memory exhaustion over the firewall's lifetime (R39).
 func (t *Table) decrFlowCountLocked(srcIP string) {
 	t.srcFlowCount[srcIP]--
 	if t.srcFlowCount[srcIP] <= 0 {
 		delete(t.srcFlowCount, srcIP)
+		delete(t.srcPorts, srcIP)
 	}
 }
 
