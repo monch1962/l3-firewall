@@ -48,7 +48,7 @@ func main() {
 		opaFailClosed    = flag.Bool("opa-fail-closed", false, "Block when OPA is unreachable")
 		opaAuditOnly     = flag.Bool("opa-audit-only", false, "Log would-be blocks without enforcing")
 		logFormat        = flag.String("log-format", "text", "Log format: text or json")
-		metricsListen    = flag.String("metrics-listen", "", "Separate address for /metrics (empty = serve on admin port)")
+		metricsListen    = flag.String("metrics-listen", "", "Separate address for /metrics (empty = /metrics not served; the admin API does not mount it)")
 		rateLimitPPS     = flag.Float64("rate-limit-pps", 0, "Per-IP packet rate limit (0 = unlimited)")
 		rateLimitBPS     = flag.Float64("rate-limit-bps", 0, "Per-IP byte rate limit (0 = unlimited)")
 		conntrackMax     = flag.Int("conntrack-max", 65536, "Max tracked connections")

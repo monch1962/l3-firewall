@@ -5,6 +5,7 @@ package ratelimit
 import (
 	"fmt"
 	"math"
+	"net"
 	"sync"
 	"time"
 )
@@ -42,14 +43,31 @@ func NewLimiter(ppsLimit, bpsLimit float64) *Limiter {
 	}
 }
 
+// normalizeIP canonicalizes an IP string so IPv4-mapped IPv6 addresses
+// ("::ffff:10.0.0.1") produce the same key as their IPv4 form ("10.0.0.1").
+// Without this, one logical source splits its rate budget across two
+// buckets — each representation stays under the OPA rate threshold while
+// the combined traffic exceeds it (R40.1; R10 class applied to the rate
+// limiter key space).
+func normalizeIP(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return v4.String()
+	}
+	return parsed.String()
+}
+
 // ipKey returns the per-IP key.
 func ipKey(ip string) rateKey {
-	return rateKey("ip:" + ip)
+	return rateKey("ip:" + normalizeIP(ip))
 }
 
 // portKey returns the per-IP:destination-port key.
 func portKey(ip string, dstPort uint16) rateKey {
-	return rateKey(fmt.Sprintf("port:%s:%d", ip, dstPort))
+	return rateKey(fmt.Sprintf("port:%s:%d", normalizeIP(ip), dstPort))
 }
 
 // updateBucket records a packet in the given bucket and returns the current PPS/BPS.
@@ -80,31 +98,50 @@ func (l *Limiter) updateBucket(b *rateBucket, packetSize int, now time.Time) (pp
 	return b.pps, b.bps
 }
 
+// evictionSampleSize bounds the eviction scan in getOrCreateBucket.
+// Scanning the entire map for the oldest entry is O(n) work executed under
+// the write lock in the packet hot path — an attacker churning unique
+// (spoofed srcIP, dstPort) keys at capacity forces a full-map scan per
+// packet, amplifying CPU by the map size and stalling all rate-limit
+// processing (R40.2). Sampling a small random subset keeps eviction
+// amortized O(1) while still removing an old entry.
+const evictionSampleSize = 16
+
 // getOrCreateBucket returns the bucket for a key, creating it if needed.
-// If MaxEntries is set and the map is at capacity, evicts one random entry.
+// If MaxEntries is set and the map is at capacity, evicts a sampled entry.
 func (l *Limiter) getOrCreateBucket(key rateKey, now time.Time) *rateBucket {
 	b, ok := l.buckets[key]
 	if !ok {
 		if l.MaxEntries > 0 && len(l.buckets) >= l.MaxEntries {
-			// Evict oldest entry
-			var oldestKey rateKey
-			var oldestTime time.Time
-			first := true
-			for k, v := range l.buckets {
-				if first || v.lastTime.Before(oldestTime) {
-					oldestKey = k
-					oldestTime = v.lastTime
-					first = false
-				}
-			}
-			if !first {
-				delete(l.buckets, oldestKey)
-			}
+			l.evictOneSampledLocked()
 		}
 		b = &rateBucket{lastTime: now}
 		l.buckets[key] = b
 	}
 	return b
+}
+
+// evictOneSampledLocked removes one entry chosen from a bounded random
+// sample of the map (oldest of the sample). Must be called with l.mu held.
+func (l *Limiter) evictOneSampledLocked() {
+	var oldestKey rateKey
+	var oldestTime time.Time
+	first := true
+	scanned := 0
+	for k, v := range l.buckets {
+		if scanned >= evictionSampleSize {
+			break
+		}
+		scanned++
+		if first || v.lastTime.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = v.lastTime
+			first = false
+		}
+	}
+	if !first {
+		delete(l.buckets, oldestKey)
+	}
 }
 
 // Allow records a packet for the given IP and returns the current PPS and BPS.
@@ -144,6 +181,16 @@ func (l *Limiter) getBucketBPS(key rateKey) float64 {
 		return b.bps
 	}
 	return 0
+}
+
+// ExceedsLimit reports whether the measured per-IP rates exceed the
+// configured limits (0 = unlimited). The engine calls this on every packet
+// to enforce --rate-limit-pps / --rate-limit-bps. Previously ppsLimit and
+// bpsLimit were set by the flags but never read — the operator's rate
+// limit was silently ignored and only OPA's hardcoded policy threshold
+// applied (R40.4).
+func (l *Limiter) ExceedsLimit(pps, bps float64) bool {
+	return (l.ppsLimit > 0 && pps > l.ppsLimit) || (l.bpsLimit > 0 && bps > l.bpsLimit)
 }
 
 // GetPPS returns the packets-per-second rate for the given IP.

@@ -302,6 +302,22 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// 4. Rate tracking — per-IP and per-destination-port
 	pps, bps := e.ratelimit.Allow(pi.SrcIP, packetSize)
 	portPPS, portBPS := e.ratelimit.AllowPort(pi.SrcIP, pi.DstPort, packetSize)
+
+	// 4a. Enforce the configured per-IP rate limits (--rate-limit-pps/-bps).
+	// The flags previously only populated Limiter fields that nothing ever
+	// read — the operator's limit was silently ignored and only OPA's
+	// hardcoded policy threshold applied (R40.4). Mirror the connection-limit
+	// block: hard deny regardless of audit-only mode.
+	if e.ratelimit.ExceedsLimit(pps, bps) {
+		e.packetsBlocked++
+		reason := fmt.Sprintf("per-IP rate limit exceeded: %.0f pps / %.0f bps", pps, bps)
+		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
+			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
+		e.recordBlock(pi, reason, tid)
+		e.logAudit("packet_block", tid, pi, reason)
+		return &opa.Result{Allowed: false, Reason: reason}
+	}
+
 	newConnRate := e.conntrack.NewConnectionRate()
 
 	// 3. Get recent ports for port scan detection
@@ -415,7 +431,15 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 
 	pi, err := packet.ParsePacket(*attr.Payload)
 	if err != nil {
-		return 0
+		// Fail-closed: an unparseable packet cannot be policy-checked, so it
+		// must be dropped, not passed. Round 10 made panics in this path
+		// fail-closed (ret=1) but parse errors still returned 0 (NF_ACCEPT),
+		// silently bypassing every policy layer for malformed/truncated
+		// packets (R40.3).
+		e.packetsProcessed++
+		e.packetsBlocked++
+		slog.Warn("unparseable packet dropped (fail-closed)", "error", err)
+		return 1
 	}
 
 	result := e.evaluatePacket(pi, len(*attr.Payload))

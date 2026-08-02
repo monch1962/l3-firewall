@@ -8,6 +8,7 @@ package conntrack
 
 import (
 	"fmt"
+	"net"
 	"sync"
 	"time"
 )
@@ -131,6 +132,23 @@ type flowKey struct {
 	dstPort  uint16
 }
 
+// normalizeIP canonicalizes an IP string so IPv4-mapped IPv6 addresses
+// ("::ffff:10.0.0.1") share keys with their IPv4 form ("10.0.0.1").
+// flows, srcFlowCount and srcPorts are keyed by these strings; without
+// normalization one logical source splits across keys — bypassing the
+// per-source flow limit, splitting port-scan history, and leaving flows
+// that can never be deleted via the other key form (R40.5; R10 class).
+func normalizeIP(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return v4.String()
+	}
+	return parsed.String()
+}
+
 func (k flowKey) String() string {
 	return fmt.Sprintf("%s:%d-%s:%d/%s", k.srcIP, k.srcPort, k.dstIP, k.dstPort, k.protocol)
 }
@@ -201,6 +219,8 @@ func (t *Table) idleTimeoutFor(protocol string) time.Duration {
 // Returns the flow with its packet counter already incremented.
 // Returns nil if the per-source flow limit has been exceeded.
 func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort uint16) *Flow {
+	srcIP = normalizeIP(srcIP)
+	dstIP = normalizeIP(dstIP)
 	key := flowKey{srcIP, dstIP, protocol, srcPort, dstPort}
 
 	t.mu.Lock()
@@ -291,6 +311,8 @@ func (t *Table) NewConnectionRate() float64 {
 // the given TCP flags. This implements a simplified TCP FSM sufficient for
 // firewall state tracking. Returns the flow.
 func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort uint16, syn, ack, rst, fin bool) *Flow {
+	srcIP = normalizeIP(srcIP)
+	dstIP = normalizeIP(dstIP)
 	key := flowKey{srcIP, dstIP, protocol, srcPort, dstPort}
 
 	t.mu.Lock()
@@ -396,6 +418,8 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 
 // Delete removes a flow by 5-tuple and decrements the per-source flow count.
 func (t *Table) Delete(srcIP, dstIP, protocol string, srcPort, dstPort uint16) {
+	srcIP = normalizeIP(srcIP)
+	dstIP = normalizeIP(dstIP)
 	key := flowKey{srcIP, dstIP, protocol, srcPort, dstPort}
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -403,27 +427,6 @@ func (t *Table) Delete(srcIP, dstIP, protocol string, srcPort, dstPort uint16) {
 		delete(t.flows, key)
 		t.decrFlowCountLocked(srcIP)
 	}
-}
-
-// expireBefore removes flows that have been idle longer than the given duration.
-// This is exposed for testing. Use Expire() for production with config-based timeouts.
-func (t *Table) expireBefore(idle time.Duration) int {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	now := time.Now()
-	var expired []flowKey
-	for key, f := range t.flows {
-		if now.Sub(f.lastSeen) > idle {
-			expired = append(expired, key)
-		}
-	}
-	for _, key := range expired {
-		delete(t.flows, key)
-		t.decrFlowCountLocked(key.srcIP)
-	}
-	t.stats.Expired += int64(len(expired))
-	return len(expired)
 }
 
 // Expire removes flows that have been idle longer than their protocol-specific timeout.
@@ -448,12 +451,27 @@ func (t *Table) Expire() int {
 	return len(expired)
 }
 
-// evictOneLocked removes the single oldest flow. Must be called with t.mu held.
+// evictionSampleSize bounds the eviction scan in evictOneLocked. Scanning
+// the entire flow map for the oldest entry is O(n) work executed under the
+// write lock in the packet hot path — an attacker churning spoofed 5-tuples
+// at capacity forces a full-map scan per packet, amplifying CPU by the map
+// size (R40.6; same class as the rate-limiter eviction fixed in R40.2).
+// Sampling a small random subset keeps eviction amortized O(1) while still
+// removing an old flow.
+const evictionSampleSize = 16
+
+// evictOneLocked removes the single oldest flow from a bounded random
+// sample of the map. Must be called with t.mu held.
 func (t *Table) evictOneLocked() {
 	var oldestKey flowKey
 	var oldestTime time.Time
 	first := true
+	scanned := 0
 	for key, f := range t.flows {
+		if scanned >= evictionSampleSize {
+			break
+		}
+		scanned++
 		if first || f.lastSeen.Before(oldestTime) {
 			oldestKey = key
 			oldestTime = f.lastSeen
@@ -472,6 +490,7 @@ func (t *Table) RecordDestPort(srcIP string, dstPort uint16) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	srcIP = normalizeIP(srcIP)
 	ports := t.srcPorts[srcIP]
 	for _, p := range ports {
 		if p == dstPort {
@@ -489,6 +508,7 @@ func (t *Table) RecordDestPort(srcIP string, dstPort uint16) {
 func (t *Table) GetRecentDestPorts(srcIP string) []uint16 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	srcIP = normalizeIP(srcIP)
 	ports := t.srcPorts[srcIP]
 	if len(ports) == 0 {
 		return nil
