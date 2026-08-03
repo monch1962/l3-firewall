@@ -8,9 +8,11 @@ import (
 	"time"
 )
 
-// ── R9.13: No max packet size limit in WriteBlock ──────────────────────
-// WriteBlock accepts a raw byte slice of any size. A single 1GB packet
-// would consume 1GB of disk space. There is no maximum size check.
+// ── R9.13: WriteBlock max packet size cap ────────────────────────────
+// R9 documented no maximum size check — a single 1GB packet would
+// consume 1GB of disk. R12 added maxPacketSize (65536) rejection.
+// R41: converted to a hard assertion — the old "no size cap enforced"
+// log only fired in the pre-R12 success branch and was stale.
 func TestAttack_NoMaxPacketSizeLimit(t *testing.T) {
 	dir := t.TempDir()
 	w, err := NewWriter(Config{Dir: dir, MaxPackets: 1, MaxFiles: 3})
@@ -25,17 +27,10 @@ func TestAttack_NoMaxPacketSizeLimit(t *testing.T) {
 	err = w.WriteBlock(largePkt)
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Logf("WriteBlock with 100MB packet returned error: %v", err)
+	if err == nil {
+		t.Errorf("WriteBlock with 100MB packet succeeded — maxPacketSize cap (%d) not enforced", maxPacketSize)
 	} else {
-		files, _ := filepath.Glob(filepath.Join(dir, "*.pcap"))
-		if len(files) > 0 {
-			info, _ := os.Stat(files[0])
-			if info != nil {
-				t.Logf("WriteBlock with 100MB packet wrote %d MB file in %v — no size cap enforced",
-					info.Size()/(1024*1024), elapsed)
-			}
-		}
+		t.Logf("FIXED (R12): oversized packet rejected in %v: %v", elapsed, err)
 	}
 }
 

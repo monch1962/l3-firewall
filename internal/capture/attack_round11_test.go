@@ -5,10 +5,13 @@ import (
 	"testing"
 )
 
-// ── R11.7: cleanupLocked silently ignores Glob error ──────────────
-// filepath.Glob can return an error if the pattern is malformed or the
-// directory has permission issues. Currently the error is silently
-// discarded with `matches, _ := filepath.Glob(pattern)`.
+// ── R11.7: cleanupLocked Glob error handling ────────────────────────
+// R11 documented filepath.Glob errors being silently discarded in
+// cleanupLocked. R12 added `slog.Warn("pcap cleanup: Glob error", ...)`.
+// R41: production code is correct — Glob errors are logged, so the R11
+// "would be silently ignored" log was stale. We can't assert on slog
+// output without a handler hook; this test exercises the write+rotate
+// path (which invokes cleanupLocked) and confirms no error is returned.
 func TestAttack_CleanupLockedGlobErrorIgnored(t *testing.T) {
 	// Create a directory structure where Glob might fail
 	dir := t.TempDir()
@@ -30,12 +33,15 @@ func TestAttack_CleanupLockedGlobErrorIgnored(t *testing.T) {
 		t.Fatalf("WriteBlock: %v", err)
 	}
 
-	t.Log("cleanupLocked completed without error — Glob error would be silently ignored")
+	t.Log("FIXED (R12): cleanupLocked logs Glob errors via slog.Warn — no silent discard")
 }
 
 // ── R11.8: WriteBlock with raw slice of zero length ────────────────
 // WriteBlock accepts a raw byte slice of any length, including zero.
 // len(raw)=0 produces a zero-length packet in the pcap file.
+// DEFERRED (R41): same disposition as R6.12 — zero-length records are
+// cosmetic, bounded by maxPacketSize, no disk-exhaustion path beyond
+// normal writes.
 func TestAttack_WriteBlockZeroLength(t *testing.T) {
 	dir := t.TempDir()
 
@@ -49,14 +55,14 @@ func TestAttack_WriteBlockZeroLength(t *testing.T) {
 	if err := w.WriteBlock([]byte{}); err != nil {
 		t.Logf("WriteBlock with empty slice returned error: %v", err)
 	} else {
-		t.Log("WriteBlock with empty slice succeeded — zero-length packet written to pcap")
+		t.Log("DEFERRED (R41): WriteBlock with empty slice writes a zero-length pcap record — cosmetic only")
 	}
 
 	// Write with nil slice
 	if err := w.WriteBlock(nil); err != nil {
 		t.Logf("WriteBlock with nil slice returned error: %v", err)
 	} else {
-		t.Log("WriteBlock with nil slice succeeded — zero-length packet written to pcap")
+		t.Log("DEFERRED (R41): WriteBlock with nil slice writes a zero-length pcap record — cosmetic only")
 	}
 
 	// Verify pcap file was created

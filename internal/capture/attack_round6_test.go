@@ -42,6 +42,10 @@ func TestAttack_DiskSpaceExhaustion(t *testing.T) {
 
 // ── R6.12: WriteBlock with nil/empty raw bytes ──────────────────────────
 // Attacker triggers WriteBlock with nil or empty byte slice.
+// DEFERRED (R41): zero-length pcap records are cosmetic — bounded by
+// maxPacketSize, no disk-exhaustion path beyond normal writes. Adding a
+// reject-nil guard is not security-relevant; the R6 "needs nil guard"
+// log described a hypothetical, not an exploitable condition.
 func TestAttack_WriteBlockNilBytes(t *testing.T) {
 	dir := t.TempDir()
 	w, err := NewWriter(Config{Dir: dir, MaxPackets: 10})
@@ -52,16 +56,16 @@ func TestAttack_WriteBlockNilBytes(t *testing.T) {
 
 	// nil byte slice
 	if err := w.WriteBlock(nil); err != nil {
-		t.Logf("WriteBlock(nil) returned error: %v — needs nil guard", err)
+		t.Logf("WriteBlock(nil) returned error: %v", err)
 	} else {
-		t.Log("WriteBlock(nil) succeeded — pcap file may contain zero-length packet")
+		t.Log("DEFERRED (R41): WriteBlock(nil) writes a zero-length pcap record — cosmetic only, bounded by maxPacketSize")
 	}
 
 	// empty byte slice
 	if err := w.WriteBlock([]byte{}); err != nil {
 		t.Logf("WriteBlock([]byte{}) returned error: %v", err)
 	} else {
-		t.Log("WriteBlock([]byte{}) succeeded")
+		t.Log("DEFERRED (R41): WriteBlock([]byte{}) writes a zero-length pcap record — cosmetic only")
 	}
 }
 

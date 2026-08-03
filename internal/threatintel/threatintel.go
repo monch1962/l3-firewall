@@ -127,7 +127,16 @@ func (bl *Blocklist) Remove(entry string) {
 	} else {
 		ip := net.ParseIP(entry)
 		if ip != nil {
-			delete(bl.ips, ip.String())
+			// Normalize IPv4-mapped IPv6 to IPv4 form, matching Add()'s key.
+			// On Go < 1.23 IP.String() preserves the mapped form and the
+			// delete would miss the normalized key, leaving an entry that
+			// can never be removed via its mapped alias (R41 — R10's
+			// Add/Remove consistency lesson applied to Remove).
+			if ip4 := ip.To4(); ip4 != nil {
+				delete(bl.ips, ip4.String())
+			} else {
+				delete(bl.ips, ip.String())
+			}
 		}
 	}
 }

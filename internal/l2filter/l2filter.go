@@ -4,6 +4,7 @@ package l2filter
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 )
@@ -81,6 +82,25 @@ func normalizeMAC(mac string) string {
 	return strings.Join(cleaned, "")
 }
 
+// normalizeIPKey canonicalizes an IP string for use as an arpTable key.
+// IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) are converted to bare IPv4
+// form so both encodings of the same IP share ONE table entry (R41).
+// Without this, an attacker reusing the mapped alias of a learned binding
+// bypasses ARP-spoof detection (the alias key misses the binding stored
+// under the bare form and re-enters learning mode) and doubles per-IP
+// table usage, halving the effective MaxARPEntries budget. Unparseable
+// strings are returned unchanged to preserve prior keying behavior.
+func normalizeIPKey(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	if ip4 := parsed.To4(); ip4 != nil {
+		return ip4.String()
+	}
+	return parsed.String()
+}
+
 // MACAllowed checks if a source MAC is allowed. If AllowedMACs is empty, all are
 // allowed unless the MAC is in BlockedMACs.
 func (f *Filter) MACAllowed(srcMAC string) (bool, string) {
@@ -125,14 +145,15 @@ func (f *Filter) RecordDHCP(ip, mac string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	norm := normalizeMAC(mac)
+	key := normalizeIPKey(ip)
 	// Evict one entry if table is full and this is a new key
-	if _, exists := f.arpTable[ip]; !exists && len(f.arpTable) >= f.maxARP {
+	if _, exists := f.arpTable[key]; !exists && len(f.arpTable) >= f.maxARP {
 		for k := range f.arpTable {
 			delete(f.arpTable, k)
 			break
 		}
 	}
-	f.arpTable[ip] = norm
+	f.arpTable[key] = norm
 	return true
 }
 
@@ -150,8 +171,9 @@ func (f *Filter) CheckARP(ip, mac string) (bool, string) {
 	if norm == "" || ip == "" {
 		return true, ""
 	}
+	key := normalizeIPKey(ip)
 
-	knownMAC, exists := f.arpTable[ip]
+	knownMAC, exists := f.arpTable[key]
 	if !exists {
 		// Learn new binding (cap table size for memory protection)
 		if len(f.arpTable) >= f.maxARP {
@@ -160,7 +182,7 @@ func (f *Filter) CheckARP(ip, mac string) (bool, string) {
 				break
 			}
 		}
-		f.arpTable[ip] = norm
+		f.arpTable[key] = norm
 		return true, ""
 	}
 

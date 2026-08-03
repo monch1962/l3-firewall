@@ -5,9 +5,10 @@ import (
 	"testing"
 )
 
-// ── R11.1: Unbounded ARP table growth (memory exhaustion) ───────────
-// RecordDHCP and CheckARP both add entries to arpTable without any cap.
-// An attacker sending many unique IP→MAC bindings could exhaust memory.
+// ── R11.1: ARP table growth bounded by MaxARPEntries ───────────────
+// R11 documented unbounded growth; R12 added the cap (defaultMaxARPEntries).
+// R41: converted to a hard assertion proving the cap is enforced — the old
+// "no size cap enforced" log described pre-R12 behavior and was stale.
 func TestAttack_UnboundedARPTableGrowth(t *testing.T) {
 	f := NewFilter(Config{EnableDHCPCheck: true})
 
@@ -24,7 +25,11 @@ func TestAttack_UnboundedARPTableGrowth(t *testing.T) {
 	size := len(f.arpTable)
 	f.mu.RUnlock()
 
-	t.Logf("arpTable grew to %d entries — no size cap enforced (inserted %d)", size, entries)
+	if size > f.maxARP {
+		t.Errorf("arpTable grew to %d entries — cap (%d) not enforced (inserted %d)", size, f.maxARP, entries)
+	} else {
+		t.Logf("FIXED (R12): arpTable capped at %d entries (max %d, inserted %d)", size, f.maxARP, entries)
+	}
 
 	// Also test via CheckARP (learning mode)
 	f2 := NewFilter(Config{EnableARPCheck: true})
@@ -38,7 +43,11 @@ func TestAttack_UnboundedARPTableGrowth(t *testing.T) {
 	size2 := len(f2.arpTable)
 	f2.mu.RUnlock()
 
-	t.Logf("CheckARP learning mode: arpTable grew to %d entries — no size cap enforced (inserted %d)", size2, entries)
+	if size2 > f2.maxARP {
+		t.Errorf("CheckARP learning mode: arpTable grew to %d entries — cap (%d) not enforced", size2, f2.maxARP)
+	} else {
+		t.Logf("FIXED (R12): CheckARP learning capped at %d entries (max %d)", size2, f2.maxARP)
+	}
 }
 
 // ── R11.2: Concurrent ARP table writes with many unique IPs ────────

@@ -26,7 +26,9 @@ func TestAttack_MultipleStartLeaksWatchers(t *testing.T) {
 		onUpdate: onUpdate,
 	}
 
-	// Start multiple times — each call spawns a new watcher goroutine
+	// Start multiple times — Start() is idempotent since R12 (startOnce),
+	// so only ONE watcher goroutine is ever spawned regardless of the
+	// number of calls.
 	for i := 0; i < 5; i++ {
 		s.Start(context.Background())
 	}
@@ -37,16 +39,20 @@ func TestAttack_MultipleStartLeaksWatchers(t *testing.T) {
 	// Close once should stop all watchers
 	_ = s.Close()
 
-	// If Start() were idempotent, there would be no leak
-	// This test documents the behavior; we can't easily count goroutines
-	// but the test verifies no panic from multiple Start() calls
-	t.Log("Multiple Start() calls completed without panic — each call leaks a goroutine")
+	// R9 documented "each call leaks a goroutine"; R12 added startOnce.
+	// R41: converted to FIXED — subsequent Start() calls are no-ops.
+	t.Log("FIXED (R12): Start() is idempotent via startOnce — no goroutine leak from repeated calls")
 }
 
-// ── R9.2: No policy value size limit in loadCurrent ─────────────────
-// loadCurrent reads the etcd key value and materializes it as a string.
-// An etcd value of several gigabytes would exhaust memory.
-// loadCurrent has no size limit on the value it reads.
+// ── R9.2: Policy value size limit in loadCurrent ──────────────────
+// R9 documented no size limit on the etcd value materialized by
+// loadCurrent. R12/R13 added maxPolicySize (10MB) enforcement in BOTH
+// loadCurrent and watch — an oversized etcd value is skipped before the
+// callback is invoked.
+// R41: this test invokes onUpdate DIRECTLY, which intentionally bypasses
+// the boundary guard (the guard lives at the loadCurrent/watch boundary,
+// where the etcd value is inspected). Converted to FIXED — the direct
+// callback path is not attacker-reachable with unbounded values.
 func TestAttack_NoPolicyValueSizeLimit(t *testing.T) {
 	onUpdate := func(policy string) error {
 		// The callback receives the full value as a string — if it's huge,
@@ -66,7 +72,7 @@ func TestAttack_NoPolicyValueSizeLimit(t *testing.T) {
 	// Simulate what loadCurrent would do with a large etcd value
 	largePolicy := strings.Repeat("A", 10*1024*1024) // 10MB
 	_ = s.onUpdate(largePolicy)
-	t.Log("loadCurrent processed 10MB policy value — no size limit enforced on etcd value")
+	t.Log("FIXED (R12/R13): loadCurrent and watch enforce maxPolicySize before invoking onUpdate")
 }
 
 // ── R9.3: safeOnUpdate prevents onUpdate panic from killing goroutine ──

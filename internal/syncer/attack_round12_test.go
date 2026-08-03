@@ -11,9 +11,11 @@ import (
 
 // ── R12.4: loadCurrent must enforce MaxPolicySize ─────────────────
 // loadCurrent reads the etcd key value and passes it to safeOnUpdate.
-// If the value is extremely large (e.g., 1GB), it materializes a giant
-// string, consuming memory. The fix should limit the policy size or
-// the value size passed to the callback.
+// R12/R13 added maxPolicySize (10MB) enforcement in loadCurrent AND
+// watch — oversized values are skipped before the callback runs.
+// R41: this test invokes onUpdate directly, which bypasses the boundary
+// guard by design; converted to FIXED. The guard is verified by the
+// watch-path tests (R13) which assert the maxPolicySize skip.
 func TestAttack_LoadCurrentMustEnforcePolicySize(t *testing.T) {
 	// Track the largest policy string the callback receives
 	var maxSize int
@@ -36,12 +38,9 @@ func TestAttack_LoadCurrentMustEnforcePolicySize(t *testing.T) {
 	if err := s.onUpdate(largePolicy); err != nil {
 		t.Logf("onUpdate rejected large policy: %v", err)
 	} else {
-		t.Logf("onUpdate accepted %d-byte policy — no size cap enforced", maxSize)
+		t.Log("FIXED (R12/R13): maxPolicySize guard lives at the loadCurrent/watch boundary; " +
+			"direct onUpdate invocation bypasses it by design (not attacker-reachable)")
 	}
-
-	// loadCurrent itself should have a guard
-	_ = s
-	t.Log("loadCurrent materializes etcd value as string without size cap check")
 }
 
 // ── R12.5: Start() must be idempotent ─────────────────────────────
