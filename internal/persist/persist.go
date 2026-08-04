@@ -45,7 +45,12 @@ func SaveState(path string, state *EngineState) error {
 		return fmt.Errorf("creating state dir: %w", err)
 	}
 	tmpPath := path + ".tmp"
-	f, err := os.Create(tmpPath)
+	// Open with O_NOFOLLOW: os.Create would follow a symlink planted at the
+	// .tmp path by an attacker with write access to the state directory,
+	// truncating and overwriting an arbitrary file writable by the firewall's
+	// UID (R42 — symlink write-through). A symlink at the .tmp path is never
+	// legitimate; rename over the final path is already symlink-safe.
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0666)
 	if err != nil {
 		return fmt.Errorf("creating temp state file: %w", err)
 	}

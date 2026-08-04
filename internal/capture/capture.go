@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/gopacket"
@@ -98,7 +99,12 @@ func (w *Writer) rotateLocked() error {
 
 	w.curFileN++
 	fname := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", w.curFileN))
-	f, err := os.Create(fname)
+	// Open with O_NOFOLLOW: os.Create would follow a symlink planted at the
+	// rotation filename by an attacker with write access to the pcap
+	// directory, truncating and overwriting an arbitrary file writable by
+	// the firewall's UID on the next blocked packet (R42 — symlink
+	// write-through). A symlink at the rotation path is never legitimate.
+	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0666)
 	if err != nil {
 		return fmt.Errorf("creating pcap file %s: %w", fname, err)
 	}

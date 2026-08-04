@@ -12,6 +12,8 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"net/http"
@@ -36,6 +38,47 @@ import (
 )
 
 const version = "0.1.0"
+
+// maxPolicyFileSize limits the OPA policy file size to prevent memory
+// exhaustion when an oversized or maliciously replaced policy file is loaded
+// at startup or hot-reload (R8/R38 class).
+const maxPolicyFileSize = 10 * 1024 * 1024
+
+// readPolicyFile reads a Rego policy file safely. Unlike os.ReadFile, it:
+//   - opens with O_NONBLOCK so a FIFO placed at --opa-embed never blocks
+//     startup or the hot-reload goroutine (R14/R15/R38 class),
+//   - checks the file type on the already-opened fd (no TOCTOU — an
+//     attacker cannot swap a regular file for a FIFO between the check
+//     and the open),
+//   - enforces maxPolicyFileSize via fstat AND io.LimitReader, so a
+//     multi-GB policy file cannot exhaust memory.
+func readPolicyFile(path string) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening policy file: %w", err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stating policy file: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("policy path is not a regular file: %s", path)
+	}
+	if fi.Size() > maxPolicyFileSize {
+		return nil, fmt.Errorf("policy file too large: %d bytes (max %d)", fi.Size(), maxPolicyFileSize)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxPolicyFileSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading policy file: %w", err)
+	}
+	if len(data) > maxPolicyFileSize {
+		return nil, fmt.Errorf("policy file grew beyond %d bytes while reading", maxPolicyFileSize)
+	}
+	return data, nil
+}
 
 func main() {
 	var (
@@ -92,7 +135,7 @@ func main() {
 	if *opaEmbed == "" {
 		log.Fatal("--opa-embed is required")
 	}
-	policyData, err := os.ReadFile(*opaEmbed)
+	policyData, err := readPolicyFile(*opaEmbed)
 	if err != nil {
 		log.Fatalf("failed to read policy file %s: %v", *opaEmbed, err)
 	}
@@ -279,7 +322,7 @@ func watchPolicyFile(path string, eval *opa.EmbeddedEvaluator) {
 		}
 		modTime := fi.ModTime()
 		if !lastMod.IsZero() && modTime.After(lastMod) {
-			data, err := os.ReadFile(path)
+			data, err := readPolicyFile(path)
 			if err != nil {
 				slog.Error("hot-reload: failed to read policy file", "path", path, "error", err)
 			} else if err := eval.Load(string(data)); err != nil {
