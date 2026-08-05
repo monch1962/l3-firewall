@@ -29,8 +29,16 @@ const (
 // f.Stat() on the already-opened fd — no TOCTOU between a Stat and an Open.
 // On Linux O_NONBLOCK has no effect on regular file writes, so normal
 // append logging is unaffected.
+//
+// O_NOFOLLOW (R43) rejects a symlink planted at the log path: without it,
+// O_CREATE|O_WRONLY|O_APPEND follows the link, and f.Stat() on the opened
+// fd reports the TARGET's mode (regular), passing the R38 regular-file
+// check — turning every audit append into an arbitrary-file write as the
+// firewall's UID (R42 class: persist .tmp and capture rotation were fixed,
+// audit was missed). Default path /tmp/l3-firewall/audit.log is
+// attacker-writable.
 func openAuditFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NONBLOCK, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0644)
 	if err != nil {
 		return nil, err
 	}
