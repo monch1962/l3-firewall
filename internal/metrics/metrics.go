@@ -2,6 +2,8 @@
 package metrics
 
 import (
+	"sync"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"net/http"
@@ -18,10 +20,25 @@ type Metrics struct {
 	AuditBlocks      *prometheus.CounterVec
 }
 
-var m *Metrics
+var (
+	m        *Metrics
+	initOnce sync.Once // makes Init idempotent — see R44
+)
 
 // Init registers all Prometheus metrics and returns the Metrics struct.
+// Idempotent: only the first call constructs and registers the collectors.
+// A second call would re-register the same collector names on the default
+// registry and panic inside prometheus.MustRegister ("duplicate metrics
+// collector registration attempted") — an unhandled panic that crashes the
+// whole firewall process. Subsequent calls return the first instance (R44).
 func Init(getConntrackLen func() int) *Metrics {
+	initOnce.Do(func() {
+		m = newMetrics(getConntrackLen)
+	})
+	return m
+}
+
+func newMetrics(getConntrackLen func() int) *Metrics {
 	m = &Metrics{
 		PacketsProcessed: prometheus.NewCounterVec(
 			prometheus.CounterOpts{

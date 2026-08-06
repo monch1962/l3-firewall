@@ -266,12 +266,8 @@ func main() {
 	if *metricsListen != "" {
 		metricsMux := http.NewServeMux()
 		metricsMux.Handle("/metrics", metrics.Handler())
-		metricsServer := &http.Server{
-			Addr:              *metricsListen,
-			Handler:           metricsMux,
-			ReadHeaderTimeout: 5 * time.Second,
-			IdleTimeout:       30 * time.Second,
-		}
+		metricsServer := newMetricsServer(*metricsListen)
+		metricsServer.Handler = metricsMux
 		go func() {
 			slog.Info("metrics listening", "addr", *metricsListen)
 			if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -331,5 +327,20 @@ func watchPolicyFile(path string, eval *opa.EmbeddedEvaluator) {
 		}
 		lastMod = modTime
 		time.Sleep(5 * time.Second)
+	}
+}
+
+// newMetricsServer builds the metrics HTTP server with the same timeout
+// posture as the admin API server (internal/admin newServer). All four
+// timeouts must be set: a zero ReadTimeout leaves the request-body phase
+// unbounded and a zero WriteTimeout lets a slow-reading scrape client hold a
+// connection (and its goroutine) open with no deadline (R44.5).
+func newMetricsServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
 	}
 }
