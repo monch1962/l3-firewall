@@ -138,6 +138,12 @@ func (f *Filter) MACAllowed(srcMAC string) (bool, string) {
 // RecordDHCP snoops a DHCP ACK to build an IP→MAC binding.
 // Returns true if the binding was recorded or updated.
 // The ARP table is capped at maxARP entries to prevent memory exhaustion.
+// MACs that normalize to empty (e.g. "!!!", separators only) and empty IPs
+// are rejected: storing "" as a binding makes every subsequent CheckARP
+// from the LEGITIMATE host fail its binding comparison ("" != realMAC)
+// and flag the victim as an ARP spoofer — an attacker poisons the ARP
+// table with an empty binding and DoS's the victim with false spoofing
+// alarms (R45 — DHCP empty-MAC binding poisoning).
 func (f *Filter) RecordDHCP(ip, mac string) bool {
 	if f == nil {
 		return false
@@ -146,6 +152,9 @@ func (f *Filter) RecordDHCP(ip, mac string) bool {
 	defer f.mu.Unlock()
 	norm := normalizeMAC(mac)
 	key := normalizeIPKey(ip)
+	if norm == "" || key == "" {
+		return false
+	}
 	// Evict one entry if table is full and this is a new key
 	if _, exists := f.arpTable[key]; !exists && len(f.arpTable) >= f.maxARP {
 		for k := range f.arpTable {

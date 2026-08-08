@@ -14,6 +14,7 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
+	"github.com/monch1962/l3-firewall/internal/securepath"
 )
 
 // maxPacketSize prevents disk exhaustion from oversized packet writes.
@@ -52,6 +53,15 @@ func NewWriter(cfg Config) (*Writer, error) {
 	}
 	if err := os.MkdirAll(cfg.Dir, 0755); err != nil {
 		return nil, fmt.Errorf("creating pcap dir %s: %w", cfg.Dir, err)
+	}
+	// Reject symlinks at any directory component of --pcap-dir: R42's
+	// O_NOFOLLOW on the rotation file open only protects the FINAL
+	// component, but the kernel resolves intermediate directory symlinks
+	// before the open — a symlink planted at the pcap dir path makes every
+	// blocked_%05d.pcap rotation land in the attacker-chosen directory as
+	// the firewall's UID (R45 — directory symlink write-through).
+	if err := securepath.RejectSymlinkComponents(cfg.Dir); err != nil {
+		return nil, err
 	}
 	return &Writer{cfg: cfg}, nil
 }

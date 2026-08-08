@@ -79,31 +79,33 @@ func TestAttack_AddSilentlyFailsAfterCap(t *testing.T) {
 }
 
 // ── R11.5: Remove with IP that has multiple CIDR matches ────────────
-// When removing a CIDR, the first matching CIDR is removed. But multiple
-// identical CIDRs could exist in the nets slice. Only the first is removed.
+// R11 documented that duplicate identical CIDRs could exist in the nets
+// slice (added from two feed sources) and Remove took out only the first.
+// R45 eliminated the precondition: Add() now dedups CIDRs on canonical
+// form, so duplicates can never accumulate — this test asserts the fixed
+// invariant (one entry, fully removable) instead of the old behavior.
 func TestAttack_RemoveDuplicateCIDRs(t *testing.T) {
 	bl := NewBlocklist()
 
-	// Add the same CIDR twice (e.g., from two different feed sources)
+	// Add the same CIDR twice (e.g., from two different feed sources) —
+	// R45 dedup collapses this to a single entry
 	bl.Add("10.0.0.0/8")
 	bl.Add("10.0.0.0/8")
-
-	if bl.Len() != 2 {
-		t.Fatalf("expected 2 entries (2 CIDR duplicates), got %d", bl.Len())
-	}
-
-	// Remove once — only one should be removed
-	bl.Remove("10.0.0.0/8")
 
 	if bl.Len() != 1 {
-		t.Errorf("expected 1 entry after removing one duplicate CIDR, got %d", bl.Len())
-	} else {
-		t.Logf("Remove removed first duplicate only — len=%d (second duplicate remains)", bl.Len())
+		t.Fatalf("expected 1 entry (CIDR duplicates deduped), got %d", bl.Len())
 	}
 
-	// Contains should still match because second CIDR is still there
-	if !bl.Contains("10.0.0.1") {
-		t.Error("Contains('10.0.0.1') should be true — second CIDR still present")
+	// Remove removes the single entry entirely
+	bl.Remove("10.0.0.0/8")
+
+	if bl.Len() != 0 {
+		t.Errorf("expected 0 entries after removing the deduped CIDR, got %d", bl.Len())
+	}
+
+	// Contains must no longer match — the network is fully gone
+	if bl.Contains("10.0.0.1") {
+		t.Error("Contains('10.0.0.1') should be false after removal")
 	}
 }
 

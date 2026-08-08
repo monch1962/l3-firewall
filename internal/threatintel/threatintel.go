@@ -24,17 +24,19 @@ const maxFeedResponseSize = 50 * 1024 * 1024
 // Blocklist holds a set of blocked IPs and CIDR networks, refreshed from
 // external threat intelligence feeds.
 type Blocklist struct {
-	mu     sync.RWMutex
-	ips    map[string]struct{} // exact IP entries
-	nets   []*net.IPNet        // CIDR network entries
-	stopCh chan struct{}
+	mu      sync.RWMutex
+	ips     map[string]struct{} // exact IP entries
+	nets    []*net.IPNet        // CIDR network entries
+	netKeys map[string]struct{} // canonical CIDR string -> present (R45 dedup)
+	stopCh  chan struct{}
 }
 
 // NewBlocklist creates an empty blocklist.
 func NewBlocklist() *Blocklist {
 	return &Blocklist{
-		ips:    make(map[string]struct{}),
-		stopCh: make(chan struct{}),
+		ips:     make(map[string]struct{}),
+		netKeys: make(map[string]struct{}),
+		stopCh:  make(chan struct{}),
 	}
 }
 
@@ -57,6 +59,19 @@ func (bl *Blocklist) Add(entry string) {
 	if strings.Contains(entry, "/") {
 		_, ipnet, err := net.ParseCIDR(entry)
 		if err == nil {
+			// Dedup on the canonical form: StartRefresher re-fetches the
+			// same feed every interval and old entries are never cleared,
+			// so a stable CIDR list re-appends every network each cycle.
+			// Without dedup the nets slice grows monotonically until the
+			// cap fills with DUPLICATES — newly discovered threats are then
+			// silently dropped by the cap check and Contains() scans tens
+			// of thousands of duplicate networks per packet (R45 — CIDR
+			// duplicate accumulation).
+			key := ipnet.String()
+			if _, dup := bl.netKeys[key]; dup {
+				return
+			}
+			bl.netKeys[key] = struct{}{}
 			bl.nets = append(bl.nets, ipnet)
 		}
 	} else {
@@ -117,9 +132,11 @@ func (bl *Blocklist) Remove(entry string) {
 	if strings.Contains(entry, "/") {
 		_, ipnet, err := net.ParseCIDR(entry)
 		if err == nil {
+			key := ipnet.String()
 			for i, n := range bl.nets {
-				if n.String() == ipnet.String() {
+				if n.String() == key {
 					bl.nets = append(bl.nets[:i], bl.nets[i+1:]...)
+					delete(bl.netKeys, key)
 					return
 				}
 			}

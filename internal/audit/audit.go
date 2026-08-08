@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/monch1962/l3-firewall/internal/securepath"
 )
 
 // Default values for the audit logger configuration.
@@ -102,6 +104,15 @@ func NewLogger(cfg Config) (*Logger, error) {
 	dir := filepath.Dir(cfg.Path)
 	if err := os.MkdirAll(dir, DefaultDirMode); err != nil {
 		return nil, fmt.Errorf("creating audit log directory %s: %w", dir, err)
+	}
+	// Reject symlinks at any directory component of the log path: R43's
+	// O_NOFOLLOW in openAuditFile only protects the FINAL component, but a
+	// symlink planted at the DIRECTORY path (default /tmp/l3-firewall is
+	// attacker-writable) is followed by the kernel — every audit append
+	// resolves into the attacker-chosen directory as the firewall's UID
+	// (R45 — directory symlink write-through).
+	if err := securepath.RejectSymlinkComponents(dir); err != nil {
+		return nil, err
 	}
 
 	// Open the log file for append (FIFO-hardened — see openAuditFile)

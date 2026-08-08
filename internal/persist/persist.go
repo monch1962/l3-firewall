@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"github.com/monch1962/l3-firewall/internal/securepath"
 )
 
 // saveMu serializes SaveState calls to prevent race conditions on the
@@ -43,6 +45,16 @@ func SaveState(path string, state *EngineState) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("creating state dir: %w", err)
+	}
+	// Reject symlinks at any directory component of the path: O_NOFOLLOW
+	// on the .tmp open below only protects the FINAL component — a symlink
+	// planted at the directory path (e.g. --state-file /tmp/state/state.json
+	// where /tmp/state -> /victim) is followed by the kernel and every
+	// write lands in the victim directory as the firewall's UID (R45 —
+	// directory symlink write-through). Must run AFTER MkdirAll: MkdirAll
+	// "succeeds" through a planted link, so the walk is the only signal.
+	if err := securepath.RejectSymlinkComponents(dir); err != nil {
+		return err
 	}
 	tmpPath := path + ".tmp"
 	// Open with O_NOFOLLOW: os.Create would follow a symlink planted at the
