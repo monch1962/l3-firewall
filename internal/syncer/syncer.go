@@ -15,13 +15,24 @@ import (
 // A firewall policy is typically a few KB; 10MB is an extreme upper bound.
 const maxPolicySize = 10 * 1024 * 1024
 
+// etcdClient is the minimal client surface the syncer needs. Extracted as
+// an interface so tests can inject a stub whose Get stalls — proving the
+// per-call timeout prevents the startup hang (R46). *clientv3.Client
+// satisfies it implicitly.
+type etcdClient interface {
+	Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error)
+	Watch(ctx context.Context, key string, opts ...clientv3.OpOption) clientv3.WatchChan
+	Close() error
+}
+
 // Syncer watches an etcd key for policy updates and triggers hot-reload.
 type Syncer struct {
-	client   *clientv3.Client
-	key      string
-	onUpdate func(string) error // called with new policy content
-	stopCh   chan struct{}
-	closeOnce sync.Once
+	client    etcdClient
+	key       string
+	timeout   time.Duration      // per-operation deadline for Get (R46)
+	onUpdate  func(string) error // called with new policy content
+	stopCh    chan struct{}
+	closeOnce sync.Once // ensures Close() is idempotent
 	startOnce sync.Once // ensures Start() is idempotent
 	started   bool
 }
@@ -54,10 +65,11 @@ func New(cfg Config, onUpdate func(string) error) (*Syncer, error) {
 	}
 
 	return &Syncer{
-		client:  cli,
-		key:     cfg.Key,
+		client:   cli,
+		key:      cfg.Key,
+		timeout:  cfg.Timeout,
 		onUpdate: onUpdate,
-		stopCh:  make(chan struct{}),
+		stopCh:   make(chan struct{}),
 	}, nil
 }
 
@@ -80,7 +92,15 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	if s == nil || s.client == nil {
 		return
 	}
-	resp, err := s.client.Get(ctx, s.key)
+	// Bound the Get with the config timeout: main() calls Start with
+	// context.Background() (no deadline), and a raw Get on that context
+	// hangs forever if the etcd endpoint accepts the connection but never
+	// responds — blocking Start synchronously so the firewall never
+	// reaches eng.Run() (startup DoS, R46). The timeout also covers a
+	// half-open connection where DialTimeout already elapsed.
+	getCtx, cancel := context.WithTimeout(ctx, s.timeout)
+	defer cancel()
+	resp, err := s.client.Get(getCtx, s.key)
 	if err != nil {
 		slog.Warn("etcd: failed to get initial policy", "key", s.key, "error", err)
 		return

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/engine"
@@ -22,7 +23,10 @@ type API struct {
 	token     string
 	readToken string // read-only token; optional
 
-	// Rule version history
+	// Rule version history (guarded: reload appends while /admin/policy/versions
+	// reads — a bare slice is a data race (R46), remotely triggerable since the
+	// admin API is unauthenticated when no tokens are configured).
+	versionsMu     sync.RWMutex
 	policyVersions []PolicyVersion
 }
 
@@ -146,15 +150,15 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := a.engine.Stats()
 	ctStats := a.engine.ConntrackStats()
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"packets_processed":  stats.PacketsProcessed,
-		"packets_allowed":    stats.PacketsAllowed,
-		"packets_blocked":    stats.PacketsBlocked,
-		"conntrack_entries":  json.Number(fmt.Sprintf("%d", ctStats.Created)),
-		"conntrack_expired":  json.Number(fmt.Sprintf("%d", ctStats.Expired)),
-		"conntrack_evicted":  json.Number(fmt.Sprintf("%d", ctStats.Evicted)),
-		"engine_running":     a.engine.Running(),
-		"uptime":             time.Since(a.started).String(),
-		"version":            a.version,
+		"packets_processed": stats.PacketsProcessed,
+		"packets_allowed":   stats.PacketsAllowed,
+		"packets_blocked":   stats.PacketsBlocked,
+		"conntrack_entries": json.Number(fmt.Sprintf("%d", ctStats.Created)),
+		"conntrack_expired": json.Number(fmt.Sprintf("%d", ctStats.Expired)),
+		"conntrack_evicted": json.Number(fmt.Sprintf("%d", ctStats.Evicted)),
+		"engine_running":    a.engine.Running(),
+		"uptime":            time.Since(a.started).String(),
+		"version":           a.version,
 	})
 }
 
@@ -182,7 +186,10 @@ func (a *API) handlePolicyReload(w http.ResponseWriter, r *http.Request) {
 	slog.Info("admin API: policy reload requested (file watcher handles the reload)")
 	w.Header().Set("Content-Type", "application/json")
 
-	// Record the version entry
+	// Record the version entry. Guarded by versionsMu: the append and the
+	// 100-entry reslice race with concurrent readers of /admin/policy/versions
+	// (R46 — the bare slice was a data race on the slice header).
+	a.versionsMu.Lock()
 	a.policyVersions = append(a.policyVersions, PolicyVersion{
 		Timestamp:   time.Now(),
 		Version:     a.version,
@@ -192,6 +199,7 @@ func (a *API) handlePolicyReload(w http.ResponseWriter, r *http.Request) {
 	if len(a.policyVersions) > 100 {
 		a.policyVersions = a.policyVersions[len(a.policyVersions)-100:]
 	}
+	a.versionsMu.Unlock()
 
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "reload triggered"})
 }
@@ -199,6 +207,8 @@ func (a *API) handlePolicyReload(w http.ResponseWriter, r *http.Request) {
 // handlePolicyVersions returns the policy reload history.
 func (a *API) handlePolicyVersions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	a.versionsMu.RLock()
+	defer a.versionsMu.RUnlock()
 	if a.policyVersions == nil {
 		json.NewEncoder(w).Encode([]PolicyVersion{})
 		return
