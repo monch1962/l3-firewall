@@ -87,7 +87,7 @@ func main() {
 		adminToken              = flag.String("admin-token", "", "Bearer token for admin API auth (full access)")
 		adminReadToken          = flag.String("admin-read-token", "", "Bearer token for read-only admin API access")
 		queueNum                = flag.Uint("queue", 0, "NFQUEUE number for forward traffic")
-		queueNumInput           = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic")
+		queueNumInput           = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic (parsed but NOT yet enforced — see startup warning)")
 		opaEmbed                = flag.String("opa-embed", "./opa-policies/l3.rego", "Path to Rego policy file")
 		opaFailClosed           = flag.Bool("opa-fail-closed", false, "Block when OPA is unreachable")
 		opaAuditOnly            = flag.Bool("opa-audit-only", false, "Log would-be blocks without enforcing")
@@ -122,6 +122,18 @@ func main() {
 	slog.SetDefault(slog.New(logHandler))
 	log.SetFlags(0)
 	log.SetOutput(slog.NewLogLogger(logHandler, slog.LevelInfo).Writer())
+
+	// --queue-input is parsed and logged but never wired into the engine:
+	// eng.Run registers only the forward queue (--queue), so traffic on
+	// the input queue is never firewalled. Warn when the operator
+	// explicitly sets it — a silently dropped security control (R40.4
+	// class, R49): flag.Visit only fires for flags the operator actually
+	// set, so the default value alone produces no warning.
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "queue-input" {
+			slog.Warn("--queue-input is parsed but NOT enforced: input traffic is not firewalled (engine.Run registers only the forward queue; wiring deferred — R49)")
+		}
+	})
 
 	slog.Info("starting l3-firewall",
 		"version", version,

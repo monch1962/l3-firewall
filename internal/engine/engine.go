@@ -434,8 +434,17 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 		}
 	}()
 
-	if attr.Payload == nil || attr.PacketID == nil {
-		return 0
+	if attr.Payload == nil {
+		// A packet with no payload is the most uninspectable case of all —
+		// it cannot be policy-checked, so it must be dropped like any other
+		// unparseable packet. R40 made parse errors fail-closed (ret=1) but
+		// left this nil-payload branch returning 0 (NF_ACCEPT): an
+		// uninspectable packet silently passed every policy layer (R49 —
+		// nil-payload fail-open sibling).
+		e.packetsProcessed++
+		e.packetsBlocked++
+		slog.Warn("packet with nil payload dropped (fail-closed): nothing to inspect")
+		return 1
 	}
 
 	pi, err := packet.ParsePacket(*attr.Payload)
@@ -462,6 +471,47 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 		}
 	}
 	return 1
+}
+
+// verdictSender is the minimal kernel-verdict surface the queue hook
+// needs. *nfqueue.Nfqueue satisfies it implicitly; tests inject a fake
+// recording what the firewall actually delivers (R49).
+type verdictSender interface {
+	SetVerdict(id uint32, verdict int) error
+}
+
+// handleQueuePacket is the go-nfqueue hook body, extracted from Run()
+// so the verdict-delivery contract is testable (R49).
+//
+// go-nfqueue v1.3.2 contract (verified in the library's own integration
+// tests and ExampleNfqueue_RegisterWithErrorFunc): the hook MUST call
+// nf.SetVerdict(*attr.PacketID, verdict) itself — the hook's return value
+// is RECEIVE-LOOP CONTROL, not a verdict (`if ret := fn(m); ret != 0 {
+// return }` stops the socketCallback loop). Before R49 the hook returned
+// the 0/1 decision without ever sending a verdict: the kernel was never
+// told to accept/drop anything (queue saturated → all traffic dropped),
+// and the first blocked packet (ret=1) killed the receive loop. R49 fixes
+// both: every decision is delivered via SetVerdict, and the loop only
+// stops when a verdict genuinely cannot be delivered.
+func (e *Engine) handleQueuePacket(nf verdictSender, attr nfqueue.Attribute) int {
+	if attr.PacketID == nil {
+		// A verdict cannot be delivered without the packet ID. Stop the
+		// receive loop (library contract: non-zero stops).
+		slog.Error("nfqueue: attribute missing PacketID — cannot deliver verdict")
+		return 1
+	}
+
+	decision := e.packetHandler(attr)
+
+	verdict := nfqueue.NfAccept
+	if decision != 0 {
+		verdict = nfqueue.NfDrop
+	}
+	if err := nf.SetVerdict(*attr.PacketID, verdict); err != nil {
+		slog.Warn("nfqueue: failed to send verdict", "packet_id", *attr.PacketID, "verdict", verdict, "error", err)
+		return 1
+	}
+	return 0 // keep the receive loop alive
 }
 
 // saveState persists the engine's block stats to a JSON file.
@@ -528,7 +578,12 @@ func (e *Engine) Run(queueNum uint16) error {
 	e.running = true
 
 	if err := nf.RegisterWithErrorFunc(ctx, func(attr nfqueue.Attribute) int {
-		return e.packetHandler(attr)
+		// The hook return value is receive-loop control, NOT the verdict
+		// (go-nfqueue v1.3.2): handleQueuePacket delivers the decision to
+		// the kernel via SetVerdict and returns 0 to keep the loop alive
+		// (R49 — before the fix the kernel was never verdicted and the
+		// first blocked packet terminated the receive loop).
+		return e.handleQueuePacket(nf, attr)
 	}, func(err error) int {
 		// Mirror the error semantics of the deprecated nf.Register:
 		// transient netlink errors (timeouts) continue processing,
