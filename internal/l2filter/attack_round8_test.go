@@ -134,5 +134,3 @@ func TestAttack_LargeMACListStartup(t *testing.T) {
 	})
 	t.Logf("NewFilter with %d allowed MACs completed", len(macs))
 }
-
-

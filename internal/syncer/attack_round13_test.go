@@ -12,8 +12,9 @@ import (
 // during a watcher update would have it materialized in memory.
 //
 // Compare the two code paths:
-//   loadCurrent (line 91):  if len(policy) > maxPolicySize { return }
-//   watch (line 122):       if len(policy) > maxPolicySize { continue }
+//
+//	loadCurrent (line 91):  if len(policy) > maxPolicySize { return }
+//	watch (line 122):       if len(policy) > maxPolicySize { continue }
 //
 // FIXED R13: watch() now checks maxPolicySize before safeOnUpdate.
 func TestAttack_WatchEventBypassesMaxPolicySize(t *testing.T) {

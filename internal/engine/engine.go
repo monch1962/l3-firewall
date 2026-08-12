@@ -2,8 +2,9 @@
 // packet parsing, connection tracking, rate limiting, and OPA policy evaluation.
 //
 // Architecture per packet:
-//   raw bytes → gopacket parse → conntrack lookup → rate track →
-//   build OPA input → OPA eval → NF_ACCEPT or NF_DROP
+//
+//	raw bytes → gopacket parse → conntrack lookup → rate track →
+//	build OPA input → OPA eval → NF_ACCEPT or NF_DROP
 package engine
 
 import (
@@ -77,13 +78,13 @@ type Engine struct {
 	auditOnly   bool
 	failClosed  bool
 	running     bool
-	auditLogger *audit.Logger // nil = no audit logging
-	alertRouter *alert.Router // nil = no alerts
-	geoipReader *geoip.Reader // nil = no GeoIP lookups
+	auditLogger *audit.Logger          // nil = no audit logging
+	alertRouter *alert.Router          // nil = no alerts
+	geoipReader *geoip.Reader          // nil = no GeoIP lookups
 	threatIntel *threatintel.Blocklist // nil = no threat intel blocking
-	pcapWriter  PcapWriter            // nil = no pcap capture
-	statePath   string                // path for persisting state (empty = no persistence)
-	l2Filter    *l2filter.Filter      // nil = no L2 filtering
+	pcapWriter  PcapWriter             // nil = no pcap capture
+	statePath   string                 // path for persisting state (empty = no persistence)
+	l2Filter    *l2filter.Filter       // nil = no L2 filtering
 
 	// Stats counters
 	packetsProcessed int64
@@ -95,7 +96,7 @@ type Engine struct {
 	blockStats   map[string]int64
 
 	// Recent blocks ring buffer
-	recentMu    sync.RWMutex
+	recentMu     sync.RWMutex
 	recentBlocks []BlockLogEntry
 
 	// NFQUEUE lifecycle

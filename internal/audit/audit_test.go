@@ -110,7 +110,7 @@ func TestLogRotation(t *testing.T) {
 	path := filepath.Join(dir, "audit.log")
 	l, err := NewLogger(Config{
 		Path:       path,
-		MaxSizeMB:  1,     // 1MB — will trigger rotation with large content
+		MaxSizeMB:  1, // 1MB — will trigger rotation with large content
 		MaxBackups: 2,
 	})
 	if err != nil {

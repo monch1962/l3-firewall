@@ -17,11 +17,11 @@ import (
 type AlertType int
 
 const (
-	AlertBlockRate      AlertType = iota // Block rate threshold exceeded
-	AlertPortScan                        // Port scan detected
-	AlertConnLimit                       // Connection limit per source IP
-	AlertOPAError                        // OPA evaluation error
-	AlertRateLimit                       // Sustained rate limit trigger
+	AlertBlockRate AlertType = iota // Block rate threshold exceeded
+	AlertPortScan                   // Port scan detected
+	AlertConnLimit                  // Connection limit per source IP
+	AlertOPAError                   // OPA evaluation error
+	AlertRateLimit                  // Sustained rate limit trigger
 )
 
 // String returns the human-readable name of an alert type.
@@ -44,7 +44,7 @@ func (at AlertType) String() string {
 
 // AlertEvent represents a single alert notification.
 type AlertEvent struct {
-	Type      AlertType `json:"-"`               // alert category
+	Type      AlertType `json:"-"`                // alert category
 	Message   string    `json:"message"`          // human-readable description
 	Source    string    `json:"source,omitempty"` // component that generated the alert
 	Timestamp time.Time `json:"timestamp"`        // when the event occurred

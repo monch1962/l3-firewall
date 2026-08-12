@@ -17,10 +17,10 @@ func TestAttack_DoubleClosePanic(t *testing.T) {
 	// (New is not called with valid endpoints, so we can't get a client)
 	ch := make(chan struct{})
 	s := &Syncer{
-		client:  nil,
-		key:     "/test/policy",
+		client:   nil,
+		key:      "/test/policy",
 		onUpdate: func(string) error { return nil },
-		stopCh:  ch,
+		stopCh:   ch,
 	}
 
 	// First close - should not panic even with nil client

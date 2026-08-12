@@ -26,10 +26,10 @@ const defaultMaxARPEntries = 65536
 type Filter struct {
 	mu          sync.RWMutex
 	cfg         Config
-	allowedMACs map[string]bool // normalized MAC -> true
-	blockedMACs map[string]bool // normalized MAC -> true
+	allowedMACs map[string]bool   // normalized MAC -> true
+	blockedMACs map[string]bool   // normalized MAC -> true
 	arpTable    map[string]string // IP -> MAC binding (from DHCP snooping)
-	maxARP     int               // max ARP table entries (from cfg, with default)
+	maxARP      int               // max ARP table entries (from cfg, with default)
 }
 
 // NewFilter creates an L2 filter.

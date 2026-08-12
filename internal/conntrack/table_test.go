@@ -8,10 +8,10 @@ import (
 
 func TestPerProtocolTimeouts(t *testing.T) {
 	cfg := Config{
-		MaxEntries:     1000,
-		IdleTimeout:    300 * time.Second, // TCP default
-		UDPTimeout:     30 * time.Second,
-		ICMPTimeout:    5 * time.Second,
+		MaxEntries:       1000,
+		IdleTimeout:      300 * time.Second, // TCP default
+		UDPTimeout:       30 * time.Second,
+		ICMPTimeout:      5 * time.Second,
 		PortScanMaxPorts: 100,
 	}
 	ct := NewTable(cfg)
@@ -27,10 +27,10 @@ func TestPerProtocolTimeouts(t *testing.T) {
 
 func TestExpireByProtocolTCP(t *testing.T) {
 	cfg := Config{
-		MaxEntries:     1000,
-		IdleTimeout:    300 * time.Second,
-		UDPTimeout:     30 * time.Second,
-		ICMPTimeout:    5 * time.Second,
+		MaxEntries:       1000,
+		IdleTimeout:      300 * time.Second,
+		UDPTimeout:       30 * time.Second,
+		ICMPTimeout:      5 * time.Second,
 		PortScanMaxPorts: 100,
 	}
 	ct := NewTable(cfg)
@@ -45,10 +45,10 @@ func TestExpireByProtocolTCP(t *testing.T) {
 
 func TestExpireUDPFast(t *testing.T) {
 	cfg := Config{
-		MaxEntries:     1000,
-		IdleTimeout:    300 * time.Second,
-		UDPTimeout:     1 * time.Millisecond,
-		ICMPTimeout:    5 * time.Second,
+		MaxEntries:       1000,
+		IdleTimeout:      300 * time.Second,
+		UDPTimeout:       1 * time.Millisecond,
+		ICMPTimeout:      5 * time.Second,
 		PortScanMaxPorts: 100,
 	}
 	ct := NewTable(cfg)
@@ -62,10 +62,10 @@ func TestExpireUDPFast(t *testing.T) {
 
 func TestExpireICMPFast(t *testing.T) {
 	cfg := Config{
-		MaxEntries:     1000,
-		IdleTimeout:    300 * time.Second,
-		UDPTimeout:     30 * time.Second,
-		ICMPTimeout:    1 * time.Millisecond,
+		MaxEntries:       1000,
+		IdleTimeout:      300 * time.Second,
+		UDPTimeout:       30 * time.Second,
+		ICMPTimeout:      1 * time.Millisecond,
 		PortScanMaxPorts: 100,
 	}
 	ct := NewTable(cfg)
@@ -324,10 +324,10 @@ func TestLookupOrCreateStats(t *testing.T) {
 
 func TestExpireStats(t *testing.T) {
 	cfg := Config{
-		MaxEntries:     1000,
-		IdleTimeout:    300 * time.Second,
-		UDPTimeout:     30 * time.Second,
-		ICMPTimeout:    1 * time.Millisecond,
+		MaxEntries:       1000,
+		IdleTimeout:      300 * time.Second,
+		UDPTimeout:       30 * time.Second,
+		ICMPTimeout:      1 * time.Millisecond,
 		PortScanMaxPorts: 100,
 	}
 	ct := NewTable(cfg)

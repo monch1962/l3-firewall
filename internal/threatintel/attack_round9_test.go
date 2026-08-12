@@ -229,5 +229,3 @@ func TestAttack_DataForOPASnapshotWithCIDR(t *testing.T) {
 	}
 	t.Log("DataForOPA snapshot correctly excludes CIDR added after snapshot")
 }
-
-

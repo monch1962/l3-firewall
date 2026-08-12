@@ -166,5 +166,3 @@ func TestAttack_ConcurrentCheckARPSameIP(t *testing.T) {
 	wg.Wait()
 	t.Log("50 concurrent CheckARP on same IP completed without race")
 }
-
-

@@ -114,10 +114,10 @@ func TestAttack_RemoveDuplicateCIDRs(t *testing.T) {
 // cause errors or add entries.
 func TestAttack_FetchFromURLEmptyResponse(t *testing.T) {
 	tests := []struct {
-		name     string
-		body     string
-		wantErr  bool
-		wantNew  int
+		name    string
+		body    string
+		wantErr bool
+		wantNew int
 	}{
 		{"empty body", "", false, 0},
 		{"whitespace only", "\n\n\n", false, 0},

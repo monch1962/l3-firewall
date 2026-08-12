@@ -1,9 +1,10 @@
 // l3-firewall — Layer 3 firewall sidecar.
 //
 // Architecture:
-//   Traffic → [nftables NFQUEUE] → [l3-firewall]
-//     gopacket parses packet headers → OPA/Rego evaluates →
-//     NF_ACCEPT or NF_DROP verdict
+//
+//	Traffic → [nftables NFQUEUE] → [l3-firewall]
+//	  gopacket parses packet headers → OPA/Rego evaluates →
+//	  NF_ACCEPT or NF_DROP verdict
 //
 // Deny-override model: traffic passes by default, blocked only by
 // matching OPA deny rules.
@@ -82,31 +83,31 @@ func readPolicyFile(path string) ([]byte, error) {
 
 func main() {
 	var (
-		listenAddr       = flag.String("admin-listen", ":8082", "Admin API listen address")
-		adminToken       = flag.String("admin-token", "", "Bearer token for admin API auth (full access)")
-		adminReadToken   = flag.String("admin-read-token", "", "Bearer token for read-only admin API access")
-		queueNum         = flag.Uint("queue", 0, "NFQUEUE number for forward traffic")
-		queueNumInput    = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic")
-		opaEmbed         = flag.String("opa-embed", "./opa-policies/l3.rego", "Path to Rego policy file")
-		opaFailClosed    = flag.Bool("opa-fail-closed", false, "Block when OPA is unreachable")
-		opaAuditOnly     = flag.Bool("opa-audit-only", false, "Log would-be blocks without enforcing")
-		logFormat        = flag.String("log-format", "text", "Log format: text or json")
-		metricsListen    = flag.String("metrics-listen", "", "Separate address for /metrics (empty = /metrics not served; the admin API does not mount it)")
-		rateLimitPPS     = flag.Float64("rate-limit-pps", 0, "Per-IP packet rate limit (0 = unlimited)")
-		rateLimitBPS     = flag.Float64("rate-limit-bps", 0, "Per-IP byte rate limit (0 = unlimited)")
-		conntrackMax     = flag.Int("conntrack-max", 65536, "Max tracked connections")
-		conntrackIdle    = flag.Duration("conntrack-idle", 5*time.Minute, "TCP connection idle timeout")
-		conntrackUDP     = flag.Duration("conntrack-udp-timeout", 30*time.Second, "UDP connection idle timeout")
-		conntrackICMP    = flag.Duration("conntrack-icmp-timeout", 5*time.Second, "ICMP connection idle timeout")
+		listenAddr              = flag.String("admin-listen", ":8082", "Admin API listen address")
+		adminToken              = flag.String("admin-token", "", "Bearer token for admin API auth (full access)")
+		adminReadToken          = flag.String("admin-read-token", "", "Bearer token for read-only admin API access")
+		queueNum                = flag.Uint("queue", 0, "NFQUEUE number for forward traffic")
+		queueNumInput           = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic")
+		opaEmbed                = flag.String("opa-embed", "./opa-policies/l3.rego", "Path to Rego policy file")
+		opaFailClosed           = flag.Bool("opa-fail-closed", false, "Block when OPA is unreachable")
+		opaAuditOnly            = flag.Bool("opa-audit-only", false, "Log would-be blocks without enforcing")
+		logFormat               = flag.String("log-format", "text", "Log format: text or json")
+		metricsListen           = flag.String("metrics-listen", "", "Separate address for /metrics (empty = /metrics not served; the admin API does not mount it)")
+		rateLimitPPS            = flag.Float64("rate-limit-pps", 0, "Per-IP packet rate limit (0 = unlimited)")
+		rateLimitBPS            = flag.Float64("rate-limit-bps", 0, "Per-IP byte rate limit (0 = unlimited)")
+		conntrackMax            = flag.Int("conntrack-max", 65536, "Max tracked connections")
+		conntrackIdle           = flag.Duration("conntrack-idle", 5*time.Minute, "TCP connection idle timeout")
+		conntrackUDP            = flag.Duration("conntrack-udp-timeout", 30*time.Second, "UDP connection idle timeout")
+		conntrackICMP           = flag.Duration("conntrack-icmp-timeout", 5*time.Second, "ICMP connection idle timeout")
 		conntrackMaxFlowsPerSrc = flag.Int("conntrack-max-flows-per-src", 0, "Max concurrent flows per source IP (0 = unlimited)")
-		auditLogPath   = flag.String("audit-log", "", "Path to structured audit log file (empty = no audit logging)")
-		alertWebhookURL = flag.String("alert-webhook-url", "", "Webhook URL for firewall alerts (e.g. Slack, Discord)")
-		geoipDBPath   = flag.String("geoip-db", "", "Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup")
-		threatIntelURL = flag.String("threat-intel-url", "", "URL(s) to IP reputation blocklists (comma-separated)")
-		pcapDir       = flag.String("pcap-dir", "", "Directory for blocked packet pcap captures")
-		stateFile     = flag.String("state-file", "", "Path for persisting firewall state across restarts")
-		etcdEndpoints = flag.String("etcd-endpoints", "", "etcd endpoints for distributed policy sync (comma-separated)")
-		etcdKey       = flag.String("etcd-key", "/l3-firewall/policy", "etcd key to watch for policy updates")
+		auditLogPath            = flag.String("audit-log", "", "Path to structured audit log file (empty = no audit logging)")
+		alertWebhookURL         = flag.String("alert-webhook-url", "", "Webhook URL for firewall alerts (e.g. Slack, Discord)")
+		geoipDBPath             = flag.String("geoip-db", "", "Path to MaxMind GeoLite2/GeoIP2 .mmdb database for country lookup")
+		threatIntelURL          = flag.String("threat-intel-url", "", "URL(s) to IP reputation blocklists (comma-separated)")
+		pcapDir                 = flag.String("pcap-dir", "", "Directory for blocked packet pcap captures")
+		stateFile               = flag.String("state-file", "", "Path for persisting firewall state across restarts")
+		etcdEndpoints           = flag.String("etcd-endpoints", "", "etcd endpoints for distributed policy sync (comma-separated)")
+		etcdKey                 = flag.String("etcd-key", "/l3-firewall/policy", "etcd key to watch for policy updates")
 	)
 	flag.Parse()
 

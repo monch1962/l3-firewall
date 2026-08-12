@@ -59,7 +59,7 @@ func openAuditFile(path string) (*os.File, error) {
 // AuditEvent represents a single structured audit log entry.
 type AuditEvent struct {
 	Timestamp  time.Time `json:"timestamp"`
-	Type       string    `json:"type"`                 // "packet_allow", "packet_block", "rate_limit", etc.
+	Type       string    `json:"type"`                  // "packet_allow", "packet_block", "rate_limit", etc.
 	TraceID    string    `json:"trace_id,omitempty"`    // correlation ID
 	SrcIP      string    `json:"src_ip,omitempty"`      // source IP address
 	DstIP      string    `json:"dst_ip,omitempty"`      // destination IP address

@@ -34,7 +34,7 @@ type EmbeddedEvaluator struct {
 	compiler    *ast.Compiler
 	store       storage.Store
 	evalTimeout time.Duration
-	policy      string // Current policy source
+	policy      string        // Current policy source
 	reloadCh    chan struct{} // Notified on each successful reload
 }
 

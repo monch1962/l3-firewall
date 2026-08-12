@@ -10,16 +10,16 @@ import (
 // Uses packet.TCPFlags and packet.FragmentInfo directly (DRY — avoids duplicating
 // identical type definitions from the packet package).
 type PacketInfo struct {
-	SrcIP      string               `json:"src_ip"`
-	DstIP      string               `json:"dst_ip"`
-	Protocol   string               `json:"protocol"`
-	SrcPort    uint16               `json:"src_port"`
-	DstPort    uint16               `json:"dst_port"`
-	TCPFlags   packet.TCPFlags      `json:"tcp_flags"`
-	ICMPType   *uint8               `json:"icmp_type"`
-	ICMPCode   *uint8               `json:"icmp_code"`
-	Fragment   packet.FragmentInfo  `json:"fragment"`
-	PacketSize int                  `json:"packet_size"`
+	SrcIP      string              `json:"src_ip"`
+	DstIP      string              `json:"dst_ip"`
+	Protocol   string              `json:"protocol"`
+	SrcPort    uint16              `json:"src_port"`
+	DstPort    uint16              `json:"dst_port"`
+	TCPFlags   packet.TCPFlags     `json:"tcp_flags"`
+	ICMPType   *uint8              `json:"icmp_type"`
+	ICMPCode   *uint8              `json:"icmp_code"`
+	Fragment   packet.FragmentInfo `json:"fragment"`
+	PacketSize int                 `json:"packet_size"`
 }
 
 // ConnectionInfo holds connection tracking state for OPA input.
@@ -81,8 +81,8 @@ func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpSt
 			PacketSize: pi.PacketSize,
 		},
 		Connection: ConnectionInfo{
-			Established:  established,
-			TCPState:     tcpState,
+			Established:   established,
+			TCPState:      tcpState,
 			PacketsInFlow: 1,
 		},
 		Rate: RateInfo{

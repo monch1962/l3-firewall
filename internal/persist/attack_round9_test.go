@@ -125,5 +125,3 @@ func TestAttack_ConcurrentSaveState(t *testing.T) {
 		t.Logf("Loaded state with %d entries after concurrent saves", len(loaded.BlockStats))
 	}
 }
-
-

@@ -28,18 +28,18 @@ type IPv6ExtHeaderType string
 
 // PacketInfo holds all parsed fields from a single L3/L4 packet.
 type PacketInfo struct {
-	SrcMAC        string             `json:"src_mac,omitempty"` // source MAC address
-	DstMAC        string             `json:"dst_mac,omitempty"` // destination MAC address
-	SrcIP         string             `json:"src_ip"`
-	DstIP         string             `json:"dst_ip"`
-	Protocol      string             `json:"protocol"` // "TCP", "UDP", "ICMP", etc.
-	SrcPort       uint16             `json:"src_port"`  // 0 for non-TCP/UDP
-	DstPort       uint16             `json:"dst_port"`  // 0 for non-TCP/UDP
-	TCPFlags      TCPFlags           `json:"tcp_flags"`
-	ICMPType      *uint8             `json:"icmp_type"`  // nil for non-ICMP
-	ICMPCode      *uint8             `json:"icmp_code"`  // nil for non-ICMP
-	Fragment      FragmentInfo       `json:"fragment"`
-	PacketSize    int                `json:"packet_size"`
+	SrcMAC         string              `json:"src_mac,omitempty"` // source MAC address
+	DstMAC         string              `json:"dst_mac,omitempty"` // destination MAC address
+	SrcIP          string              `json:"src_ip"`
+	DstIP          string              `json:"dst_ip"`
+	Protocol       string              `json:"protocol"` // "TCP", "UDP", "ICMP", etc.
+	SrcPort        uint16              `json:"src_port"` // 0 for non-TCP/UDP
+	DstPort        uint16              `json:"dst_port"` // 0 for non-TCP/UDP
+	TCPFlags       TCPFlags            `json:"tcp_flags"`
+	ICMPType       *uint8              `json:"icmp_type"` // nil for non-ICMP
+	ICMPCode       *uint8              `json:"icmp_code"` // nil for non-ICMP
+	Fragment       FragmentInfo        `json:"fragment"`
+	PacketSize     int                 `json:"packet_size"`
 	IPv6ExtHeaders []IPv6ExtHeaderType `json:"ipv6_ext_headers"`
 }
 
@@ -85,11 +85,11 @@ func parseIPv4Packet(raw []byte) (*PacketInfo, error) {
 	srcMAC, dstMAC := extractMAC(packet)
 
 	info := &PacketInfo{
-		SrcMAC:      srcMAC,
-		DstMAC:      dstMAC,
-		SrcIP:       ipv4.SrcIP.String(),
-		DstIP:       ipv4.DstIP.String(),
-		PacketSize:  len(packet.Data()),
+		SrcMAC:     srcMAC,
+		DstMAC:     dstMAC,
+		SrcIP:      ipv4.SrcIP.String(),
+		DstIP:      ipv4.DstIP.String(),
+		PacketSize: len(packet.Data()),
 		Fragment: FragmentInfo{
 			IsFragment:    ipv4.FragOffset > 0 || ipv4.Flags&layers.IPv4MoreFragments != 0,
 			MoreFragments: ipv4.Flags&layers.IPv4MoreFragments != 0,

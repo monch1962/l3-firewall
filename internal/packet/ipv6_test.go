@@ -115,9 +115,9 @@ func buildIPv6WithExt(src, dst string, srcPort, dstPort uint16, extType layers.I
 		// Next-header=TCP, reserved, offset+flags, identification
 		ext = make([]byte, 8)
 		ext[0] = byte(layers.IPProtocolTCP) // next header
-		ext[1] = 0                           // reserved
-		ext[2] = 0x03                        // fragment offset high
-		ext[3] = 0x20                        // MoreFragments + offset low
+		ext[1] = 0                          // reserved
+		ext[2] = 0x03                       // fragment offset high
+		ext[3] = 0x20                       // MoreFragments + offset low
 	default:
 		ext = []byte{byte(layers.IPProtocolTCP), 0, 0, 0, 0, 0, 0, 0}
 	}

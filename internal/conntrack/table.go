@@ -18,15 +18,15 @@ type TCPState int
 
 // TCP state machine constants.
 const (
-	TCPSynSent      TCPState = iota // SYN sent, awaiting SYN-ACK
-	TCPSynReceived                  // SYN received, awaiting ACK
-	TCPEstablished                  // Connection established
-	TCPFinWait1                     // FIN sent, awaiting FIN-ACK
-	TCPFinWait2                     // FIN-ACK received, awaiting FIN
-	TCPClosing                      // Both sides have sent FIN
-	TCPTimeWait                     // All packets sent, waiting for timeout
-	TcpCloseWait                    // Received FIN, waiting for app close
-	TCPClosed                       // Connection closed
+	TCPSynSent     TCPState = iota // SYN sent, awaiting SYN-ACK
+	TCPSynReceived                 // SYN received, awaiting ACK
+	TCPEstablished                 // Connection established
+	TCPFinWait1                    // FIN sent, awaiting FIN-ACK
+	TCPFinWait2                    // FIN-ACK received, awaiting FIN
+	TCPClosing                     // Both sides have sent FIN
+	TCPTimeWait                    // All packets sent, waiting for timeout
+	TcpCloseWait                   // Received FIN, waiting for app close
+	TCPClosed                      // Connection closed
 )
 
 // String returns a human-readable TCP state name.
@@ -95,7 +95,7 @@ type Flow struct {
 	SrcPort     uint16
 	DstPort     uint16
 	Established bool
-	TCPState    TCPState  // TCP FSM state (zero for non-TCP)
+	TCPState    TCPState // TCP FSM state (zero for non-TCP)
 	Packets     int64
 	created     time.Time
 	lastSeen    time.Time
@@ -161,8 +161,8 @@ type Table struct {
 	stats    Stats
 	srcPorts map[string][]uint16 // srcIP -> recent dest ports for scan detection
 	// New connection rate tracking
-	newConns     []time.Time
-	rateMu       sync.Mutex
+	newConns []time.Time
+	rateMu   sync.Mutex
 	// Per-source flow count tracking
 	srcFlowCount map[string]int // srcIP -> number of active flows
 }

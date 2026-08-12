@@ -12,9 +12,9 @@ func TestSaveLoadState(t *testing.T) {
 
 	state := &EngineState{
 		BlockStats: map[string]int64{
-			"blocked SSH":  42,
-			"SYN flood":     7,
-			"port scan":     3,
+			"blocked SSH": 42,
+			"SYN flood":   7,
+			"port scan":   3,
 		},
 	}
 
