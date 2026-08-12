@@ -268,7 +268,9 @@ func TestEmbeddedEvaluatorReloadCh(t *testing.T) {
 	}
 
 	// Trigger a reload
-	eval.Load(`package l3_firewall import rego.v1 default allow := true allow := false if { input.packet.dst_port == 22 }`)
+	if err := eval.Load(`package l3_firewall import rego.v1 default allow := true allow := false if { input.packet.dst_port == 22 }`); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
 
 	// Check that the channel received a signal
 	select {

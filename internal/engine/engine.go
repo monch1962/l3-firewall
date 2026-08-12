@@ -27,6 +27,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/threatintel"
 
 	"github.com/florianl/go-nfqueue"
+	"github.com/mdlayher/netlink"
 )
 
 // PcapWriter is the interface for writing blocked packets to pcap files.
@@ -46,7 +47,12 @@ const traceIDLength = 4
 // newTraceID returns a short hex trace identifier for correlating log entries.
 func newTraceID() string {
 	b := make([]byte, traceIDLength)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand.Read cannot fail on supported platforms (it only
+		// returns an error for interface compatibility); treat failure
+		// as fatal since trace IDs are required for log correlation.
+		panic(fmt.Sprintf("crypto/rand: %v", err))
+	}
 	return hex.EncodeToString(b)
 }
 
@@ -206,7 +212,7 @@ func (e *Engine) logAudit(eventType, traceID string, pi *packet.PacketInfo, reas
 	if e.auditLogger == nil {
 		return
 	}
-	e.auditLogger.Log(audit.AuditEvent{
+	if err := e.auditLogger.Log(audit.AuditEvent{
 		Timestamp:  time.Now(),
 		Type:       eventType,
 		TraceID:    traceID,
@@ -217,7 +223,9 @@ func (e *Engine) logAudit(eventType, traceID string, pi *packet.PacketInfo, reas
 		DstPort:    pi.DstPort,
 		PacketSize: pi.PacketSize,
 		Reason:     reason,
-	})
+	}); err != nil {
+		slog.Warn("audit log write failed", "error", err)
+	}
 }
 
 // fireAlert dispatches an alert via the alert router if configured.
@@ -518,8 +526,19 @@ func (e *Engine) Run(queueNum uint16) error {
 
 	e.running = true
 
-	if err := nf.Register(ctx, func(attr nfqueue.Attribute) int {
+	if err := nf.RegisterWithErrorFunc(ctx, func(attr nfqueue.Attribute) int {
 		return e.packetHandler(attr)
+	}, func(err error) int {
+		// Mirror the error semantics of the deprecated nf.Register:
+		// transient netlink errors (timeouts) continue processing,
+		// everything else stops the receive loop.
+		if opError, ok := err.(*netlink.OpError); ok {
+			if opError.Timeout() || opError.Temporary() {
+				return 0
+			}
+		}
+		slog.Error("nfqueue: receive error", "error", err)
+		return 1
 	}); err != nil {
 		nf.Close()
 		e.running = false

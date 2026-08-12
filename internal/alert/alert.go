@@ -7,7 +7,6 @@ package alert
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -118,7 +117,7 @@ func (r *Router) fire(e AlertEvent) {
 		"message":    e.Message,
 		"source":     e.Source,
 		"timestamp":  e.Timestamp.UTC().Format(time.RFC3339),
-		"event_type": fmt.Sprintf("l3_firewall_alert"),
+		"event_type": "l3_firewall_alert",
 	}
 
 	body, err := json.Marshal(payload)

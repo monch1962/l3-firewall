@@ -26,7 +26,9 @@ func buildTCPPacket(srcIP, dstIP net.IP, srcPort, dstPort layers.TCPPort, syn, a
 		RST:     rst,
 		FIN:     fin,
 	}
-	tcp.SetNetworkLayerForChecksum(ip)
+	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
+		panic("buildTCPPacket: " + err.Error())
+	}
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
@@ -52,7 +54,9 @@ func buildUDPPacket(srcIP, dstIP net.IP, srcPort, dstPort layers.UDPPort) []byte
 		SrcPort: srcPort,
 		DstPort: dstPort,
 	}
-	udp.SetNetworkLayerForChecksum(ip)
+	if err := udp.SetNetworkLayerForChecksum(ip); err != nil {
+		panic("buildUDPPacket: " + err.Error())
+	}
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
@@ -261,7 +265,9 @@ func TestParseIPv6Packet(t *testing.T) {
 		SYN:     true,
 		ACK:     false,
 	}
-	tcp.SetNetworkLayerForChecksum(ip6)
+	if err := tcp.SetNetworkLayerForChecksum(ip6); err != nil {
+		t.Fatalf("set checksum: %v", err)
+	}
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{

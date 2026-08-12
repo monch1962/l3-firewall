@@ -160,21 +160,26 @@ func TestLogConcurrentSafe(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 50; i++ {
-			l.Log(AuditEvent{
+			if err := l.Log(AuditEvent{
 				Timestamp: time.Now(),
 				Type:      "packet_allow",
 				SrcIP:     "10.0.1.1",
-			})
+			}); err != nil {
+				t.Errorf("Log (goroutine): %v", err)
+				return
+			}
 		}
 	}()
 
 	for i := 0; i < 50; i++ {
-		l.Log(AuditEvent{
+		if err := l.Log(AuditEvent{
 			Timestamp: time.Now(),
 			Type:      "packet_block",
 			SrcIP:     "10.0.2.1",
 			Reason:    "test",
-		})
+		}); err != nil {
+			t.Errorf("Log: %v", err)
+		}
 	}
 	<-done
 

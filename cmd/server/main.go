@@ -288,7 +288,9 @@ func main() {
 		if adminServer != nil {
 			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer shutdownCancel()
-			adminServer.Shutdown(shutdownCtx)
+			if err := adminServer.Shutdown(shutdownCtx); err != nil {
+				slog.Warn("admin server shutdown", "error", err)
+			}
 		}
 		eng.Stop()
 		cancel()

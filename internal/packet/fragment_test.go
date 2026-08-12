@@ -56,7 +56,9 @@ func TestFragmentFirstPacket(t *testing.T) {
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{}
-	gopacket.SerializeLayers(buf, opts, ip)
+	if err := gopacket.SerializeLayers(buf, opts, ip); err != nil {
+		t.Fatalf("build fragment packet: %v", err)
+	}
 
 	info, err := ParsePacket(buf.Bytes())
 	if err != nil {

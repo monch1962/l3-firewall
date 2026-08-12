@@ -66,7 +66,9 @@ func TestAttack_TCPAllFlags(t *testing.T) {
 		RST:     true,
 		FIN:     true,
 	}
-	tcp.SetNetworkLayerForChecksum(ip)
+	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
+		t.Fatalf("set checksum: %v", err)
+	}
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
@@ -188,14 +190,18 @@ func TestAttack_IPv4MinHeader(t *testing.T) {
 		DstPort: 443,
 		SYN:     true,
 	}
-	tcp.SetNetworkLayerForChecksum(ip)
+	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
+		t.Fatalf("set checksum: %v", err)
+	}
 
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{
 		ComputeChecksums: true,
 		FixLengths:       true,
 	}
-	gopacket.SerializeLayers(buf, opts, ip, tcp)
+	if err := gopacket.SerializeLayers(buf, opts, ip, tcp); err != nil {
+		t.Fatalf("build packet: %v", err)
+	}
 
 	info, err := ParsePacket(buf.Bytes())
 	if err != nil {

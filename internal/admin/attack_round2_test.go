@@ -65,7 +65,9 @@ func TestAttack_HealthLeaksInfo(t *testing.T) {
 	handler.ServeHTTP(w, req)
 
 	var resp map[string]interface{}
-	json.NewDecoder(w.Body).Decode(&resp)
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
 
 	// Health should only expose basic info, not internal stats
 	if _, ok := resp["status"]; !ok {

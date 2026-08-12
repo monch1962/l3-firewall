@@ -106,7 +106,7 @@ func TestFetchFromURL(t *testing.T) {
 		t.Error("missing 192.168.1.1 (CIDR)")
 	}
 	if bl.Contains("10.0.0.99") {
-		// Not in the list
+		t.Error("10.0.0.99 should not be in the blocklist")
 	}
 }
 

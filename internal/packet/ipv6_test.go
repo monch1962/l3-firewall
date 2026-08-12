@@ -73,9 +73,13 @@ func buildIPv6TCP(src, dst string, srcPort, dstPort uint16) []byte {
 		DstPort: layers.TCPPort(dstPort),
 		SYN:     true,
 	}
-	tcp.SetNetworkLayerForChecksum(ip6)
+	if err := tcp.SetNetworkLayerForChecksum(ip6); err != nil {
+		panic("buildIPv6TCP: " + err.Error())
+	}
 	buf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, ip6, tcp)
+	if err := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, ip6, tcp); err != nil {
+		panic("buildIPv6TCP: " + err.Error())
+	}
 	return buf.Bytes()
 }
 
@@ -92,9 +96,13 @@ func buildIPv6WithExt(src, dst string, srcPort, dstPort uint16, extType layers.I
 		DstPort: layers.TCPPort(dstPort),
 		SYN:     true,
 	}
-	tcp.SetNetworkLayerForChecksum(ip6)
+	if err := tcp.SetNetworkLayerForChecksum(ip6); err != nil {
+		panic("buildIPv6WithExt: " + err.Error())
+	}
 	buf := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, ip6, tcp)
+	if err := gopacket.SerializeLayers(buf, gopacket.SerializeOptions{}, ip6, tcp); err != nil {
+		panic("buildIPv6WithExt: " + err.Error())
+	}
 	full := buf.Bytes()
 
 	// Build extension header bytes to insert after the 40-byte IPv6 header

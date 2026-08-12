@@ -81,7 +81,9 @@ func TestLoadEmptyPath(t *testing.T) {
 func TestCorruptFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
-	os.WriteFile(path, []byte("{corrupt"), 0644)
+	if err := os.WriteFile(path, []byte("{corrupt"), 0644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 
 	_, err := LoadState(path)
 	if err == nil {

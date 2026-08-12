@@ -2,6 +2,7 @@ package alert
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -51,7 +52,12 @@ func TestSendFiresWebhook(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		buf := make([]byte, r.ContentLength)
-		r.Body.Read(buf)
+		if _, err := io.ReadFull(r.Body, buf); err != nil {
+			received = nil
+			mu.Unlock()
+			httpWg.Done()
+			return
+		}
 		received = buf
 		mu.Unlock()
 		w.WriteHeader(http.StatusOK)

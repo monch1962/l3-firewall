@@ -94,6 +94,8 @@ func BenchmarkOPAEval(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		eval.Evaluate(input)
+		if _, err := eval.Evaluate(input); err != nil {
+			b.Fatalf("Evaluate: %v", err)
+		}
 	}
 }
