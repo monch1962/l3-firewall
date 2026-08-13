@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/monch1962/l3-firewall/internal/alert"
@@ -77,7 +78,6 @@ type Engine struct {
 	ratelimit   *ratelimit.Limiter
 	auditOnly   bool
 	failClosed  bool
-	running     bool
 	auditLogger *audit.Logger          // nil = no audit logging
 	alertRouter *alert.Router          // nil = no alerts
 	geoipReader *geoip.Reader          // nil = no GeoIP lookups
@@ -86,10 +86,14 @@ type Engine struct {
 	statePath   string                 // path for persisting state (empty = no persistence)
 	l2Filter    *l2filter.Filter       // nil = no L2 filtering
 
-	// Stats counters
-	packetsProcessed int64
-	packetsAllowed   int64
-	packetsBlocked   int64
+	// Stats counters. Atomics: incremented on the go-nfqueue callback
+	// goroutine (NFQUEUE hot path) and read on the admin API HTTP
+	// goroutine (Stats/Running) — plain fields would be a data race
+	// (R50, R46 policyVersions class: unauthenticated admin API makes
+	// it remotely triggerable).
+	packetsProcessed atomic.Int64
+	packetsAllowed   atomic.Int64
+	packetsBlocked   atomic.Int64
 
 	// Per-reason block counters for aggregation
 	blockStatsMu sync.RWMutex
@@ -100,8 +104,10 @@ type Engine struct {
 	recentBlocks []BlockLogEntry
 
 	// NFQUEUE lifecycle
-	ctx    context.Context
-	cancel context.CancelFunc
+	lifecycleMu sync.RWMutex // guards ctx/cancel (Run vs Stop, R50)
+	ctx         context.Context
+	cancel      context.CancelFunc
+	running     atomic.Bool
 }
 
 // New creates a firewall engine with the given components.
@@ -134,15 +140,15 @@ type Stats struct {
 
 func (e *Engine) Stats() Stats {
 	return Stats{
-		PacketsProcessed: e.packetsProcessed,
-		PacketsAllowed:   e.packetsAllowed,
-		PacketsBlocked:   e.packetsBlocked,
+		PacketsProcessed: e.packetsProcessed.Load(),
+		PacketsAllowed:   e.packetsAllowed.Load(),
+		PacketsBlocked:   e.packetsBlocked.Load(),
 	}
 }
 
 // Running returns whether the engine is actively running (NFQUEUE connected).
 func (e *Engine) Running() bool {
-	return e.running
+	return e.running.Load()
 }
 
 // ConntrackStats returns the connection tracking stats.
@@ -247,8 +253,8 @@ func (e *Engine) fireAlert(alertType alert.AlertType, message string) {
 func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *opa.Result) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			e.packetsProcessed++
-			e.packetsBlocked++
+			e.packetsProcessed.Add(1)
+			e.packetsBlocked.Add(1)
 			result = &opa.Result{
 				Allowed: false,
 				Reason:  fmt.Sprintf("internal error: %v", rec),
@@ -257,7 +263,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		}
 	}()
 
-	e.packetsProcessed++
+	e.packetsProcessed.Add(1)
 
 	// Generate a trace ID for correlating log entries across the pipeline
 	tid := newTraceID()
@@ -281,7 +287,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 
 	// Connection limit exceeded — block immediately
 	if flowLimited {
-		e.packetsBlocked++
+		e.packetsBlocked.Add(1)
 		reason := "connection limit exceeded for source IP"
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
@@ -299,7 +305,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// 3. L2 filtering — MAC address check
 	if e.l2Filter != nil {
 		if ok, reason := e.l2Filter.MACAllowed(pi.SrcMAC); !ok {
-			e.packetsBlocked++
+			e.packetsBlocked.Add(1)
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "mac", pi.SrcMAC,
 				"protocol", pi.Protocol, "trace_id", tid)
 			e.recordBlock(pi, reason, tid)
@@ -318,7 +324,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// hardcoded policy threshold applied (R40.4). Mirror the connection-limit
 	// block: hard deny regardless of audit-only mode.
 	if e.ratelimit.ExceedsLimit(pps, bps) {
-		e.packetsBlocked++
+		e.packetsBlocked.Add(1)
 		reason := fmt.Sprintf("per-IP rate limit exceeded: %.0f pps / %.0f bps", pps, bps)
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
@@ -342,7 +348,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 
 	// 5. Threat intel check (if blocklist is configured)
 	if e.threatIntel != nil && e.threatIntel.Contains(pi.SrcIP) {
-		e.packetsBlocked++
+		e.packetsBlocked.Add(1)
 		reason := "source IP in threat intelligence blocklist"
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
@@ -362,7 +368,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// 6. OPA evaluation
 	if e.eval == nil {
 		if e.failClosed {
-			e.packetsBlocked++
+			e.packetsBlocked.Add(1)
 			reason := "evaluator unavailable — blocked for safety"
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
@@ -370,7 +376,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			e.logAudit("packet_block", tid, pi, reason)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
-		e.packetsAllowed++
+		e.packetsAllowed.Add(1)
 		e.logAudit("packet_allow", tid, pi, "")
 		return &opa.Result{Allowed: true}
 	}
@@ -378,7 +384,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	result, err := e.eval.Evaluate(input)
 	if err != nil {
 		if e.failClosed {
-			e.packetsBlocked++
+			e.packetsBlocked.Add(1)
 			reason := fmt.Sprintf("OPA error: %v — blocked for safety", err)
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
@@ -387,7 +393,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 			e.fireAlert(alert.AlertOPAError, reason)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
-		e.packetsAllowed++
+		e.packetsAllowed.Add(1)
 		e.logAudit("packet_allow", tid, pi, "")
 		return &opa.Result{Allowed: true}
 	}
@@ -396,16 +402,16 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	if !result.Allowed && e.auditOnly {
 		slog.Warn("[AUDIT] would block", "reason", result.Reason, "src", pi.SrcIP,
 			"dst", pi.DstIP, "protocol", pi.Protocol, "port", pi.DstPort)
-		e.packetsAllowed++
+		e.packetsAllowed.Add(1)
 		e.logAudit("audit_block", tid, pi, result.Reason)
 		return &opa.Result{Allowed: true}
 	}
 
 	if result.Allowed {
-		e.packetsAllowed++
+		e.packetsAllowed.Add(1)
 		e.logAudit("packet_allow", tid, pi, "")
 	} else {
-		e.packetsBlocked++
+		e.packetsBlocked.Add(1)
 		// Truncate long reason strings
 		if len(result.Reason) > maxReasonLength {
 			result.Reason = result.Reason[:maxReasonLength]
@@ -426,8 +432,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			e.packetsProcessed++
-			e.packetsAllowed++
+			e.packetsProcessed.Add(1)
+			e.packetsAllowed.Add(1)
 			slog.Error("panic recovered in packet handler",
 				"panic", fmt.Sprintf("%v", rec))
 			ret = 1 // fail-closed: blocked packets stay blocked on panic
@@ -441,8 +447,8 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 		// left this nil-payload branch returning 0 (NF_ACCEPT): an
 		// uninspectable packet silently passed every policy layer (R49 —
 		// nil-payload fail-open sibling).
-		e.packetsProcessed++
-		e.packetsBlocked++
+		e.packetsProcessed.Add(1)
+		e.packetsBlocked.Add(1)
 		slog.Warn("packet with nil payload dropped (fail-closed): nothing to inspect")
 		return 1
 	}
@@ -454,8 +460,8 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 		// fail-closed (ret=1) but parse errors still returned 0 (NF_ACCEPT),
 		// silently bypassing every policy layer for malformed/truncated
 		// packets (R40.3).
-		e.packetsProcessed++
-		e.packetsBlocked++
+		e.packetsProcessed.Add(1)
+		e.packetsBlocked.Add(1)
 		slog.Warn("unparseable packet dropped (fail-closed)", "error", err)
 		return 1
 	}
@@ -553,14 +559,24 @@ func (e *Engine) restoreState() {
 	slog.Info("restored block stats from state file", "count", len(state.BlockStats))
 }
 
+// setLifecycle records the run context/cancel func so Stop() can
+// cancel the NFQUEUE loop. Guarded by lifecycleMu: Run() assigns on
+// the main goroutine while the signal-handler goroutine may call
+// Stop() concurrently — a plain field would race (R50).
+func (e *Engine) setLifecycle(ctx context.Context, cancel context.CancelFunc) {
+	e.lifecycleMu.Lock()
+	e.ctx = ctx
+	e.cancel = cancel
+	e.lifecycleMu.Unlock()
+}
+
 // Run starts the NFQUEUE listener on the given queue number.
 func (e *Engine) Run(queueNum uint16) error {
 	// Restore state from previous run
 	e.restoreState()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	e.ctx = ctx
-	e.cancel = cancel
+	e.setLifecycle(ctx, cancel)
 
 	cfg := nfqueue.Config{
 		NfQueue:      queueNum,
@@ -575,7 +591,7 @@ func (e *Engine) Run(queueNum uint16) error {
 		return fmt.Errorf("opening NFQUEUE %d: %w", queueNum, err)
 	}
 
-	e.running = true
+	e.running.Store(true)
 
 	if err := nf.RegisterWithErrorFunc(ctx, func(attr nfqueue.Attribute) int {
 		// The hook return value is receive-loop control, NOT the verdict
@@ -597,7 +613,7 @@ func (e *Engine) Run(queueNum uint16) error {
 		return 1
 	}); err != nil {
 		nf.Close()
-		e.running = false
+		e.running.Store(false)
 		cancel()
 		return fmt.Errorf("registering NFQUEUE handler: %w", err)
 	}
@@ -620,13 +636,16 @@ func (e *Engine) Run(queueNum uint16) error {
 
 	<-ctx.Done()
 	nf.Close()
-	e.running = false
+	e.running.Store(false)
 	return nil
 }
 
 // Stop gracefully shuts down the NFQUEUE listener.
 func (e *Engine) Stop() {
-	if e.cancel != nil {
-		e.cancel()
+	e.lifecycleMu.RLock()
+	cancel := e.cancel
+	e.lifecycleMu.RUnlock()
+	if cancel != nil {
+		cancel()
 	}
 }
