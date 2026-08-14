@@ -87,9 +87,15 @@ func extractToken(r *http.Request) string {
 }
 
 // tokenMatches does a constant-time comparison of two tokens.
+// An empty expected value never matches: an unconfigured credential must
+// not authenticate anyone. The "no auth configured" case is handled by the
+// require*Auth wrappers returning the handler unwrapped when ALL tokens are
+// empty — before R51, tokenMatches(given, "") returned true, so a config
+// with ONLY --admin-read-token let any junk bearer token pass every read
+// endpoint (and requireWriteAuth left writes fully open).
 func tokenMatches(given, expected string) bool {
 	if expected == "" {
-		return true
+		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(given), []byte(expected)) == 1
 }
@@ -115,7 +121,12 @@ func (a *API) requireReadAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // requireWriteAuth only accepts the full admin token.
 func (a *API) requireWriteAuth(next http.HandlerFunc) http.HandlerFunc {
-	if a.token == "" {
+	// Auth is disabled only when NO credentials are configured at all.
+	// With only a read token set, write endpoints must NOT be left open:
+	// the operator configured auth and the read-only token cannot modify
+	// resources (R51 — previously a.token == "" short-circuited straight
+	// to the handler, silently dropping the write control).
+	if a.token == "" && a.readToken == "" {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {

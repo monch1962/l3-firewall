@@ -136,6 +136,17 @@ func (s *Syncer) watch(ctx context.Context) {
 				return
 			}
 			for _, ev := range wresp.Events {
+				// A watch event missing its key/value (nil event pointer
+				// or nil Kv — possible from a malformed/malicious etcd
+				// wire response, which clientv3 casts into *Event pointers
+				// without filtering) must not panic the watch goroutine:
+				// an unrecovered panic there crashes the whole process
+				// (R51 — the nil deref was the only unprotected statement
+				// in the watch loop).
+				if ev == nil || ev.Kv == nil {
+					slog.Warn("etcd: watch event missing key/value, skipping")
+					continue
+				}
 				policy := string(ev.Kv.Value)
 				// Enforce policy size limit to prevent memory exhaustion from
 				// oversized etcd values arriving via watcher updates.
