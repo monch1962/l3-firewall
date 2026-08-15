@@ -105,20 +105,28 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 		slog.Warn("etcd: failed to get initial policy", "key", s.key, "error", err)
 		return
 	}
-	if len(resp.Kvs) > 0 {
-		policy := string(resp.Kvs[0].Value)
-		// Enforce policy size limit to prevent memory exhaustion
-		if len(policy) > maxPolicySize {
-			slog.Warn("etcd: initial policy exceeds max size, skipping",
-				"key", s.key, "size", len(policy), "max", maxPolicySize)
-			return
-		}
-		// Wrap callback in panic recovery to prevent goroutine death
-		if err := safeOnUpdate(s.onUpdate, policy); err != nil {
-			slog.Warn("etcd: failed to load initial policy", "error", err)
-		} else {
-			slog.Info("etcd: loaded policy from", "key", s.key)
-		}
+	// A Get response missing its kv entirely (nil response) or whose first
+	// element is a nil KeyValue pointer must not panic loadCurrent: it runs
+	// synchronously inside Start on the MAIN goroutine with no recover
+	// anywhere on the path, so a panic there crashes the whole process at
+	// startup (R52 — the R51 watch-loop nil-shape guard applied to the
+	// initial-load path, which dereferenced resp.Kvs[0].Value unguarded).
+	if resp == nil || len(resp.Kvs) == 0 || resp.Kvs[0] == nil {
+		slog.Warn("etcd: initial Get response missing key/value, skipping")
+		return
+	}
+	policy := string(resp.Kvs[0].Value)
+	// Enforce policy size limit to prevent memory exhaustion
+	if len(policy) > maxPolicySize {
+		slog.Warn("etcd: initial policy exceeds max size, skipping",
+			"key", s.key, "size", len(policy), "max", maxPolicySize)
+		return
+	}
+	// Wrap callback in panic recovery to prevent goroutine death
+	if err := safeOnUpdate(s.onUpdate, policy); err != nil {
+		slog.Warn("etcd: failed to load initial policy", "error", err)
+	} else {
+		slog.Info("etcd: loaded policy from", "key", s.key)
 	}
 }
 
