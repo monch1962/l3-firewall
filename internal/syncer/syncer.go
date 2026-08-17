@@ -34,7 +34,6 @@ type Syncer struct {
 	stopCh    chan struct{}
 	closeOnce sync.Once // ensures Close() is idempotent
 	startOnce sync.Once // ensures Start() is idempotent
-	started   bool
 }
 
 // Config controls the etcd syncer.
@@ -80,7 +79,6 @@ func (s *Syncer) Start(ctx context.Context) {
 		return
 	}
 	s.startOnce.Do(func() {
-		s.started = true
 		// Load initial policy
 		s.loadCurrent(ctx)
 		// Start watcher
@@ -115,13 +113,18 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 		slog.Warn("etcd: initial Get response missing key/value, skipping")
 		return
 	}
-	policy := string(resp.Kvs[0].Value)
-	// Enforce policy size limit to prevent memory exhaustion
-	if len(policy) > maxPolicySize {
+	// Enforce policy size limit BEFORE converting the value to a string:
+	// the conversion copies the full value into memory, so a post-copy
+	// len(policy) check (pre-R54) defeats the cap's purpose — the
+	// allocation the cap exists to prevent has already happened (R42/R13
+	// check-before-allocate doctrine; R42's readPolicyFile enforces the
+	// cap via fstat + LimitReader before the bytes ever reach memory).
+	if len(resp.Kvs[0].Value) > maxPolicySize {
 		slog.Warn("etcd: initial policy exceeds max size, skipping",
-			"key", s.key, "size", len(policy), "max", maxPolicySize)
+			"key", s.key, "size", len(resp.Kvs[0].Value), "max", maxPolicySize)
 		return
 	}
+	policy := string(resp.Kvs[0].Value)
 	// Wrap callback in panic recovery to prevent goroutine death
 	if err := safeOnUpdate(s.onUpdate, policy); err != nil {
 		slog.Warn("etcd: failed to load initial policy", "error", err)
@@ -155,15 +158,16 @@ func (s *Syncer) watch(ctx context.Context) {
 					slog.Warn("etcd: watch event missing key/value, skipping")
 					continue
 				}
-				policy := string(ev.Kv.Value)
-				// Enforce policy size limit to prevent memory exhaustion from
-				// oversized etcd values arriving via watcher updates.
-				// Matching the same check in loadCurrent().
-				if len(policy) > maxPolicySize {
+				// Enforce policy size limit BEFORE the string conversion —
+				// same check-before-allocate ordering as loadCurrent (R54):
+				// string() copies the value, so a post-copy check lets an
+				// oversized value allocate fully before being rejected.
+				if len(ev.Kv.Value) > maxPolicySize {
 					slog.Warn("etcd: policy update exceeds max size, skipping",
-						"key", s.key, "size", len(policy), "max", maxPolicySize)
+						"key", s.key, "size", len(ev.Kv.Value), "max", maxPolicySize)
 					continue
 				}
+				policy := string(ev.Kv.Value)
 				slog.Info("etcd: policy updated", "key", s.key, "type", ev.Type)
 				// Wrap callback in panic recovery to prevent goroutine death
 				if err := safeOnUpdate(s.onUpdate, policy); err != nil {
@@ -190,15 +194,22 @@ func safeOnUpdate(fn func(string) error, policy string) (err error) {
 }
 
 // Close shuts down the syncer and closes the etcd connection.
+// Idempotent: the closeOnce guard covers the WHOLE close — the stopCh
+// AND client.Close(). Before R54 the once guarded only the channel, so a
+// second Close() re-invoked client.Close(): clientv3 tolerates double
+// calls but the etcdClient interface (R46) makes no such promise for
+// arbitrary implementations, and the idempotency contract exists exactly
+// so a double Close cannot corrupt a client (R6 double-close panic class).
 func (s *Syncer) Close() error {
 	if s == nil {
 		return nil
 	}
+	var err error
 	s.closeOnce.Do(func() {
 		close(s.stopCh)
+		if s.client != nil {
+			err = s.client.Close()
+		}
 	})
-	if s.client == nil {
-		return nil
-	}
-	return s.client.Close()
+	return err
 }

@@ -213,22 +213,58 @@ func (bl *Blocklist) FetchFromURL(url string) (int, error) {
 	return bl.parseReader(io.LimitReader(resp.Body, maxFeedResponseSize))
 }
 
+// maxFeedLineSize caps the length of a single feed line. Blocklist
+// entries are IPs/CIDRs — anything longer is not a plausible entry and is
+// skipped (R54). 1MB is generous (IPv6-CIDR lines are <100 bytes).
+const maxFeedLineSize = 1024 * 1024
+
 // parseReader reads IP/CIDR entries from a reader and adds them to the blocklist.
+// Lines longer than maxFeedLineSize are skipped with a warning, not fatal:
+// bufio.Scanner (pre-R54) aborted the ENTIRE parse on ErrTooLong, so a
+// malicious/compromised feed server needed only one 2MB line to discard
+// every other entry in the response and permanently kill each refresh —
+// newly discovered threats were silently never added (R54).
 func (bl *Blocklist) parseReader(r io.Reader) (int, error) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	br := bufio.NewReaderSize(r, maxFeedLineSize)
 
 	count := 0
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+	for {
+		line, err := br.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			// Overlong line: not a plausible entry. Drain the remainder of
+			// the line in bounded chunks (never buffering it whole) and
+			// continue with the next line.
+			for err == bufio.ErrBufferFull {
+				_, err = br.ReadSlice('\n')
+			}
+			slog.Warn("threat intel: skipping overlong feed line", "max", maxFeedLineSize)
+			if err == io.EOF {
+				return count, nil
+			}
+			if err != nil {
+				return count, err
+			}
 			continue
 		}
-		bl.Add(line)
+		if err != nil && err != io.EOF {
+			return count, err
+		}
+		// Trim with the same Unicode-aware semantics as the pre-R54
+		// strings.TrimSpace(scanner.Text()) so normal lines parse exactly
+		// as before; only the overlong-line handling changes.
+		lineStr := strings.TrimSpace(string(line))
+		if lineStr == "" || strings.HasPrefix(lineStr, "#") {
+			if err == io.EOF {
+				return count, nil
+			}
+			continue
+		}
+		bl.Add(lineStr)
 		count++
+		if err == io.EOF {
+			return count, nil
+		}
 	}
-
-	return count, scanner.Err()
 }
 
 // StartRefresher launches a background goroutine that periodically fetches
