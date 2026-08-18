@@ -114,7 +114,15 @@ func (w *Writer) rotateLocked() error {
 	// directory, truncating and overwriting an arbitrary file writable by
 	// the firewall's UID on the next blocked packet (R42 — symlink
 	// write-through). A symlink at the rotation path is never legitimate.
-	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0666)
+	// Also O_NONBLOCK: WriteBlock runs in the NFQUEUE packet hot path, and
+	// opening an existing FIFO planted at the (predictable) rotation
+	// filename O_WRONLY without O_NONBLOCK blocks until a reader appears —
+	// stalling the receive loop until the queue fills and the kernel drops
+	// ALL traffic (R55 — the R38 FIFO class applied to the CREATE open,
+	// where O_NOFOLLOW alone does not protect). With O_NONBLOCK the FIFO
+	// open fails immediately with ENXIO (packet simply not captured);
+	// regular files are unaffected.
+	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0666)
 	if err != nil {
 		return fmt.Errorf("creating pcap file %s: %w", fname, err)
 	}

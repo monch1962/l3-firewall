@@ -62,7 +62,14 @@ func SaveState(path string, state *EngineState) error {
 	// truncating and overwriting an arbitrary file writable by the firewall's
 	// UID (R42 — symlink write-through). A symlink at the .tmp path is never
 	// legitimate; rename over the final path is already symlink-safe.
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0666)
+	// Also O_NONBLOCK: opening an existing FIFO planted at the .tmp path
+	// O_WRONLY (without O_NONBLOCK) blocks until a reader appears — the
+	// 60-second saveState ticker goroutine would hang forever, and with it
+	// the same tick's conntrack.Expire/ratelimit.Cleanup (availability DoS;
+	// R55 — the R38 FIFO class applied to the CREATE open, where O_NOFOLLOW
+	// alone does not protect). With O_NONBLOCK the FIFO open fails
+	// immediately with ENXIO; regular files are unaffected.
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0666)
 	if err != nil {
 		return fmt.Errorf("creating temp state file: %w", err)
 	}
