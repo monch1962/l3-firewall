@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -92,6 +93,16 @@ type Logger struct {
 func NewLogger(cfg Config) (*Logger, error) {
 	if cfg.Path == "" {
 		cfg.Path = "/tmp/l3-firewall/audit.log"
+	}
+	// Reject path traversal (..): filepath.Dir below strips a ".."
+	// component before securepath.RejectSymlinkComponents can reject it,
+	// but the raw cfg.Path is what openAuditFile opens — the kernel
+	// resolves a symlink planted at a component before the ".." and every
+	// audit append lands outside the checked directory as the firewall's
+	// UID (R57; persist R13 pattern — the ".." class must be rejected at
+	// every file-writing consumer, not only persist).
+	if strings.Contains(cfg.Path, "..") {
+		return nil, fmt.Errorf("path traversal rejected: %s", cfg.Path)
 	}
 	if cfg.MaxSizeMB <= 0 {
 		cfg.MaxSizeMB = DefaultMaxSizeMB

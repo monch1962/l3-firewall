@@ -60,13 +60,18 @@ func TestRejectSymlinkComponents_RealDirs(t *testing.T) {
 	if err := os.MkdirAll(rel, 0755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	relPath, err := filepath.Rel(t.TempDir(), rel)
-	if err != nil {
-		t.Fatalf("filepath.Rel: %v", err)
+	// Relative real dir: chdir into a fresh temp dir so "sub/nested"
+	// resolves from the CWD without ".." components. The R45 version
+	// built the relative path with filepath.Rel against a DIFFERENT
+	// temp dir, yielding a "../.."-heavy path — which R57 now (correctly)
+	// rejects, because the kernel resolves ".." against the real tree
+	// (following planted symlinks) in a way the lexical walk cannot
+	// follow. The genuine relative-path case must be ".."-free.
+	t.Chdir(t.TempDir())
+	if err := os.MkdirAll("sub/nested", 0755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
 	}
-	// Rebase so the relative path resolves from the current directory
-	// (t.TempDir() is under /tmp, so walk "."-relative components)
-	if err := RejectSymlinkComponents(relPath); err != nil {
+	if err := RejectSymlinkComponents("sub/nested"); err != nil {
 		t.Errorf("relative real dir rejected: %v", err)
 	}
 

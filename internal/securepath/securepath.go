@@ -26,6 +26,22 @@ import (
 // atomic defense requires openat2(RESOLVE_NO_SYMLINKS); this walk closes
 // the planted-before-startup window that O_NOFOLLOW alone cannot.
 func RejectSymlinkComponents(dir string) error {
+	// Reject ".." path components on the RAW input: filepath.Clean
+	// (below) resolves ".." lexically BEFORE the walk, so a path like
+	// /base/evil/../state would be walked as /base/state while the kernel
+	// resolves /base/evil (a planted symlink), then ".." against the REAL
+	// directory structure — the walk would validate a different path than
+	// the opens that follow, letting MkdirAll and file writes escape the
+	// checked tree (R57). persist additionally guards the whole path with
+	// strings.Contains (R13); this helper must reject the class for every
+	// consumer (capture.NewWriter passes its dir raw). No legitimate
+	// firewall state/log/capture directory needs a ".." component.
+	for _, part := range strings.Split(dir, string(filepath.Separator)) {
+		if part == ".." {
+			return fmt.Errorf("path component '..' not allowed: %s", dir)
+		}
+	}
+
 	cleaned := filepath.Clean(dir)
 
 	var cur string
