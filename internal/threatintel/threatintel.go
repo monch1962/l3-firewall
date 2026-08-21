@@ -17,6 +17,18 @@ import (
 // maxBlocklistEntries prevents memory exhaustion from a very large blocklist.
 const maxBlocklistEntries = 500000
 
+// maxCIDRNetworks caps the number of DISTINCT CIDR networks separately from
+// the total entry count. Exact-IP entries are O(1) map lookups, but
+// Contains() scans the entire nets slice on EVERY packet in the NFQUEUE hot
+// path — a feed poisoned with 500k distinct networks makes each packet pay a
+// ~5ms linear scan (measured on this host: 12ns per IPNet.Contains check),
+// stalling the single-goroutine receive loop and dropping ALL traffic (R58 —
+// the R45 dedup fix eliminated DUPLICATE accumulation but left the DISTINCT
+// count unbounded up to the 500k total cap). 65536 networks bounds the scan
+// to ~0.8ms worst case; legitimate feeds (Spamhaus DROP etc.) carry a few
+// thousand CIDRs.
+const maxCIDRNetworks = 65536
+
 // maxFeedResponseSize limits the response body from a threat intel feed to
 // prevent memory exhaustion attacks (50MB).
 const maxFeedResponseSize = 50 * 1024 * 1024
@@ -69,6 +81,19 @@ func (bl *Blocklist) Add(entry string) {
 			// duplicate accumulation).
 			key := ipnet.String()
 			if _, dup := bl.netKeys[key]; dup {
+				return
+			}
+			// Separate distinct-network cap (R58): Contains() scans the
+			// WHOLE nets slice on every packet in the NFQUEUE hot path
+			// (engine.evaluatePacket calls threatIntel.Contains per packet
+			// before OPA evaluation). The R45 dedup stops DUPLICATES from
+			// accumulating, but the total cap (ips+nets jointly, 500k)
+			// still lets a single malicious feed fetch fill all 500k slots
+			// with DISTINCT networks — measured ~4.7ms scan per packet,
+			// stalling the receive loop and dropping all traffic. Exact IPs
+			// are O(1) map lookups and keep the full budget; networks are
+			// O(n) per packet and get their own bound.
+			if len(bl.nets) >= maxCIDRNetworks {
 				return
 			}
 			bl.netKeys[key] = struct{}{}
