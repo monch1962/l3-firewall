@@ -91,10 +91,23 @@ func SaveState(path string, state *EngineState) error {
 // maxStateFileSize is enforced to prevent memory exhaustion attacks.
 // Non-regular files (named pipes, device files, directories) are
 // rejected to prevent blocking on FIFO hangs (DoS via --state-file).
+// Paths containing ".." are rejected — the sibling-path mirror of
+// SaveState's R13 guard: --state-file is operator-influenced (may come
+// from a partially-attacker-edited config), and the same path is WRITTEN
+// by SaveState, so an unguarded LoadState lets an attacker-influenced
+// path read ANY readable file that parses as EngineState JSON, injecting
+// attacker-chosen BlockStats into engine.restoreState and the admin API
+// (R59 — the R13 guard covered only the writer; the reader was missed).
 func LoadState(path string) (*EngineState, error) {
 	if path == "" {
 		return nil, nil
 	}
+	// Reject path traversal (..) to prevent reading files outside the
+	// intended directory — mirrors the SaveState guard (R13).
+	if strings.Contains(path, "..") {
+		return nil, fmt.Errorf("path traversal rejected: %s", path)
+	}
+	// TEMP-R59-RED-VERIFY
 	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes.
 	// On Linux, O_NONBLOCK has no effect on regular file reads, so
 	// subsequent JSON decoding works normally. By opening first and
