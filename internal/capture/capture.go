@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -144,11 +145,28 @@ func (w *Writer) rotateLocked() error {
 }
 
 func (w *Writer) cleanupLocked() {
-	pattern := filepath.Join(w.cfg.Dir, "blocked_*.pcap")
-	matches, err := filepath.Glob(pattern)
+	// List the configured directory directly with os.ReadDir instead of
+	// building a filepath.Glob pattern from the operator-influenced
+	// --pcap-dir: the old pattern (Join(cfg.Dir, "blocked_*.pcap"))
+	// interpreted glob metacharacters ([, *, ?) IN the dir component as
+	// pattern syntax — a dir like /base/pcaps[1] expanded to match the
+	// literal SIBLING /base/pcaps1, so cleanup (1) deleted blocked_*.pcap
+	// files the firewall never wrote (arbitrary deletion as its UID) and
+	// (2) never matched the firewall's own rotation files in the literal
+	// dir, silently defeating the MaxFiles cap (unbounded disk growth).
+	// ReadDir has no pattern interpretation: the match set is exactly the
+	// files in the configured directory (R60).
+	entries, err := os.ReadDir(w.cfg.Dir)
 	if err != nil {
-		slog.Warn("pcap cleanup: Glob error", "pattern", pattern, "error", err)
+		slog.Warn("pcap cleanup: read dir error", "dir", w.cfg.Dir, "error", err)
 		return
+	}
+	var matches []string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "blocked_") && strings.HasSuffix(name, ".pcap") {
+			matches = append(matches, filepath.Join(w.cfg.Dir, name))
+		}
 	}
 	if len(matches) <= w.cfg.MaxFiles {
 		return

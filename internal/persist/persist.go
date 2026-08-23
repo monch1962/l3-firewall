@@ -107,7 +107,6 @@ func LoadState(path string) (*EngineState, error) {
 	if strings.Contains(path, "..") {
 		return nil, fmt.Errorf("path traversal rejected: %s", path)
 	}
-	// TEMP-R59-RED-VERIFY
 	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes.
 	// On Linux, O_NONBLOCK has no effect on regular file reads, so
 	// subsequent JSON decoding works normally. By opening first and

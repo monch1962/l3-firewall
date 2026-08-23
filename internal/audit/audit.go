@@ -207,10 +207,28 @@ func (l *Logger) rotateLocked() error {
 // cleanupLocked removes old rotated files, keeping only the newest MaxBackups.
 // Must be called with l.mu held.
 func (l *Logger) cleanupLocked() {
-	pattern := l.cfg.Path + ".*"
-	matches, err := filepath.Glob(pattern)
+	// List the log's directory directly with os.ReadDir instead of
+	// building a filepath.Glob pattern from the operator-influenced
+	// --audit-log-path: the old pattern (cfg.Path + ".*") interpreted glob
+	// metacharacters ([, *, ?) IN the path as pattern syntax — a path like
+	// /base/audit[1].log expanded to match the literal SIBLING
+	// /base/audit1.log.*, so cleanup (1) deleted backups the firewall never
+	// created (arbitrary deletion as its UID) and (2) never matched the
+	// firewall's own rotated files, silently defeating the MaxBackups cap
+	// (unbounded disk growth). ReadDir + base-prefix filter has no pattern
+	// interpretation (R60).
+	dir := filepath.Dir(l.cfg.Path)
+	base := filepath.Base(l.cfg.Path)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
+	}
+	var matches []string
+	prefix := base + "."
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			matches = append(matches, filepath.Join(dir, e.Name()))
+		}
 	}
 	if len(matches) <= l.cfg.MaxBackups {
 		return
