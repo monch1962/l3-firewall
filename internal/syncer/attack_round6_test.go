@@ -6,6 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // ── R6.1: Double-close panic ────────────────────────────────────────────
@@ -98,8 +101,17 @@ func TestAttack_StartCloseRace(t *testing.T) {
 	_ = s.Close()
 }
 
-// ── R6.4: Watcher event flood — no rate limiting ────────────────────────
-// Rapid etcd events could overwhelm the onUpdate callback.
+// ── R6.4: Watcher event flood — reload rate limiting ─────────────────────
+// Rapid etcd events could overwhelm the onUpdate callback. R6 documented
+// the gap ("no rate limiting in place") as a t.Log and never fixed it —
+// R61 converts it to a hard assertion: a flood of IDENTICAL policy events
+// through the watch loop must trigger exactly ONE reload. etcd emits a
+// modify event for EVERY Put (each Put is a new revision, even for the
+// same value), and each reload recompiles the full policy via onUpdate
+// (measured ~70ms per 2MB policy, R61) — an attacker (malicious/compromised
+// etcd or MITM on the plaintext connection, the R51/R52 threat model)
+// replaying the same policy bytes turns the watch loop into a sustained
+// CPU-burn/allocation-churn engine (R61, content-dedupe fix).
 func TestAttack_WatcherEventFlood(t *testing.T) {
 	var callCount int32
 	onUpdate := func(policy string) error {
@@ -108,16 +120,26 @@ func TestAttack_WatcherEventFlood(t *testing.T) {
 		return nil
 	}
 
+	// 100 identical PUT events in a single WatchResponse.
+	events := make([]*clientv3.Event, 0, 100)
+	for i := 0; i < 100; i++ {
+		events = append(events, &clientv3.Event{
+			Type: mvccpb.PUT,
+			Kv:   &mvccpb.KeyValue{Key: []byte("/test/policy"), Value: []byte("package l3_firewall")},
+		})
+	}
 	s := &Syncer{
+		client:   &floodEtcdClient{events: events},
 		key:      "/test/policy",
+		timeout:  time.Second,
 		stopCh:   make(chan struct{}),
 		onUpdate: onUpdate,
 	}
 
-	for i := 0; i < 100; i++ {
-		_ = s.onUpdate("{}")
-	}
+	runWatchToExit(t, s)
 
 	calls := atomic.LoadInt32(&callCount)
-	t.Logf("onUpdate called %d times — no rate limiting in place", calls)
+	if calls != 1 {
+		t.Errorf("identical-policy flood triggered %d reloads, want exactly 1 (each reload recompiles the full policy — unbounded reloads are a CPU/GC DoS via malicious etcd)", calls)
+	}
 }

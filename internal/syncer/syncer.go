@@ -8,12 +8,24 @@ import (
 	"sync"
 	"time"
 
+	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // maxPolicySize prevents memory exhaustion from an oversized etcd policy value.
 // A firewall policy is typically a few KB; 10MB is an extreme upper bound.
 const maxPolicySize = 10 * 1024 * 1024
+
+// maxWatchEventsPerResponse bounds the number of events processed from a
+// single WatchResponse. R13/R54 bound the per-event VALUE size but not the
+// event COUNT: a single response within clientv3's 16MB receive limit can
+// carry ~400k minimal events, each triggering a full policy recompile via
+// onUpdate — unbounded CPU burn from one wire response (R61 — the R58
+// bound-one-dimension rule applied to the watch path). An oversized
+// response is collapsed to its LAST event before processing: every event
+// on a single-key watch (no WithPrevKV) carries the FULL current value, so
+// the last event IS the latest policy state.
+const maxWatchEventsPerResponse = 10000
 
 // etcdClient is the minimal client surface the syncer needs. Extracted as
 // an interface so tests can inject a stub whose Get stalls — proving the
@@ -34,6 +46,19 @@ type Syncer struct {
 	stopCh    chan struct{}
 	closeOnce sync.Once // ensures Close() is idempotent
 	startOnce sync.Once // ensures Start() is idempotent
+
+	// policyMu + lastPolicy dedupe policy content. etcd emits a modify
+	// event for EVERY Put — a same-value Put is a new revision and still
+	// produces an event — and every event drives onUpdate (a full Rego
+	// recompile via opaEval.Load, ~70ms per 2MB policy, measured R61). An
+	// attacker replaying identical policy bytes (malicious/compromised
+	// etcd or MITM on the plaintext connection, the R51/R52 threat model)
+	// turns the watch loop into a sustained CPU/allocation-churn engine.
+	// lastPolicy records the LAST PROCESSED content (applied or rejected),
+	// so an identical replay never reloads twice (R61 — the R6 "no rate
+	// limiting" documentation finding, finally fixed).
+	policyMu   sync.Mutex
+	lastPolicy string
 }
 
 // Config controls the etcd syncer.
@@ -86,6 +111,24 @@ func (s *Syncer) Start(ctx context.Context) {
 	})
 }
 
+// applyPolicy dedupes policy content before the onUpdate callback is
+// invoked. It records the last PROCESSED content (applied or rejected) so
+// an identical replay never triggers a second recompile: etcd emits a
+// modify event for every Put, even a same-value Put, and each reload
+// recompiles the full policy (R61 — the R6 "no rate limiting" gap). The
+// last-ATTEMPTED (not last-successful) content is tracked so a policy that
+// fails to compile is also compiled at most once per distinct content.
+// Returns true when the caller should invoke onUpdate.
+func (s *Syncer) applyPolicy(policy string) bool {
+	s.policyMu.Lock()
+	defer s.policyMu.Unlock()
+	if policy == s.lastPolicy {
+		return false
+	}
+	s.lastPolicy = policy
+	return true
+}
+
 func (s *Syncer) loadCurrent(ctx context.Context) {
 	if s == nil || s.client == nil {
 		return
@@ -125,6 +168,12 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 		return
 	}
 	policy := string(resp.Kvs[0].Value)
+	// Content dedupe (R61): the same policy is already applied — a reload
+	// would recompile identical content for nothing.
+	if !s.applyPolicy(policy) {
+		slog.Debug("etcd: initial policy unchanged, skipping", "key", s.key)
+		return
+	}
 	// Wrap callback in panic recovery to prevent goroutine death
 	if err := safeOnUpdate(s.onUpdate, policy); err != nil {
 		slog.Warn("etcd: failed to load initial policy", "error", err)
@@ -146,7 +195,22 @@ func (s *Syncer) watch(ctx context.Context) {
 			if !ok {
 				return
 			}
-			for _, ev := range wresp.Events {
+			// Bound the event COUNT dimension (R58 rule): R13/R54 cap the
+			// per-event VALUE size, but a single response within clientv3's
+			// receive limit can carry ~400k minimal events, each triggering
+			// a full policy recompile — unbounded CPU burn from one wire
+			// response (R61). Collapse an oversized response to its LAST
+			// event: every event on this single-key watch (no WithPrevKV)
+			// carries the full current value, so the last event IS the
+			// latest policy state; intermediates are irrelevant to a policy
+			// syncer (eventual consistency).
+			events := wresp.Events
+			if len(events) > maxWatchEventsPerResponse {
+				slog.Warn("etcd: watch response carries excessive events, applying only the latest state",
+					"key", s.key, "count", len(events), "max", maxWatchEventsPerResponse)
+				events = events[len(events)-1:]
+			}
+			for _, ev := range events {
 				// A watch event missing its key/value (nil event pointer
 				// or nil Kv — possible from a malformed/malicious etcd
 				// wire response, which clientv3 casts into *Event pointers
@@ -156,6 +220,14 @@ func (s *Syncer) watch(ctx context.Context) {
 				// in the watch loop).
 				if ev == nil || ev.Kv == nil {
 					slog.Warn("etcd: watch event missing key/value, skipping")
+					continue
+				}
+				// DELETE events carry no policy value (nil Kv.Value):
+				// applying one always failed the empty-policy check,
+				// churning a failed reload + error log per delete. Skip
+				// with a warning and keep the last applied policy (R61).
+				if ev.Type == mvccpb.DELETE {
+					slog.Warn("etcd: policy key deleted, keeping last applied policy", "key", s.key)
 					continue
 				}
 				// Enforce policy size limit BEFORE the string conversion —
@@ -168,6 +240,12 @@ func (s *Syncer) watch(ctx context.Context) {
 					continue
 				}
 				policy := string(ev.Kv.Value)
+				// Content dedupe (R61): an identical replay never reloads
+				// twice — see applyPolicy.
+				if !s.applyPolicy(policy) {
+					slog.Debug("etcd: policy unchanged, skipping reload", "key", s.key)
+					continue
+				}
 				slog.Info("etcd: policy updated", "key", s.key, "type", ev.Type)
 				// Wrap callback in panic recovery to prevent goroutine death
 				if err := safeOnUpdate(s.onUpdate, policy); err != nil {
