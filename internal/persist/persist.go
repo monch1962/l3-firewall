@@ -107,6 +107,24 @@ func LoadState(path string) (*EngineState, error) {
 	if strings.Contains(path, "..") {
 		return nil, fmt.Errorf("path traversal rejected: %s", path)
 	}
+	// Reject symlinks at directory components (R62 — the R45 walk
+	// mirrored from the writer): SaveState rejects directory symlinks via
+	// securepath.RejectSymlinkComponents and final-component symlinks via
+	// O_NOFOLLOW on the .tmp create (R42/R45), but the sibling READER of
+	// the same path followed symlinks at every component — R11.11 even
+	// enshrined the follow behavior as a passing test. An attacker with
+	// write access to the state directory (the R42/R45/R55 threat model)
+	// plants state.json -> /crafted/state.json; at startup engine.Run →
+	// restoreState → LoadState follows the link, and a target that parses
+	// as EngineState JSON injects attacker-chosen BlockStats into engine
+	// state — served on the default-unauthenticated /admin/block-stats
+	// (R46) and re-persisted by the next saveState tick (R59's documented
+	// impact chain, which the R59 ".." guard did not close). The walk
+	// tolerates non-existent components, so a first run with no state
+	// directory still returns (nil, nil) unchanged.
+	if err := securepath.RejectSymlinkComponents(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
 	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes.
 	// On Linux, O_NONBLOCK has no effect on regular file reads, so
 	// subsequent JSON decoding works normally. By opening first and
@@ -115,7 +133,12 @@ func LoadState(path string) (*EngineState, error) {
 	// the subsequent os.Open(path) — an attacker cannot replace the
 	// file between the type check and the open, because the type
 	// check operates on the already-opened file descriptor.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	// O_NOFOLLOW (R62) rejects a symlink planted at the FINAL path
+	// component — the R42 create-open guard mirrored to the reader:
+	// without it the open follows the link and f.Stat() reports the
+	// TARGET's mode, passing the regular-file check while reading
+	// attacker-chosen content (the R11.11 follow-symlink behavior).
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil

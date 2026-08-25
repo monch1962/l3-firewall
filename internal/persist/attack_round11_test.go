@@ -40,36 +40,40 @@ func TestAttack_SaveStateCrossDevice(t *testing.T) {
 	}
 }
 
-// ── R11.11: LoadState with symlink path ────────────────────────────
-// If the state file path is a symlink, LoadState follows it. An attacker
-// who can control the state file path could point it to sensitive files.
-// The content would be parsed as JSON and likely fail. But we verify
-// the behavior is safe (no crash, error returned).
+// ── R11.11 (converted R62): LoadState with symlink path ─────────────
+// R11 documented LoadState FOLLOWING a symlink as expected behavior — but
+// the symlink class was only discovered later (R42/R45) and applied to
+// the WRITERS (persist .tmp, capture rotation, audit append); the sibling
+// READER kept following links until R62. Since R62 the reader mirrors the
+// writer's posture (securepath walk + O_NOFOLLOW): an attacker with write
+// access to the state directory plants state.json -> crafted.json and a
+// followed link would inject the crafted EngineState into
+// engine.restoreState → /admin/block-stats → next saveState tick (R59
+// impact chain). Converted from enshrine-follow to assert-reject (R45
+// conversion pattern for tests asserting the pre-fix vulnerable behavior).
 func TestAttack_LoadStateSymlink(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create a valid state file
+	// Create a valid state file (what the operator's state looks like)
 	realPath := filepath.Join(dir, "real_state.json")
 	state := &EngineState{BlockStats: map[string]int64{"test": 1}}
 	if err := SaveState(realPath, state); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
 
-	// Create a symlink to the state file
+	// Create a symlink to the state file (what the attacker plants at the
+	// state path)
 	symlinkPath := filepath.Join(dir, "symlink_state.json")
 	if err := os.Symlink(realPath, symlinkPath); err != nil {
 		t.Skipf("cannot create symlink: %v", err)
 	}
 
-	// LoadState via symlink — should follow it
+	// LoadState via symlink — must be REJECTED, not followed.
 	loaded, err := LoadState(symlinkPath)
-	if err != nil {
-		t.Fatalf("LoadState via symlink: %v", err)
+	if err == nil {
+		t.Fatalf("LoadState followed the symlink and loaded %+v — symlink must be rejected", loaded)
 	}
-	if loaded.BlockStats["test"] != 1 {
-		t.Errorf("expected test=1, got test=%d", loaded.BlockStats["test"])
-	}
-	t.Log("LoadState via symlink correctly follows symlink and loads data")
+	t.Logf("LoadState correctly rejected the symlink: %v", err)
 }
 
 // ── R11.12: LoadState with path to a directory ─────────────────────
