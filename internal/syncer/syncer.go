@@ -182,19 +182,87 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	}
 }
 
+// minReloadInterval is the minimum time between onUpdate (policy
+// reload) invocations (R63). R61 bounded the per-response event COUNT
+// (maxWatchEventsPerResponse) and deduplicated identical content, but a
+// stream of DISTINCT policies — each under the collapse threshold —
+// still forced one full Rego recompile per event with no TIME-based
+// bound: a malicious or compromised etcd (or a MITM on the plaintext
+// connection, the R51/R52 threat model) sustains a CPU/allocation-churn
+// engine (the R6 "no rate limiting" finding, which R61 closed only for
+// the identical-replay dimension). Distinct policies arriving within
+// the interval are collapsed: only the LATEST is applied once the
+// interval elapses — every event on this single-key watch carries the
+// FULL current value, so the latest event IS the latest state (the same
+// latest-wins semantics R61.2 applies to oversized bursts). 100ms
+// matches threatintel.StartRefresher's minInterval posture; legitimate
+// policy updates are operator-paced and never hit the window.
+const minReloadInterval = 100 * time.Millisecond
+
 func (s *Syncer) watch(ctx context.Context) {
 	if s == nil || s.client == nil {
 		return
 	}
 	wch := s.client.Watch(ctx, s.key)
+
+	// Reload-rate-limiting state (R63): pendingPolicy holds the latest
+	// policy that passed dedupe but has not yet been applied (its
+	// minReloadInterval window has not elapsed); a timer armed while
+	// pending guarantees a collapsed policy is flushed even if the
+	// watch stream goes idle (otherwise the last update of a flood —
+	// or a second update within the window — could be dropped forever).
+	var lastReload time.Time
+	var pendingPolicy string
+	var pendingSet bool
+
+	flushPending := func() {
+		if !pendingSet {
+			return
+		}
+		if time.Since(lastReload) < minReloadInterval {
+			return
+		}
+		pendingSet = false
+		// lastReload advances on failure too: a policy that fails to
+		// compile must not re-trigger on every event of a flood (the
+		// R61 last-PROCESSED dedupe semantics).
+		if err := safeOnUpdate(s.onUpdate, pendingPolicy); err != nil {
+			slog.Warn("etcd: failed to apply policy update", "error", err)
+		} else {
+			slog.Info("etcd: policy applied", "key", s.key)
+		}
+		lastReload = time.Now()
+	}
+
 	for {
+		// While a policy is pending, arm a timer for its flush.
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if pendingSet {
+			d := minReloadInterval - time.Since(lastReload)
+			if d < time.Millisecond {
+				d = time.Millisecond
+			}
+			timer = time.NewTimer(d)
+			timerC = timer.C
+		}
 		select {
 		case <-s.stopCh:
+			if timer != nil {
+				timer.Stop()
+			}
 			return
 		case wresp, ok := <-wch:
+			if timer != nil {
+				timer.Stop()
+			}
 			if !ok {
 				return
 			}
+			// Apply any pending policy whose window has fully elapsed
+			// before processing the new batch, so ordering is preserved
+			// (older state first).
+			flushPending()
 			// Bound the event COUNT dimension (R58 rule): R13/R54 cap the
 			// per-event VALUE size, but a single response within clientv3's
 			// receive limit can carry ~400k minimal events, each triggering
@@ -246,12 +314,19 @@ func (s *Syncer) watch(ctx context.Context) {
 					slog.Debug("etcd: policy unchanged, skipping reload", "key", s.key)
 					continue
 				}
-				slog.Info("etcd: policy updated", "key", s.key, "type", ev.Type)
-				// Wrap callback in panic recovery to prevent goroutine death
-				if err := safeOnUpdate(s.onUpdate, policy); err != nil {
-					slog.Warn("etcd: failed to apply policy update", "error", err)
-				}
+				// Rate limit (R63): distinct policies arriving within
+				// minReloadInterval collapse to the LATEST — the pending
+				// policy is applied (and logged) once the interval elapses,
+				// by flushPending at the next batch boundary or the timer.
+				pendingPolicy = policy
+				pendingSet = true
 			}
+			// Flush at the end of the batch when the window allows —
+			// the common case: a single event long after the previous
+			// reload applies immediately.
+			flushPending()
+		case <-timerC:
+			flushPending()
 		}
 	}
 }

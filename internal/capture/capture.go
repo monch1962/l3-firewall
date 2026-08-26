@@ -23,6 +23,17 @@ import (
 // A 64KB cap covers all realistic packet sizes with margin.
 const maxPacketSize = 65536
 
+// maxCleanupEntries bounds the number of directory entries examined per
+// rotation (R63). The pre-R63 cleanup read the ENTIRE --pcap-dir via
+// os.ReadDir on the NFQUEUE hot path: an attacker with write access to
+// the pcap directory plants a large number of files, and every rotation
+// pays an O(N) allocation + syscall burst — recurring forever when the
+// planted names don't match the cleanup filter. Readdirnames in one
+// bounded chunk caps both memory and syscalls per rotation regardless
+// of directory contents; leftover stale matches are pruned on
+// subsequent rotations.
+const maxCleanupEntries = 4096
+
 // Config controls the pcap writer behaviour.
 type Config struct {
 	Dir        string // directory to write pcap files to (empty = disabled)
@@ -145,25 +156,44 @@ func (w *Writer) rotateLocked() error {
 }
 
 func (w *Writer) cleanupLocked() {
-	// List the configured directory directly with os.ReadDir instead of
-	// building a filepath.Glob pattern from the operator-influenced
-	// --pcap-dir: the old pattern (Join(cfg.Dir, "blocked_*.pcap"))
-	// interpreted glob metacharacters ([, *, ?) IN the dir component as
-	// pattern syntax — a dir like /base/pcaps[1] expanded to match the
-	// literal SIBLING /base/pcaps1, so cleanup (1) deleted blocked_*.pcap
-	// files the firewall never wrote (arbitrary deletion as its UID) and
-	// (2) never matched the firewall's own rotation files in the literal
-	// dir, silently defeating the MaxFiles cap (unbounded disk growth).
-	// ReadDir has no pattern interpretation: the match set is exactly the
-	// files in the configured directory (R60).
-	entries, err := os.ReadDir(w.cfg.Dir)
+	// Mechanism 1 — direct indexed removal of the firewall's own
+	// rotation files (O(1), no directory read): after creating rotation
+	// file N (blocked_%05d.pcap, strictly increasing), the file created
+	// MaxFiles rotations ago — index N-MaxFiles — is obsolete. The
+	// firewall knows the exact names it creates, so its own retention
+	// cap is enforced regardless of what else is in the directory (R63).
+	oldIdx := w.curFileN - w.cfg.MaxFiles
+	if oldIdx >= 1 {
+		name := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", oldIdx))
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			slog.Warn("pcap cleanup: remove failed", "file", name, "error", err)
+		}
+	}
+
+	// Mechanism 2 — BOUNDED directory scan for stale files the index
+	// cannot see: prior-run files with non-sequential names (e.g. old
+	// non-padded blocked_0.pcap formats, R9.14) or indices the current
+	// run never reaches. Read at most maxCleanupEntries names — the
+	// pre-R63 os.ReadDir read the ENTIRE --pcap-dir into memory on every
+	// rotation (which runs on the NFQUEUE hot path via WriteBlock), so
+	// an attacker with write access to the pcap directory planting N
+	// files (matching or not) forced an O(N) allocation + syscall burst
+	// per rotation — recurring forever when the planted names don't
+	// match the filter (R63). Names come back in sorted order, so the
+	// matches found are the oldest — exactly what the removal loop
+	// targets; leftovers beyond the window are pruned on later
+	// rotations. O_NONBLOCK (the R15 pattern) rejects a FIFO swapped in
+	// at the directory path instead of blocking the hot path.
+	f, err := os.OpenFile(w.cfg.Dir, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		slog.Warn("pcap cleanup: read dir error", "dir", w.cfg.Dir, "error", err)
 		return
 	}
+	names, _ := f.Readdirnames(maxCleanupEntries)
+	f.Close()
+
 	var matches []string
-	for _, e := range entries {
-		name := e.Name()
+	for _, name := range names {
 		if strings.HasPrefix(name, "blocked_") && strings.HasSuffix(name, ".pcap") {
 			matches = append(matches, filepath.Join(w.cfg.Dir, name))
 		}

@@ -204,30 +204,45 @@ func (l *Logger) rotateLocked() error {
 	return nil
 }
 
+// maxCleanupEntries bounds the number of directory entries examined per
+// rotation (R63). The pre-R63 cleanup read the ENTIRE log directory via
+// os.ReadDir: an attacker with write access to the log directory (the
+// DEFAULT /tmp/l3-firewall is attacker-writable) plants a large number
+// of files, and every rotation (audit.Log runs on the packet hot path)
+// pays an O(N) allocation + syscall burst. Readdirnames in one bounded
+// chunk caps both memory and syscalls per rotation regardless of
+// directory contents; leftover stale backups beyond the window are
+// pruned on subsequent rotations (each rotation removes the oldest
+// matches first, so cleanup converges).
+const maxCleanupEntries = 4096
+
 // cleanupLocked removes old rotated files, keeping only the newest MaxBackups.
 // Must be called with l.mu held.
 func (l *Logger) cleanupLocked() {
-	// List the log's directory directly with os.ReadDir instead of
-	// building a filepath.Glob pattern from the operator-influenced
-	// --audit-log-path: the old pattern (cfg.Path + ".*") interpreted glob
-	// metacharacters ([, *, ?) IN the path as pattern syntax — a path like
-	// /base/audit[1].log expanded to match the literal SIBLING
-	// /base/audit1.log.*, so cleanup (1) deleted backups the firewall never
-	// created (arbitrary deletion as its UID) and (2) never matched the
-	// firewall's own rotated files, silently defeating the MaxBackups cap
-	// (unbounded disk growth). ReadDir + base-prefix filter has no pattern
-	// interpretation (R60).
 	dir := filepath.Dir(l.cfg.Path)
 	base := filepath.Base(l.cfg.Path)
-	entries, err := os.ReadDir(dir)
+	prefix := base + "."
+
+	// Bounded scan (R63): open the directory and read at most
+	// maxCleanupEntries names — os.ReadDir (pre-R63) buffered every
+	// entry, so a directory stuffed with attacker files forced an O(N)
+	// allocation + scan on every rotation (hot-path DoS). Names are
+	// returned in sorted order, so the matches found are the OLDEST
+	// backups — exactly the ones the removal loop below targets.
+	// O_NONBLOCK (the R15 pattern): a FIFO swapped in at the directory
+	// path would block the plain open forever; with O_NONBLOCK it fails
+	// immediately with ENXIO. Directories are unaffected.
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return
 	}
+	names, _ := f.Readdirnames(maxCleanupEntries)
+	f.Close()
+
 	var matches []string
-	prefix := base + "."
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), prefix) {
-			matches = append(matches, filepath.Join(dir, e.Name()))
+	for _, name := range names {
+		if strings.HasPrefix(name, prefix) {
+			matches = append(matches, filepath.Join(dir, name))
 		}
 	}
 	if len(matches) <= l.cfg.MaxBackups {

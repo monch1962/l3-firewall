@@ -142,9 +142,15 @@ func TestAttack_WatchDeleteEventNoReload(t *testing.T) {
 	}
 }
 
-// ── R61.4: Regression — distinct policies still each apply ─────────────
-// The dedupe must only collapse IDENTICAL content: two genuinely different
-// policies in one response both reach onUpdate.
+// ── R61.4: Regression — distinct policies within one response collapse ─
+// The dedupe must not collapse IDENTICAL content, but since R63 the
+// reload RATE is bounded: two genuinely different policies arriving
+// within minReloadInterval (same batch, same watch response) collapse
+// to the LATEST — a policy syncer is eventual-consistency by nature and
+// every event carries the full value, so applying the newest state is
+// correct (the R61.2 latest-wins semantics applied to the ≤10000 case).
+// Distinct policies spaced beyond the interval each apply — covered by
+// TestAttack_WatchDistinctPoliciesSpacedStillEachApply (R63.2).
 func TestAttack_WatchDistinctPoliciesEachApply(t *testing.T) {
 	var callCount int32
 	s := &Syncer{
@@ -163,7 +169,7 @@ func TestAttack_WatchDistinctPoliciesEachApply(t *testing.T) {
 
 	runWatchToExit(t, s)
 
-	if c := atomic.LoadInt32(&callCount); c != 2 {
-		t.Errorf("distinct policies triggered %d reloads, want 2 (dedupe must not collapse different content)", c)
+	if c := atomic.LoadInt32(&callCount); c != 1 {
+		t.Errorf("distinct policies within the rate-limit window triggered %d reloads, want 1 (R63: reloads are time-bounded; only the latest state applies)", c)
 	}
 }
