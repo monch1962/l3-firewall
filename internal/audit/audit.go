@@ -176,6 +176,22 @@ func (l *Logger) Log(e AuditEvent) error {
 // rotateLocked renames the current file and opens a new one.
 // Must be called with l.mu held.
 func (l *Logger) rotateLocked() error {
+	// Re-verify the log directory on EVERY rotation (R64). R45's walk
+	// runs once at NewLogger, but rotations re-resolve the log path
+	// fresh (os.Rename, openAuditFile, cleanup scan): the DEFAULT dir
+	// /tmp/l3-firewall sits in world-writable /tmp, so any local user
+	// can rename it and plant a symlink to an arbitrary writable
+	// directory at any time during the run — the next rotation then
+	// renames/creates/appends/deletes audit.log* files in that directory
+	// as the firewall's UID, or (without a pre-placed victim file) fails
+	// the rename AFTER the real fd is closed and permanently destroys
+	// the audit trail. Mirror persist.SaveState's per-call check;
+	// rotation runs once per MaxSizeMB of events, not per event. Must
+	// run BEFORE l.file.Close() so a rejected path leaves the logger's
+	// real fd intact.
+	if err := securepath.RejectSymlinkComponents(filepath.Dir(l.cfg.Path)); err != nil {
+		return err
+	}
 	// Close current file
 	if err := l.file.Close(); err != nil {
 		return fmt.Errorf("closing current audit log: %w", err)

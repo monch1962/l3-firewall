@@ -114,6 +114,19 @@ func (w *Writer) WriteBlock(raw []byte) error {
 
 // rotateLocked closes the current file and opens a new one.
 func (w *Writer) rotateLocked() error {
+	// Re-verify the directory on EVERY rotation (R64). R45's walk runs
+	// once at NewWriter, but rotations re-resolve --pcap-dir fresh: an
+	// attacker with write access to the PARENT of the pcap dir (rename +
+	// symlink creation — strictly weaker than the R42/R45/R55 model of
+	// write access to the directory itself) can swap the real directory
+	// for a symlink to an arbitrary writable directory at any time during
+	// the run, and the next rotation creates/truncates blocked_%05d.pcap
+	// and deletes blocked_*.pcap through the link as the firewall's UID.
+	// Mirror persist.SaveState's per-call check; rotation runs once per
+	// MaxPackets blocked packets, not on the per-packet hot path.
+	if err := securepath.RejectSymlinkComponents(w.cfg.Dir); err != nil {
+		return err
+	}
 	if w.curFile != nil {
 		w.curFile.Close()
 		w.curFile = nil
