@@ -199,11 +199,21 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 // policy updates are operator-paced and never hit the window.
 const minReloadInterval = 100 * time.Millisecond
 
+// watchReconnectDelay bounds the watch-reconnect rate (R65). When the
+// watch stream keeps terminating (e.g., etcd permanently down, or a
+// hostile server canceling every watch), the reconnect loop must not
+// hot-spin: each cycle also pays a loadCurrent Get bounded by
+// s.timeout — which dominates when etcd is down — and this delay
+// floors the cycle when etcd answers instantly but the stream fails.
+// 100ms matches minReloadInterval's posture; a policy syncer is
+// eventual-consistency by nature, so one interval of sync downtime is
+// invisible.
+const watchReconnectDelay = 100 * time.Millisecond
+
 func (s *Syncer) watch(ctx context.Context) {
 	if s == nil || s.client == nil {
 		return
 	}
-	wch := s.client.Watch(ctx, s.key)
 
 	// Reload-rate-limiting state (R63): pendingPolicy holds the latest
 	// policy that passed dedupe but has not yet been applied (its
@@ -211,6 +221,8 @@ func (s *Syncer) watch(ctx context.Context) {
 	// pending guarantees a collapsed policy is flushed even if the
 	// watch stream goes idle (otherwise the last update of a flood —
 	// or a second update within the window — could be dropped forever).
+	// Lives OUTSIDE the reconnect loop (R65) so a watch restart does
+	// not reset the rate limiter.
 	var lastReload time.Time
 	var pendingPolicy string
 	var pendingSet bool
@@ -234,99 +246,149 @@ func (s *Syncer) watch(ctx context.Context) {
 		lastReload = time.Now()
 	}
 
+	// Outer loop: re-establish the watch whenever it terminates (R65).
 	for {
-		// While a policy is pending, arm a timer for its flush.
-		var timer *time.Timer
-		var timerC <-chan time.Time
-		if pendingSet {
-			d := minReloadInterval - time.Since(lastReload)
-			if d < time.Millisecond {
-				d = time.Millisecond
+		wch := s.client.Watch(ctx, s.key)
+		terminated := false
+		for !terminated {
+			// While a policy is pending, arm a timer for its flush.
+			var timer *time.Timer
+			var timerC <-chan time.Time
+			if pendingSet {
+				d := minReloadInterval - time.Since(lastReload)
+				if d < time.Millisecond {
+					d = time.Millisecond
+				}
+				timer = time.NewTimer(d)
+				timerC = timer.C
 			}
-			timer = time.NewTimer(d)
-			timerC = timer.C
+			select {
+			case <-s.stopCh:
+				if timer != nil {
+					timer.Stop()
+				}
+				return
+			case wresp, ok := <-wch:
+				if timer != nil {
+					timer.Stop()
+				}
+				// A terminated watch must be RE-ESTABLISHED, not treated
+				// as the end of sync (R65). clientv3 closes the watch
+				// channel — after delivering a final Canceled/errored
+				// WatchResponse (Err() non-nil) — when a watch cannot be
+				// resumed: server-side cancel (watch session expiry,
+				// server limits), mvcc compaction past the start revision
+				// (ErrCompacted), or an unrecoverable stream error.
+				// Pre-R65 the loop returned here permanently: under the
+				// R51/R52 threat model (malicious/compromised etcd or a
+				// MITM on the plaintext connection), one hostile frame
+				// that failed the stream silently killed the policy
+				// update plane forever — every subsequent legitimate
+				// policy push (including emergency block-everything
+				// policies during an incident) was dropped with no log
+				// line and no recovery. The reconnect path below resyncs
+				// via Get (compaction-proof) and re-establishes the watch.
+				if !ok || wresp.Err() != nil || wresp.Canceled {
+					switch {
+					case wresp.Err() != nil:
+						slog.Warn("etcd: watch terminated with error, reconnecting", "key", s.key, "error", wresp.Err())
+					case wresp.Canceled:
+						slog.Warn("etcd: watch canceled, reconnecting", "key", s.key)
+					default:
+						slog.Warn("etcd: watch channel closed, reconnecting", "key", s.key)
+					}
+					terminated = true
+					break
+				}
+				// Apply any pending policy whose window has fully elapsed
+				// before processing the new batch, so ordering is preserved
+				// (older state first).
+				flushPending()
+				// Bound the event COUNT dimension (R58 rule): R13/R54 cap the
+				// per-event VALUE size, but a single response within clientv3's
+				// receive limit can carry ~400k minimal events, each triggering
+				// a full policy recompile — unbounded CPU burn from one wire
+				// response (R61). Collapse an oversized response to its LAST
+				// event: every event on this single-key watch (no WithPrevKV)
+				// carries the full current value, so the last event IS the
+				// latest policy state; intermediates are irrelevant to a policy
+				// syncer (eventual consistency).
+				events := wresp.Events
+				if len(events) > maxWatchEventsPerResponse {
+					slog.Warn("etcd: watch response carries excessive events, applying only the latest state",
+						"key", s.key, "count", len(events), "max", maxWatchEventsPerResponse)
+					events = events[len(events)-1:]
+				}
+				for _, ev := range events {
+					// A watch event missing its key/value (nil event pointer
+					// or nil Kv — possible from a malformed/malicious etcd
+					// wire response, which clientv3 casts into *Event pointers
+					// without filtering) must not panic the watch goroutine:
+					// an unrecovered panic there crashes the whole process
+					// (R51 — the nil deref was the only unprotected statement
+					// in the watch loop).
+					if ev == nil || ev.Kv == nil {
+						slog.Warn("etcd: watch event missing key/value, skipping")
+						continue
+					}
+					// DELETE events carry no policy value (nil Kv.Value):
+					// applying one always failed the empty-policy check,
+					// churning a failed reload + error log per delete. Skip
+					// with a warning and keep the last applied policy (R61).
+					if ev.Type == mvccpb.DELETE {
+						slog.Warn("etcd: policy key deleted, keeping last applied policy", "key", s.key)
+						continue
+					}
+					// Enforce policy size limit BEFORE the string conversion —
+					// same check-before-allocate ordering as loadCurrent (R54):
+					// string() copies the value, so a post-copy check lets an
+					// oversized value allocate fully before being rejected.
+					if len(ev.Kv.Value) > maxPolicySize {
+						slog.Warn("etcd: policy update exceeds max size, skipping",
+							"key", s.key, "size", len(ev.Kv.Value), "max", maxPolicySize)
+						continue
+					}
+					policy := string(ev.Kv.Value)
+					// Content dedupe (R61): an identical replay never reloads
+					// twice — see applyPolicy.
+					if !s.applyPolicy(policy) {
+						slog.Debug("etcd: policy unchanged, skipping reload", "key", s.key)
+						continue
+					}
+					// Rate limit (R63): distinct policies arriving within
+					// minReloadInterval collapse to the LATEST — the pending
+					// policy is applied (and logged) once the interval elapses,
+					// by flushPending at the next batch boundary or the timer.
+					pendingPolicy = policy
+					pendingSet = true
+				}
+				// Flush at the end of the batch when the window allows —
+				// the common case: a single event long after the previous
+				// reload applies immediately.
+				flushPending()
+			case <-timerC:
+				flushPending()
+			}
 		}
+
+		// Reconnect (R65): the watch stream is gone. Resync the latest
+		// policy FIRST — events delivered between the failure and the
+		// re-established watch may have been lost, and a Get at the
+		// current revision has no historical dependency (it succeeds
+		// even when the watch died to compaction). loadCurrent also
+		// throttles the reconnect cycle when etcd is down (its Get is
+		// bounded by s.timeout), so the loop cannot hot-spin. If the
+		// context is done (shutdown), exit instead of reconnecting.
+		if ctx.Err() != nil {
+			return
+		}
+		s.loadCurrent(ctx)
 		select {
 		case <-s.stopCh:
-			if timer != nil {
-				timer.Stop()
-			}
 			return
-		case wresp, ok := <-wch:
-			if timer != nil {
-				timer.Stop()
-			}
-			if !ok {
-				return
-			}
-			// Apply any pending policy whose window has fully elapsed
-			// before processing the new batch, so ordering is preserved
-			// (older state first).
-			flushPending()
-			// Bound the event COUNT dimension (R58 rule): R13/R54 cap the
-			// per-event VALUE size, but a single response within clientv3's
-			// receive limit can carry ~400k minimal events, each triggering
-			// a full policy recompile — unbounded CPU burn from one wire
-			// response (R61). Collapse an oversized response to its LAST
-			// event: every event on this single-key watch (no WithPrevKV)
-			// carries the full current value, so the last event IS the
-			// latest policy state; intermediates are irrelevant to a policy
-			// syncer (eventual consistency).
-			events := wresp.Events
-			if len(events) > maxWatchEventsPerResponse {
-				slog.Warn("etcd: watch response carries excessive events, applying only the latest state",
-					"key", s.key, "count", len(events), "max", maxWatchEventsPerResponse)
-				events = events[len(events)-1:]
-			}
-			for _, ev := range events {
-				// A watch event missing its key/value (nil event pointer
-				// or nil Kv — possible from a malformed/malicious etcd
-				// wire response, which clientv3 casts into *Event pointers
-				// without filtering) must not panic the watch goroutine:
-				// an unrecovered panic there crashes the whole process
-				// (R51 — the nil deref was the only unprotected statement
-				// in the watch loop).
-				if ev == nil || ev.Kv == nil {
-					slog.Warn("etcd: watch event missing key/value, skipping")
-					continue
-				}
-				// DELETE events carry no policy value (nil Kv.Value):
-				// applying one always failed the empty-policy check,
-				// churning a failed reload + error log per delete. Skip
-				// with a warning and keep the last applied policy (R61).
-				if ev.Type == mvccpb.DELETE {
-					slog.Warn("etcd: policy key deleted, keeping last applied policy", "key", s.key)
-					continue
-				}
-				// Enforce policy size limit BEFORE the string conversion —
-				// same check-before-allocate ordering as loadCurrent (R54):
-				// string() copies the value, so a post-copy check lets an
-				// oversized value allocate fully before being rejected.
-				if len(ev.Kv.Value) > maxPolicySize {
-					slog.Warn("etcd: policy update exceeds max size, skipping",
-						"key", s.key, "size", len(ev.Kv.Value), "max", maxPolicySize)
-					continue
-				}
-				policy := string(ev.Kv.Value)
-				// Content dedupe (R61): an identical replay never reloads
-				// twice — see applyPolicy.
-				if !s.applyPolicy(policy) {
-					slog.Debug("etcd: policy unchanged, skipping reload", "key", s.key)
-					continue
-				}
-				// Rate limit (R63): distinct policies arriving within
-				// minReloadInterval collapse to the LATEST — the pending
-				// policy is applied (and logged) once the interval elapses,
-				// by flushPending at the next batch boundary or the timer.
-				pendingPolicy = policy
-				pendingSet = true
-			}
-			// Flush at the end of the batch when the window allows —
-			// the common case: a single event long after the previous
-			// reload applies immediately.
-			flushPending()
-		case <-timerC:
-			flushPending()
+		case <-ctx.Done():
+			return
+		case <-time.After(watchReconnectDelay):
 		}
 	}
 }

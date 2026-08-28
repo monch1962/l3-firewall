@@ -27,6 +27,7 @@ package syncer
 import (
 	"context"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -67,9 +68,13 @@ func (f *funcEtcdClient) Close() error {
 // distinctFloodEtcdClient delivers a single WatchResponse carrying a
 // caller-chosen list of DISTINCT policy events (all under the
 // maxWatchEventsPerResponse collapse threshold, so R61's count bound
-// does not apply), then closes the channel.
+// does not apply), then stays open (R65: the test terminates via
+// stopCh; a closed channel would trigger a reconnect that replays the
+// events and re-applies them).
 type distinctFloodEtcdClient struct {
-	events []*clientv3.Event
+	mu        sync.Mutex
+	delivered bool
+	events    []*clientv3.Event
 }
 
 func (f *distinctFloodEtcdClient) Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
@@ -77,9 +82,13 @@ func (f *distinctFloodEtcdClient) Get(ctx context.Context, key string, opts ...c
 }
 
 func (f *distinctFloodEtcdClient) Watch(ctx context.Context, key string, opts ...clientv3.OpOption) clientv3.WatchChan {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	ch := make(chan clientv3.WatchResponse, 1)
-	ch <- clientv3.WatchResponse{Events: f.events}
-	close(ch)
+	if !f.delivered {
+		f.delivered = true
+		ch <- clientv3.WatchResponse{Events: f.events}
+	}
 	return ch
 }
 
@@ -161,7 +170,9 @@ func TestAttack_WatchDistinctPoliciesSpacedStillEachApply(t *testing.T) {
 						Type: mvccpb.PUT,
 						Kv:   &mvccpb.KeyValue{Key: []byte("/test/key"), Value: []byte(sc.second)},
 					}}}
-					close(ch)
+					// No close (R65): a closed channel would trigger a
+					// reconnect that replays the events; the test ends
+					// via stopCh after the second event is processed.
 				}()
 				return ch
 			},

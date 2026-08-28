@@ -58,7 +58,10 @@ func TestAttack_WatchEventNilKvNoPanic(t *testing.T) {
 
 	// Run watch() in a goroutine with a recover so an unrecovered panic
 	// in production (whole-process crash) surfaces here as a panic we can
-	// observe without killing the test binary.
+	// observe without killing the test binary. The loop ends via stopCh:
+	// since R65 the loop survives channel closes (it reconnects — the
+	// stub replays the same malformed events, which are skipped again),
+	// so the test stops it explicitly after the first cycle.
 	panicked := make(chan bool, 1)
 	go func() {
 		defer func() {
@@ -67,6 +70,8 @@ func TestAttack_WatchEventNilKvNoPanic(t *testing.T) {
 		s.watch(ctx)
 	}()
 
+	time.Sleep(300 * time.Millisecond) // deliver the malformed response + a reconnect cycle
+	close(s.stopCh)
 	if p := <-panicked; p {
 		t.Error("watch goroutine panicked on nil-Kv event: a malformed etcd watch response crashes the firewall")
 	}
@@ -102,6 +107,9 @@ func TestAttack_WatchEventNilEventNoPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// The loop ends via stopCh (R65: the loop survives channel closes —
+	// it reconnects, and the stub replays the same nil-event batch, which
+	// is skipped again).
 	panicked := make(chan bool, 1)
 	go func() {
 		defer func() {
@@ -110,6 +118,8 @@ func TestAttack_WatchEventNilEventNoPanic(t *testing.T) {
 		s.watch(ctx)
 	}()
 
+	time.Sleep(300 * time.Millisecond) // deliver the malformed response + a reconnect cycle
+	close(s.stopCh)
 	if p := <-panicked; p {
 		t.Error("watch goroutine panicked on nil event: a malformed etcd watch response crashes the firewall")
 	}
@@ -166,5 +176,10 @@ func TestAttack_WatchEventNormalPutStillApplies(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("onUpdate not called for normal PUT event")
 	}
+	// The loop ends via stopCh (R65: the loop survives channel closes —
+	// it reconnects, and the stub replays the same PUT event, which the
+	// content dedupe skips). Stop it after the event is delivered.
+	time.Sleep(300 * time.Millisecond)
+	close(s.stopCh)
 	<-done
 }

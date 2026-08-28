@@ -3,6 +3,7 @@ package syncer
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,9 +37,12 @@ import (
 // instead of churning a failed reload each.
 
 // floodEtcdClient delivers a single WatchResponse carrying a caller-chosen
-// event list, then closes the channel (watch() exits after processing).
+// event list, then stays open (R65: a closed channel no longer ends the
+// watch loop — it triggers a reconnect; the test terminates via stopCh).
 type floodEtcdClient struct {
-	events []*clientv3.Event
+	mu        sync.Mutex
+	delivered bool
+	events    []*clientv3.Event
 }
 
 func (f *floodEtcdClient) Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
@@ -46,16 +50,24 @@ func (f *floodEtcdClient) Get(ctx context.Context, key string, opts ...clientv3.
 }
 
 func (f *floodEtcdClient) Watch(ctx context.Context, key string, opts ...clientv3.OpOption) clientv3.WatchChan {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	ch := make(chan clientv3.WatchResponse, 1)
-	ch <- clientv3.WatchResponse{Events: f.events}
-	close(ch)
+	if !f.delivered {
+		f.delivered = true
+		ch <- clientv3.WatchResponse{Events: f.events}
+	}
 	return ch
 }
 
 func (f *floodEtcdClient) Close() error { return nil }
 
-// runWatchToExit runs s.watch() to completion (the fake client closes its
-// channel after one response). Fails the test if the loop does not exit.
+// runWatchToExit runs s.watch() in a goroutine until stopCh is closed.
+// R61/R63 tests deliver a bounded set of events and then end the loop via
+// stopCh: since R65 the loop no longer exits when the watch channel closes
+// (a closed channel is a stream FAILURE that triggers a reconnect, not the
+// end of sync). The grace period lets the delivered events be processed
+// before the loop is stopped.
 func runWatchToExit(t *testing.T, s *Syncer) {
 	t.Helper()
 	done := make(chan struct{})
@@ -63,10 +75,12 @@ func runWatchToExit(t *testing.T, s *Syncer) {
 		s.watch(context.Background())
 		close(done)
 	}()
+	time.Sleep(500 * time.Millisecond) // process the delivered events
+	close(s.stopCh)
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("watch loop did not exit after channel close")
+		t.Fatal("watch loop did not exit after stopCh close")
 	}
 }
 
