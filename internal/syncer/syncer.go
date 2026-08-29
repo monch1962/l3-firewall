@@ -129,9 +129,9 @@ func (s *Syncer) applyPolicy(policy string) bool {
 	return true
 }
 
-func (s *Syncer) loadCurrent(ctx context.Context) {
+func (s *Syncer) loadCurrent(ctx context.Context) string {
 	if s == nil || s.client == nil {
-		return
+		return ""
 	}
 	// Bound the Get with the config timeout: main() calls Start with
 	// context.Background() (no deadline), and a raw Get on that context
@@ -144,7 +144,7 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	resp, err := s.client.Get(getCtx, s.key)
 	if err != nil {
 		slog.Warn("etcd: failed to get initial policy", "key", s.key, "error", err)
-		return
+		return ""
 	}
 	// A Get response missing its kv entirely (nil response) or whose first
 	// element is a nil KeyValue pointer must not panic loadCurrent: it runs
@@ -154,7 +154,7 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	// initial-load path, which dereferenced resp.Kvs[0].Value unguarded).
 	if resp == nil || len(resp.Kvs) == 0 || resp.Kvs[0] == nil {
 		slog.Warn("etcd: initial Get response missing key/value, skipping")
-		return
+		return ""
 	}
 	// Enforce policy size limit BEFORE converting the value to a string:
 	// the conversion copies the full value into memory, so a post-copy
@@ -165,14 +165,14 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	if len(resp.Kvs[0].Value) > maxPolicySize {
 		slog.Warn("etcd: initial policy exceeds max size, skipping",
 			"key", s.key, "size", len(resp.Kvs[0].Value), "max", maxPolicySize)
-		return
+		return ""
 	}
 	policy := string(resp.Kvs[0].Value)
 	// Content dedupe (R61): the same policy is already applied — a reload
 	// would recompile identical content for nothing.
 	if !s.applyPolicy(policy) {
 		slog.Debug("etcd: initial policy unchanged, skipping", "key", s.key)
-		return
+		return policy
 	}
 	// Wrap callback in panic recovery to prevent goroutine death
 	if err := safeOnUpdate(s.onUpdate, policy); err != nil {
@@ -180,6 +180,7 @@ func (s *Syncer) loadCurrent(ctx context.Context) {
 	} else {
 		slog.Info("etcd: loaded policy from", "key", s.key)
 	}
+	return policy
 }
 
 // minReloadInterval is the minimum time between onUpdate (policy
@@ -382,7 +383,29 @@ func (s *Syncer) watch(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		s.loadCurrent(ctx)
+		current := s.loadCurrent(ctx)
+		// R66: a pending policy that the resync SUPERSEDED must be dropped,
+		// not flushed. R63 queues distinct policies in the pending slot when
+		// they arrive within minReloadInterval of the last reload; the slot
+		// lives OUTSIDE the reconnect loop (R65), so it survives a watch
+		// restart. If the resync Get read a DIFFERENT policy than the queued
+		// one, that Get ran at a revision >= the pending event's revision —
+		// the resync value is the authoritative, newer state — and flushing
+		// the older pending policy after the resync REGRESSES the firewall to
+		// a stale policy (e.g. reverting an emergency block-everything policy
+		// pushed during an incident — the exact scenario R65 exists to
+		// protect). Because the resync also advanced lastPolicy past the
+		// pending content, a replay of the newer policy is dedupe-skipped and
+		// the firewall is STUCK on the stale policy until the next distinct
+		// update. When the resync read the SAME content (pending == current)
+		// the slot is kept: the pending flush performs the single apply. When
+		// the resync read NOTHING (etcd down), the pending policy is the
+		// best-known state and is kept as before.
+		if current != "" && pendingSet && pendingPolicy != current {
+			slog.Warn("etcd: resync superseded queued policy, dropping stale pending",
+				"key", s.key, "queued", pendingPolicy, "current", current)
+			pendingSet = false
+		}
 		select {
 		case <-s.stopCh:
 			return
