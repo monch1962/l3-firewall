@@ -29,6 +29,23 @@ type EmbedConfig struct {
 // EmbeddedEvaluator evaluates Rego policies in-process using the OPA Go library.
 // Supports hot-reload via Load() and a reload-notification channel.
 type EmbeddedEvaluator struct {
+	// loadMu serializes Load calls (R67). Two independent policy sources
+	// call Load concurrently in the deployed binary — the etcd syncer's
+	// watch goroutine and the --opa-embed file hot-reload watcher (both
+	// always wired when --etcd-endpoints is configured, since --opa-embed
+	// is mandatory). Load swaps compiler/policy in one critical section,
+	// then rebuild() RE-READS e.compiler and swaps e.prepared in a second
+	// one; without serialization an OLDER policy whose slower rebuild
+	// lands its prepared swap LAST silently supersedes a NEWER policy
+	// whose Load completed first — the newer Load returns nil error but
+	// never governs, the R66 stale-policy-regression class at the
+	// evaluator boundary (reverting an operator's emergency policy). A
+	// dedicated mutex (NOT mu): mu is shared with Evaluate, so holding it
+	// across a multi-hundred-ms compile would stall the packet hot path —
+	// the R61/R63 DoS the out-of-lock compile exists to prevent. With
+	// loadMu, loads serialize by issue order (last-issued governs) while
+	// Evaluate stays lock-free behind the short field-swap section.
+	loadMu      sync.Mutex
 	mu          sync.RWMutex
 	prepared    *rego.PreparedEvalQuery
 	compiler    *ast.Compiler
@@ -78,6 +95,14 @@ func (e *EmbeddedEvaluator) Load(policy string) error {
 	if policy == "" {
 		return fmt.Errorf("policy source is empty")
 	}
+
+	// Serialize concurrent loads by issue order (R67): the last-issued
+	// Load must be the one that governs once it completes. Without this,
+	// an overlapping older Load whose slower rebuild finishes last
+	// supersedes the newer policy (see loadMu above). loadMu, not mu —
+	// Evaluate must never block behind a compile.
+	e.loadMu.Lock()
+	defer e.loadMu.Unlock()
 
 	compiler, err := ast.CompileModules(map[string]string{
 		"policy.rego": policy,
