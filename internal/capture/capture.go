@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -192,11 +193,15 @@ func (w *Writer) cleanupLocked() {
 	// an attacker with write access to the pcap directory planting N
 	// files (matching or not) forced an O(N) allocation + syscall burst
 	// per rotation — recurring forever when the planted names don't
-	// match the filter (R63). Names come back in sorted order, so the
-	// matches found are the oldest — exactly what the removal loop
-	// targets; leftovers beyond the window are pruned on later
-	// rotations. O_NONBLOCK (the R15 pattern) rejects a FIFO swapped in
-	// at the directory path instead of blocking the hot path.
+	// match the filter (R63). Names are then SORTED before removal (R69):
+	// Readdirnames returns directory order — reverse-creation on tmpfs,
+	// hash order on ext4 — NOT sorted order, and the pre-R69 removal loop
+	// deleted the newest files including the firewall's own open rotation
+	// file; after the R69 sort the matches removed are the oldest —
+	// exactly what the removal loop targets; leftovers beyond the window
+	// are pruned on later rotations. O_NONBLOCK (the R15 pattern) rejects
+	// a FIFO swapped in at the directory path instead of blocking the hot
+	// path.
 	f, err := os.OpenFile(w.cfg.Dir, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		slog.Warn("pcap cleanup: read dir error", "dir", w.cfg.Dir, "error", err)
@@ -214,8 +219,37 @@ func (w *Writer) cleanupLocked() {
 	if len(matches) <= w.cfg.MaxFiles {
 		return
 	}
-	for i := 0; i < len(matches)-w.cfg.MaxFiles; i++ {
+	// Sort BEFORE removal (R69): Readdirnames returns DIRECTORY order —
+	// reverse-creation on tmpfs, hash order on ext4 — NOT sorted order as
+	// the pre-R69 comment claimed. The removal loop deletes the first
+	// (len(matches)-MaxFiles) entries of the slice; on unsorted order that
+	// front is the NEWEST files, so the firewall unlinked its own current
+	// open rotation file (silent capture-evidence loss: writes land in an
+	// orphaned inode) and deleted newer captures while keeping older stale
+	// ones (retention inverted). Zero-padded blocked_%05d.pcap names sort
+	// lexicographically = numerically, so sorted matches are oldest-first
+	// and the removal targets exactly the stale files the scan exists for.
+	sort.Strings(matches)
+	// Never remove the file this rotation JUST opened (index curFileN): it
+	// is definitionally not stale — it is the current forensic capture
+	// receiving WriteBlock writes. Mechanism 1 (indexed removal) already
+	// enforces the own-file retention cap by index; mechanism 2 exists to
+	// prune stale prior-run files the index cannot see. Without this skip,
+	// a directory in reverse-creation order (tmpfs) puts the current file
+	// FIRST in the sorted-by-creation slice and it is deleted by its own
+	// rotation's cleanup (R69). The skip is cheap (strings compare) and
+	// runs once per rotation, not per packet. The `removed` counter keeps
+	// the total at len(matches)-MaxFiles even when the current file falls
+	// inside the removal window — the retention cap is a hard contract
+	// (R9.14: at most MaxFiles files remain after cleanup).
+	current := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", w.curFileN))
+	removed := 0
+	for i := 0; i < len(matches) && removed < len(matches)-w.cfg.MaxFiles; i++ {
+		if matches[i] == current {
+			continue
+		}
 		os.Remove(matches[i])
+		removed++
 	}
 }
 
