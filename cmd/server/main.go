@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +35,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/metrics"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
+	"github.com/monch1962/l3-firewall/internal/securepath"
 	"github.com/monch1962/l3-firewall/internal/syncer"
 	"github.com/monch1962/l3-firewall/internal/threatintel"
 )
@@ -52,9 +54,32 @@ const maxPolicyFileSize = 10 * 1024 * 1024
 //     attacker cannot swap a regular file for a FIFO between the check
 //     and the open),
 //   - enforces maxPolicyFileSize via fstat AND io.LimitReader, so a
-//     multi-GB policy file cannot exhaust memory.
+//     multi-GB policy file cannot exhaust memory,
+//   - rejects symlinks at the final path component (O_NOFOLLOW) and at
+//     every directory component (securepath walk) — the R62 reader-side
+//     guard applied to persist.LoadState, mirrored onto the policy file
+//     reader. The policy file's content becomes the ENFORCED firewall
+//     policy (opa.NewEmbedded at startup, eval.Load on every 5-second
+//     hot-reload poll), so an attacker with write access to the policy
+//     directory who plants `l3.rego -> /attacker/evil.rego` must not be
+//     able to swap in attacker-chosen policy (fail-open Rego = blocking
+//     silently disabled) or turn the reload loop into a read oracle on
+//     arbitrary files readable by the firewall's UID. R42 hardened this
+//     read against FIFOs/oversize but never applied the R62 symlink
+//     class; O_NOFOLLOW rejects the planted final-component link with
+//     ELOOP, and the walk closes the directory-component variant (a
+//     symlinked parent resolves before the open, bypassing O_NOFOLLOW).
+//     The walk tolerates non-existent components and runs per call, so
+//     a path whose parent does not exist yet still returns a clean open
+//     error, and the hot-reload loop recovers once the file is real.
 func readPolicyFile(path string) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	// Reject symlinks at directory components (R62/R70): O_NOFOLLOW on
+	// the open below only protects the FINAL component, but the kernel
+	// resolves intermediate directory symlinks before the open.
+	if err := securepath.RejectSymlinkComponents(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("opening policy file: %w", err)
 	}
