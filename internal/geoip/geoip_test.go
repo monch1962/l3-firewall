@@ -1,7 +1,6 @@
 package geoip
 
 import (
-	"net"
 	"testing"
 )
 
@@ -54,19 +53,21 @@ func TestLookupCountryNoDB(t *testing.T) {
 	}
 }
 
-// TestLookupCountryWithRealFile tests with an actual MMDB file if available.
-// This is a manual/integration test that's skipped without a test database.
+// TestLookupCountryWithRealFile verifies lookup against the committed
+// minimal country database (testdata/country-test.mmdb — 8.8.8.0/24 → US,
+// 1.1.1.0/24 → GB, generated with the maxmind/mmdbwriter tool and added
+// in R71 as the crafted-database asset for the symlink attack tests).
 func TestLookupCountryWithRealFile(t *testing.T) {
-	// Skip if no test database is available
-	r, err := NewReader("testdata/GeoIP2-Country-Test.mmdb")
+	r, err := NewReader("testdata/country-test.mmdb")
 	if err != nil {
-		t.Skipf("test database not available: %v", err)
+		t.Fatalf("open committed test database: %v", err)
 	}
 	defer r.Close()
 
-	// Test a known IP in the test database
-	code := r.LookupCountry(net.IP{81, 2, 69, 160}.String())
-	if code == "" {
-		t.Log("no country found for test IP (database may be minimal)")
+	if code := r.LookupCountry("8.8.8.8"); code != "US" {
+		t.Errorf("LookupCountry(8.8.8.8) = %q, want US", code)
+	}
+	if code := r.LookupCountry("1.1.1.1"); code != "GB" {
+		t.Errorf("LookupCountry(1.1.1.1) = %q, want GB", code)
 	}
 }

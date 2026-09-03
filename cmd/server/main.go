@@ -345,28 +345,60 @@ func main() {
 	slog.Info("shutdown complete")
 }
 
-// watchPolicyFile polls the OPA policy file for modifications every 5 seconds
-// and triggers a hot-reload when the file changes.
+// policyReloader abstracts the hot-reload target so the poll decision
+// logic is testable without a real OPA evaluator (R71). *opa.EmbeddedEvaluator
+// satisfies it implicitly (Load(policy string) error).
+type policyReloader interface {
+	Load(policy string) error
+}
+
+// pollPolicyFile performs ONE hot-reload poll decision: stats the policy
+// file, and when the entry mtime advanced past *lastMod, reads the file
+// (readPolicyFile — FIFO/oversize/symlink hardened, R42/R70) and reloads
+// the evaluator. Returns the duration to sleep before the next poll.
+//
+// lastMod is advanced ONLY when the reload succeeded (or when nothing
+// changed). A REJECTED read or failed load must not advance it (R71):
+// os.Stat follows a planted symlink and returns the TARGET's mtime, so a
+// pre-R71 loop that advanced lastMod unconditionally let an attacker
+// poison the comparator with a far-future target mtime — the rejected
+// poll recorded it, and every subsequent legitimate policy edit (whose
+// mtime is the present, not the future) failed the `modTime.After(lastMod)`
+// test: the hot-reload plane stayed dead until the wall clock passed the
+// poisoned value. An operator's emergency block-everything policy written
+// during an incident would silently never be enforced — the R65/R66/R67
+// stale-policy outcome on the --opa-embed file path. When lastMod is not
+// advanced, the next poll re-attempts the read, so the loop recovers the
+// moment the entry is real again (the 30s return on failure bounds the
+// error-log rate to one line per 30s while the entry stays rejected).
+func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.Duration {
+	fi, err := os.Stat(path)
+	if err != nil {
+		slog.Error("hot-reload: failed to stat policy file", "path", path, "error", err)
+		return 30 * time.Second
+	}
+	modTime := fi.ModTime()
+	if !lastMod.IsZero() && modTime.After(*lastMod) {
+		data, err := readPolicyFile(path)
+		if err != nil {
+			slog.Error("hot-reload: failed to read policy file", "path", path, "error", err)
+			return 30 * time.Second
+		}
+		if err := eval.Load(string(data)); err != nil {
+			slog.Error("hot-reload: failed to reload policy", "path", path, "error", err)
+			return 30 * time.Second
+		}
+	}
+	*lastMod = modTime
+	return 5 * time.Second
+}
+
+// watchPolicyFile polls the OPA policy file for modifications every 5
+// seconds and triggers a hot-reload when the file changes.
 func watchPolicyFile(path string, eval *opa.EmbeddedEvaluator) {
 	var lastMod time.Time
 	for {
-		fi, err := os.Stat(path)
-		if err != nil {
-			slog.Error("hot-reload: failed to stat policy file", "path", path, "error", err)
-			time.Sleep(30 * time.Second)
-			continue
-		}
-		modTime := fi.ModTime()
-		if !lastMod.IsZero() && modTime.After(lastMod) {
-			data, err := readPolicyFile(path)
-			if err != nil {
-				slog.Error("hot-reload: failed to read policy file", "path", path, "error", err)
-			} else if err := eval.Load(string(data)); err != nil {
-				slog.Error("hot-reload: failed to reload policy", "path", path, "error", err)
-			}
-		}
-		lastMod = modTime
-		time.Sleep(5 * time.Second)
+		time.Sleep(pollPolicyFile(path, eval, &lastMod))
 	}
 }
 

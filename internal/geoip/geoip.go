@@ -8,9 +8,11 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/monch1962/l3-firewall/internal/securepath"
 	"github.com/oschwald/maxminddb-golang/v2"
 )
 
@@ -42,15 +44,32 @@ type Reader struct {
 // and the size is capped before the database is loaded into memory.
 // OpenBytes is used on the verified fd content so the library never
 // re-opens the path itself.
+//
+// Hardened R71: O_NOFOLLOW on the open rejects a symlink planted at the
+// FINAL path component, and the securepath walk rejects symlinks at every
+// DIRECTORY component — the R62/R70 reader-side guard, applied to the
+// fourth production file reader (persist.LoadState R62, readPolicyFile
+// R70, the audit/capture/persist writers R43/R45). A crafted .mmdb loaded
+// through a planted link maps attacker IPs to attacker-chosen countries,
+// and engine's per-packet LookupCountry feeds those into OPA input
+// (input.geo.src_country/dst_country) — flipping the country-based deny
+// rules in the deny-override policy (opa-policies/l3.rego RULE 16).
 func NewReader(path string) (*Reader, error) {
 	if path == "" {
 		return nil, nil
 	}
-	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes.
+	// Reject symlinks at directory components (R62/R71): O_NOFOLLOW on
+	// the open below only protects the FINAL component, but the kernel
+	// resolves intermediate directory symlinks before the open.
+	if err := securepath.RejectSymlinkComponents(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
+	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes, and
+	// O_NOFOLLOW to reject a symlink at the final path component.
 	// On Linux, O_NONBLOCK has no effect on regular file reads.
 	// Checking the type and size on the already-opened fd eliminates the
 	// TOCTOU race between a path-based Stat check and a later Open.
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("opening GeoIP database %s: %w", path, err)
 	}
