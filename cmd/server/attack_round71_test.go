@@ -56,7 +56,11 @@ func TestAttack_HotReloadRejectedReadDoesNotPoisonLastMod(t *testing.T) {
 	path := filepath.Join(dir, "l3.rego")
 
 	// Phase 1: a legitimate policy P0 is in place and polled once
-	// (baseline — no load on the first poll, lastMod = P0's mtime).
+	// (baseline). Under the R72 contract the FIRST poll (zero lastMod)
+	// also attempts the hardened read before recording — the read-
+	// verified record — so P0 is loaded exactly once here (content
+	// identical to the startup load this test simulates), and
+	// lastMod = P0's mtime.
 	p0 := "package firewall\nallow := true\n"
 	writePolicyFile(t, path, p0)
 	t0 := time.Now().Add(-2 * time.Second)
@@ -67,8 +71,8 @@ func TestAttack_HotReloadRejectedReadDoesNotPoisonLastMod(t *testing.T) {
 	reloader := &fakePolicyReloader{}
 	var lastMod time.Time
 	pollPolicyFile(path, reloader, &lastMod)
-	if len(reloader.policies) != 0 {
-		t.Fatalf("baseline poll loaded %d policies, want 0", len(reloader.policies))
+	if len(reloader.policies) != 1 || reloader.policies[0] != p0 {
+		t.Fatalf("baseline poll loaded %d policies %q, want exactly [P0] once (R72: the first poll verifies the entry by reading it before recording lastMod)", len(reloader.policies), reloader.policies)
 	}
 
 	// Phase 2: the attacker plants a symlink whose TARGET carries a
@@ -91,8 +95,8 @@ func TestAttack_HotReloadRejectedReadDoesNotPoisonLastMod(t *testing.T) {
 		t.Skipf("cannot create symlink: %v", err)
 	}
 	pollPolicyFile(path, reloader, &lastMod)
-	if len(reloader.policies) != 0 {
-		t.Fatalf("symlink content reached the reloader (%d policies) — the R70 read guard is broken", len(reloader.policies))
+	if len(reloader.policies) != 1 {
+		t.Fatalf("symlink episode added %d policies (total %d, want 1 = P0 only) — symlink content reached the reloader or the R70 read guard is broken", len(reloader.policies)-1, len(reloader.policies))
 	}
 
 	// Phase 3: the attacker removes the symlink; the operator writes the
@@ -152,8 +156,8 @@ func TestAttack_HotReloadRejectsThenRecovers(t *testing.T) {
 		t.Skipf("cannot create symlink: %v", err)
 	}
 	pollPolicyFile(path, reloader, &lastMod)
-	if len(reloader.policies) != 0 {
-		t.Fatalf("symlink content reached the reloader")
+	if len(reloader.policies) != 1 {
+		t.Fatalf("symlink episode added %d policies (total %d, want 1 = the P0 baseline from the first poll) — symlink content reached the reloader", len(reloader.policies)-1, len(reloader.policies))
 	}
 
 	// Attacker removes the link; operator writes a newer real policy.

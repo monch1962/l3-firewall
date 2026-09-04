@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -242,9 +243,7 @@ func (l *Logger) cleanupLocked() {
 	// Bounded scan (R63): open the directory and read at most
 	// maxCleanupEntries names — os.ReadDir (pre-R63) buffered every
 	// entry, so a directory stuffed with attacker files forced an O(N)
-	// allocation + scan on every rotation (hot-path DoS). Names are
-	// returned in sorted order, so the matches found are the OLDEST
-	// backups — exactly the ones the removal loop below targets.
+	// allocation + scan on every rotation (hot-path DoS).
 	// O_NONBLOCK (the R15 pattern): a FIFO swapped in at the directory
 	// path would block the plain open forever; with O_NONBLOCK it fails
 	// immediately with ENXIO. Directories are unaffected.
@@ -265,8 +264,24 @@ func (l *Logger) cleanupLocked() {
 		return
 	}
 
-	// Sort by name (timestamp suffix makes them naturally sortable)
-	// Remove oldest (first in alphabetically sorted list) until we're under limit
+	// Sort BEFORE removal (R72): Readdirnames returns DIRECTORY order —
+	// reverse-creation on tmpfs, hash order on ext4 — NOT sorted order
+	// as the pre-R72 comment claimed (the R69 finding, which fixed the
+	// identical unsorted-front removal in capture.cleanupLocked but was
+	// never applied to the audit path). rotateLocked renames the current
+	// audit.log to a fresh timestamped backup BEFORE cleanup runs, so on
+	// reverse-creation order the fresh backup is matches[0] and the
+	// pre-R72 removal loop deleted it first — the newest rotated audit
+	// history (the only copy of the events that triggered the rotation)
+	// was destroyed at its moment of creation, every rotation, while the
+	// OLDEST backups survived forever (retention inverted and frozen).
+	// The rotated names (audit.log.<UTC yyyymmddThhmmssZ>) are
+	// fixed-width and sort lexicographically = chronologically, so after
+	// sorting the removal targets exactly the oldest backups and the
+	// newest MaxBackups (including the just-rotated file) survive — the
+	// documented "keep only MaxBackups most recent" contract.
+	sort.Strings(matches)
+	// Remove oldest (first in sorted list) until we're under limit
 	toRemove := len(matches) - l.cfg.MaxBackups
 	for i := 0; i < toRemove && i < len(matches); i++ {
 		os.Remove(matches[i])

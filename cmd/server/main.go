@@ -353,9 +353,11 @@ type policyReloader interface {
 }
 
 // pollPolicyFile performs ONE hot-reload poll decision: stats the policy
-// file, and when the entry mtime advanced past *lastMod, reads the file
-// (readPolicyFile — FIFO/oversize/symlink hardened, R42/R70) and reloads
-// the evaluator. Returns the duration to sleep before the next poll.
+// file, and when the entry mtime advanced past *lastMod — OR when
+// *lastMod is zero (the first poll after watchPolicyFile starts, R72) —
+// reads the file (readPolicyFile — FIFO/oversize/symlink hardened,
+// R42/R70) and reloads the evaluator. Returns the duration to sleep
+// before the next poll.
 //
 // lastMod is advanced ONLY when the reload succeeded (or when nothing
 // changed). A REJECTED read or failed load must not advance it (R71):
@@ -367,10 +369,31 @@ type policyReloader interface {
 // test: the hot-reload plane stayed dead until the wall clock passed the
 // poisoned value. An operator's emergency block-everything policy written
 // during an incident would silently never be enforced — the R65/R66/R67
-// stale-policy outcome on the --opa-embed file path. When lastMod is not
-// advanced, the next poll re-attempts the read, so the loop recovers the
-// moment the entry is real again (the 30s return on failure bounds the
-// error-log rate to one line per 30s while the entry stays rejected).
+// stale-policy outcome on the --opa-embed file path.
+//
+// R72 closed the SAME poisoning on the one path R71 left unguarded: the
+// zero-lastMod FIRST poll short-circuited the read entirely
+// (`!lastMod.IsZero() &&` evaluated false) and recorded the stat-derived
+// mtime unconditionally — an attacker who plants the symlink during the
+// startup window between main()'s initial readPolicyFile and the watcher
+// goroutine's first poll (a window that includes the etcd syncer dial
+// and synchronous threat-intel feed fetches — unbounded-latency
+// operations) poisons the comparator with NO rejected read, no error
+// log, and no backoff: the record self-sustains (each poll's stat of the
+// still-planted link reports the same future mtime, never After itself).
+// Treating a zero lastMod as "changed" forces the hardened read before
+// any record: the planted link is rejected with ELOOP, lastMod stays
+// zero, and the poll returns the 30s backoff — the loop re-attempts and
+// recovers the moment a real entry appears (loading its content, so no
+// second operator edit is required). On a normal restart the first poll
+// re-reads the content main() already loaded and reloads it once (a
+// single extra compile per process start) — the price of a read-verified
+// record.
+//
+// When lastMod is not advanced, the next poll re-attempts the read, so
+// the loop recovers the moment the entry is real again (the 30s return
+// on failure bounds the error-log rate to one line per 30s while the
+// entry stays rejected).
 func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.Duration {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -378,7 +401,7 @@ func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.D
 		return 30 * time.Second
 	}
 	modTime := fi.ModTime()
-	if !lastMod.IsZero() && modTime.After(*lastMod) {
+	if lastMod.IsZero() || modTime.After(*lastMod) {
 		data, err := readPolicyFile(path)
 		if err != nil {
 			slog.Error("hot-reload: failed to read policy file", "path", path, "error", err)
