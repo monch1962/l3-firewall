@@ -60,7 +60,7 @@ func TestAttack_ReadPolicyFileRejectsSymlink(t *testing.T) {
 		t.Skipf("cannot create symlink: %v", err)
 	}
 
-	data, err := readPolicyFile(link)
+	data, _, err := readPolicyFile(link)
 	if err == nil {
 		t.Fatalf("readPolicyFile FOLLOWED the planted symlink and returned %d bytes of attacker policy (%q) — a symlink at the policy path must be rejected (R62 reader class)", len(data), string(data))
 	}
@@ -86,7 +86,7 @@ func TestAttack_ReadPolicyFileSymlinkDoesNotSupplyPolicy(t *testing.T) {
 		t.Skipf("cannot create symlink: %v", err)
 	}
 
-	data, err := readPolicyFile(link)
+	data, _, err := readPolicyFile(link)
 	if err != nil {
 		t.Logf("symlinked policy correctly rejected: %v", err)
 		return
@@ -108,7 +108,7 @@ func TestAttack_ReadPolicyFileRegularFileStillReads(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	data, err := readPolicyFile(path)
+	data, _, err := readPolicyFile(path)
 	if err != nil {
 		t.Fatalf("readPolicyFile failed on regular file: %v", err)
 	}
@@ -128,7 +128,7 @@ func TestAttack_ReadPolicyFileRegularFileStillReads(t *testing.T) {
 	if err := os.Symlink(crafted, path); err != nil {
 		t.Skipf("cannot create symlink: %v", err)
 	}
-	if _, err := readPolicyFile(path); err == nil {
+	if _, _, err := readPolicyFile(path); err == nil {
 		t.Fatalf("readPolicyFile accepted the planted symlink phase")
 	}
 	if err := os.Remove(path); err != nil {
@@ -137,7 +137,7 @@ func TestAttack_ReadPolicyFileRegularFileStillReads(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		t.Fatalf("WriteFile restore: %v", err)
 	}
-	data, err = readPolicyFile(path)
+	data, _, err = readPolicyFile(path)
 	if err != nil {
 		t.Fatalf("readPolicyFile failed after symlink removal (recovery broken): %v", err)
 	}

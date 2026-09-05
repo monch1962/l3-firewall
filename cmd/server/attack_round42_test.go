@@ -71,7 +71,7 @@ func TestAttack_ReadPolicyFileRejectsFIFO(t *testing.T) {
 	var data []byte
 	var readErr error
 	go func() {
-		data, readErr = readPolicyFile(fifoPath)
+		data, _, readErr = readPolicyFile(fifoPath)
 		close(done)
 	}()
 
@@ -105,7 +105,7 @@ func TestAttack_ReadPolicyFileRejectsOversize(t *testing.T) {
 	}
 	f.Close()
 
-	data, err := readPolicyFile(bigPath)
+	data, _, err := readPolicyFile(bigPath)
 	if err == nil {
 		t.Errorf("readPolicyFile accepted oversized policy file (len=%d, cap=%d)", len(data), maxPolicyFileSize)
 	} else {
@@ -124,7 +124,7 @@ func TestAttack_ReadPolicyFileReadsRegularFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := readPolicyFile(policyPath)
+	data, _, err := readPolicyFile(policyPath)
 	if err != nil {
 		t.Fatalf("readPolicyFile failed on regular file: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestAttack_ReadPolicyFileLimitReaderBounded(t *testing.T) {
 	}
 
 	// The helper must exist and return data within the cap for a small file.
-	data, err := readPolicyFile(path)
+	data, _, err := readPolicyFile(path)
 	if err != nil {
 		t.Fatalf("readPolicyFile failed: %v", err)
 	}

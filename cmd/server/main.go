@@ -72,38 +72,48 @@ const maxPolicyFileSize = 10 * 1024 * 1024
 //     The walk tolerates non-existent components and runs per call, so
 //     a path whose parent does not exist yet still returns a clean open
 //     error, and the hot-reload loop recovers once the file is real.
-func readPolicyFile(path string) ([]byte, error) {
+//
+// It also returns the modification time observed on the OPENED fd (the
+// fstat below — not a separate os.Stat, which would follow a planted
+// symlink and reintroduce the R71/R72 mtime-poisoning window). main()
+// seeds watchPolicyFile's lastMod with this READ-VERIFIED mtime so the
+// first hot-reload poll loads only when the file changed since main()
+// read it — an unchanged file must not re-assert over a policy the etcd
+// syncer applied at boot (R73 — the R72 zero-lastMod first-poll reload
+// reverted the syncer's startup Load on every restart, silently undoing
+// an etcd-pushed emergency policy until the next DISTINCT etcd update).
+func readPolicyFile(path string) ([]byte, time.Time, error) {
 	// Reject symlinks at directory components (R62/R70): O_NOFOLLOW on
 	// the open below only protects the FINAL component, but the kernel
 	// resolves intermediate directory symlinks before the open.
 	if err := securepath.RejectSymlinkComponents(filepath.Dir(path)); err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return nil, fmt.Errorf("opening policy file: %w", err)
+		return nil, time.Time{}, fmt.Errorf("opening policy file: %w", err)
 	}
 	defer f.Close()
 
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stating policy file: %w", err)
+		return nil, time.Time{}, fmt.Errorf("stating policy file: %w", err)
 	}
 	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("policy path is not a regular file: %s", path)
+		return nil, time.Time{}, fmt.Errorf("policy path is not a regular file: %s", path)
 	}
 	if fi.Size() > maxPolicyFileSize {
-		return nil, fmt.Errorf("policy file too large: %d bytes (max %d)", fi.Size(), maxPolicyFileSize)
+		return nil, time.Time{}, fmt.Errorf("policy file too large: %d bytes (max %d)", fi.Size(), maxPolicyFileSize)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(f, maxPolicyFileSize+1))
 	if err != nil {
-		return nil, fmt.Errorf("reading policy file: %w", err)
+		return nil, time.Time{}, fmt.Errorf("reading policy file: %w", err)
 	}
 	if len(data) > maxPolicyFileSize {
-		return nil, fmt.Errorf("policy file grew beyond %d bytes while reading", maxPolicyFileSize)
+		return nil, time.Time{}, fmt.Errorf("policy file grew beyond %d bytes while reading", maxPolicyFileSize)
 	}
-	return data, nil
+	return data, fi.ModTime(), nil
 }
 
 func main() {
@@ -173,7 +183,7 @@ func main() {
 	if *opaEmbed == "" {
 		log.Fatal("--opa-embed is required")
 	}
-	policyData, err := readPolicyFile(*opaEmbed)
+	policyData, policyModTime, err := readPolicyFile(*opaEmbed)
 	if err != nil {
 		log.Fatalf("failed to read policy file %s: %v", *opaEmbed, err)
 	}
@@ -295,9 +305,21 @@ func main() {
 		adminServer = adminAPI.StartServer(*listenAddr)
 	}
 
-	// Start file watcher for hot-reload of the OPA policy file
+	// Start file watcher for hot-reload of the OPA policy file. The watcher
+	// is seeded with the READ-VERIFIED mtime of the file main() just read
+	// (readPolicyFile returns the fstat of its O_NOFOLLOW'd fd): the first
+	// poll must load only when the file changed since that read. With a zero
+	// seed (pre-R73) the first poll re-read the UNCHANGED file ~5s into every
+	// process start and re-asserted it over any policy the etcd syncer
+	// applied at boot — the firewall silently reverted to the stale embedded
+	// file until the next DISTINCT etcd update (R73, the R65/R66/R67
+	// stale-policy outcome on the boot path). The seed is read-verified, so
+	// a symlink planted during the startup window cannot advance lastMod past
+	// it: the planted link's target mtime is After the seed, forcing the
+	// hardened read, which rejects with ELOOP and does NOT advance lastMod
+	// (R71/R72 anti-poisoning preserved — see pollPolicyFile).
 	if *opaEmbed != "" {
-		go watchPolicyFile(*opaEmbed, opaEval)
+		go watchPolicyFile(*opaEmbed, opaEval, policyModTime)
 	}
 
 	// Metrics HTTP handler on separate port or admin port
@@ -402,7 +424,7 @@ func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.D
 	}
 	modTime := fi.ModTime()
 	if lastMod.IsZero() || modTime.After(*lastMod) {
-		data, err := readPolicyFile(path)
+		data, _, err := readPolicyFile(path)
 		if err != nil {
 			slog.Error("hot-reload: failed to read policy file", "path", path, "error", err)
 			return 30 * time.Second
@@ -418,8 +440,24 @@ func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.D
 
 // watchPolicyFile polls the OPA policy file for modifications every 5
 // seconds and triggers a hot-reload when the file changes.
-func watchPolicyFile(path string, eval *opa.EmbeddedEvaluator) {
-	var lastMod time.Time
+//
+// seed is the read-verified mtime of the file at process start (main()
+// passes the fstat of the file its readPolicyFile opened — R73): lastMod
+// starts from the seed instead of zero so the FIRST poll loads only when
+// the file changed since main() read it. A zero seed (no caller-provided
+// value — the direct-poll path) retains the R72 "zero means changed"
+// contract: the first poll performs the hardened read before recording
+// anything. R73: with a zero seed, an UNCHANGED file re-loads on the first
+// poll ~5s into every process start — harmless when the file is the only
+// policy source, but with --etcd-endpoints configured it re-asserts the
+// embedded file over the policy the syncer applied at boot (the R66
+// stale-policy outcome; see readPolicyFile's R73 note). The seed is
+// read-verified (not a fresh os.Stat), so the R71/R72 symlink-poisoning
+// protection is unchanged: a link planted after main()'s read whose target
+// mtime advances past the seed forces the hardened read, which rejects with
+// ELOOP and does NOT advance lastMod.
+func watchPolicyFile(path string, eval *opa.EmbeddedEvaluator, seed time.Time) {
+	lastMod := seed
 	for {
 		time.Sleep(pollPolicyFile(path, eval, &lastMod))
 	}
