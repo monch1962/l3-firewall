@@ -416,6 +416,29 @@ type policyReloader interface {
 // the loop recovers the moment the entry is real again (the 30s return
 // on failure bounds the error-log rate to one line per 30s while the
 // entry stays rejected).
+//
+// R74: lastMod is advanced ONLY from the read-VERIFIED fd mtime returned by
+// a successful readPolicyFile — never from the os.Stat value on a poll that
+// did NOT read. The pre-R74 code advanced `*lastMod = modTime`
+// unconditionally, including on the no-change path where no hardened read
+// occurred — and os.Stat FOLLOWS a planted symlink and reports the TARGET's
+// mtime. An attacker with policy-directory write access (the standing
+// R42/R70/R71/R72/R73 model) who plants a link whose target mtime is
+// EARLIER than lastMod got the record REGRESSED backward by an unread stat:
+// the poll skipped the read (modTime.After(lastMod) false — no ELOOP, no
+// error log, no backoff), and once the real file was restored (a pure
+// rename dance — park the file, plant the link for one 5-second poll,
+// rename it back; no content write, no content read) its UNCHANGED boot
+// mtime was After the regressed record: the next poll re-read and re-loaded
+// the file main() already loaded at boot, silently re-asserting the stale
+// file policy over the policy the etcd syncer applied (the R73 outcome —
+// R66-class stale-policy regression — attacker-triggerable on demand at any
+// quiescent moment). R71/R72/R73 hardened only the FORWARD direction of the
+// record ("an unread record can never move lastMod forward"); backward
+// movement was unguarded. A real file's mtime never legitimately moves
+// backward, so a backward-moving stat mtime is an attack signal, not a
+// change signal: the record is left exactly as it is, and the restored
+// file's unchanged mtime never passes the comparator again.
 func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.Duration {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -424,7 +447,7 @@ func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.D
 	}
 	modTime := fi.ModTime()
 	if lastMod.IsZero() || modTime.After(*lastMod) {
-		data, _, err := readPolicyFile(path)
+		data, verifiedMod, err := readPolicyFile(path)
 		if err != nil {
 			slog.Error("hot-reload: failed to read policy file", "path", path, "error", err)
 			return 30 * time.Second
@@ -433,8 +456,17 @@ func pollPolicyFile(path string, eval policyReloader, lastMod *time.Time) time.D
 			slog.Error("hot-reload: failed to reload policy", "path", path, "error", err)
 			return 30 * time.Second
 		}
+		// Advance ONLY from the mtime of the file actually read (the fstat of
+		// readPolicyFile's O_NOFOLLOW'd fd — not the os.Stat value, which
+		// could describe a different file swapped in between stat and open).
+		// The record then always reflects content that was verified (R74).
+		*lastMod = verifiedMod
+		return 5 * time.Second
 	}
-	*lastMod = modTime
+	// No change per the comparator (modTime is not After lastMod — equal or
+	// backward). Do NOT touch the record: an equal mtime is a no-op, and a
+	// backward mtime (planted link to an old target, or a backward-dated
+	// replacement) must not regress a read-verified record (R74).
 	return 5 * time.Second
 }
 
