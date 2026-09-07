@@ -20,10 +20,54 @@ import (
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
 )
 
+// decisionQuery is the single Rego query the evaluator runs for every
+// packet. The policy MUST declare exactly this package: a compile-valid
+// module in any other package can never produce a decision here, and
+// Evaluate then returns the zero-result default (Allowed=true) — a silent
+// allow-all firewall (R75).
+const decisionQuery = "data.l3_firewall"
+
 // EmbedConfig configures the in-process OPA evaluator.
 type EmbedConfig struct {
 	Policy  string        // Rego policy source code
 	Timeout time.Duration // Evaluation timeout (0 = default 500ms)
+}
+
+// verifyPolicyPackage rejects a compiled module set that does not declare
+// the decision package (R75). Both Load and NewEmbedded gate on it: without
+// the gate, a compile-valid policy with a wrong package line (a typo, a
+// `package firewall`/`package evil` module, or a sub-package such as
+// `l3_firewall.sub` whose rules never surface at the queried document) is
+// accepted with a nil error while the firewall silently allows every packet
+// — the fail-open sibling of the compile-error path, which is rejected
+// loudly and keeps the last-good policy. The exact-match requirement mirrors
+// the query: rules under a descendant package (l3_firewall.sub) do not
+// define `allow` at data.l3_firewall, so only the exact package can govern.
+func verifyPolicyPackage(compiler *ast.Compiler) error {
+	for _, mod := range compiler.Modules {
+		if mod != nil && mod.Package != nil && mod.Package.Path.String() == decisionQuery {
+			return nil
+		}
+	}
+	return fmt.Errorf("policy must declare package at %s: compiled modules declare %s (a policy in any other package can never produce a decision for the %q query and would silently allow every packet)", decisionQuery, declaredPackages(compiler), decisionQuery)
+}
+
+// declaredPackages lists the package paths of a compiled module set for
+// error messages.
+func declaredPackages(compiler *ast.Compiler) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, mod := range compiler.Modules {
+		if mod == nil || mod.Package == nil {
+			continue
+		}
+		p := mod.Package.Path.String()
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // EmbeddedEvaluator evaluates Rego policies in-process using the OPA Go library.
@@ -66,6 +110,12 @@ func NewEmbedded(cfg EmbedConfig) (*EmbeddedEvaluator, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("compiling Rego: %w", err)
+	}
+	// The module must declare the decision package (R75): without the gate,
+	// a wrong-package policy boots an allow-all firewall with no error (see
+	// verifyPolicyPackage).
+	if err := verifyPolicyPackage(compiler); err != nil {
+		return nil, err
 	}
 
 	e := &EmbeddedEvaluator{
@@ -110,6 +160,15 @@ func (e *EmbeddedEvaluator) Load(policy string) error {
 	if err != nil {
 		return fmt.Errorf("compiling Rego: %w", err)
 	}
+	// Reject a policy that cannot produce a decision at the queried document
+	// (R75): a wrong-package policy would otherwise Load successfully and
+	// silently switch the firewall to allow-all — the fail-open sibling of
+	// the compile-error path. Rejecting here keeps the last-good policy
+	// governing (callers log the error; pollPolicyFile/syncer keep their
+	// existing retry semantics).
+	if err := verifyPolicyPackage(compiler); err != nil {
+		return err
+	}
 
 	// Atomically swap the compiler and rebuild the prepared query
 	e.mu.Lock()
@@ -141,7 +200,7 @@ func (e *EmbeddedEvaluator) rebuild() error {
 	e.mu.RUnlock()
 
 	r := rego.New(
-		rego.Query("data.l3_firewall"),
+		rego.Query(decisionQuery),
 		rego.Compiler(compiler),
 		rego.Store(store),
 	)
