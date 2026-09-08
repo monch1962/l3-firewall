@@ -181,6 +181,23 @@ func NewTable(cfg Config) *Table {
 	if cfg.ICMPTimeout <= 0 {
 		cfg.ICMPTimeout = 5 * time.Second
 	}
+	// Default the port-scan tracking bounds like every other field (R76):
+	// cmd/server/main.go constructs its Config with ONLY MaxEntries and the
+	// idle timeouts — no CLI flags exist for the scan fields — so a zero
+	// PortScanMaxPorts previously made RecordDestPort's cap check
+	// `len(ports) >= 0` short-circuit forever: srcPorts never filled,
+	// GetRecentDestPorts returned nil, and OPA input connection.recent_ports
+	// stayed empty on every packet. The shipped deny-override policy enables
+	// port-scan blocking by default (l3.rego deny_port_scan, threshold 20),
+	// so that rule could never fire in the production binary — moderate
+	// scans were silently allowed (R40.4-class dropped control; the other
+	// target-package constructors — capture.NewWriter, l2filter.NewFilter,
+	// syncer.New — all default their config fields, NewTable was the lone
+	// asymmetric exception). Zero now means "default", matching the
+	// established convention for MaxEntries and the timeouts above.
+	if cfg.PortScanMaxPorts <= 0 {
+		cfg.PortScanMaxPorts = 100
+	}
 	return &Table{
 		flows:        make(map[flowKey]*Flow),
 		cfg:          cfg,
