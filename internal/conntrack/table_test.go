@@ -346,8 +346,13 @@ func TestNewConnectionRate(t *testing.T) {
 	ct.LookupOrCreate("10.0.1.100", "10.0.2.51", "TCP", 44002, 80)
 	ct.LookupOrCreate("10.0.1.100", "10.0.2.52", "TCP", 44003, 443)
 
-	rate := ct.NewConnectionRate()
+	// Per-source (R77): query the source that opened the connections.
+	rate := ct.NewConnectionRate("10.0.1.100")
 	if rate <= 0 {
 		t.Errorf("NewConnectionRate = %f, want > 0", rate)
+	}
+	// An unrelated source must not inherit the rate (per-IP attribution).
+	if other := ct.NewConnectionRate("10.0.1.200"); other != 0 {
+		t.Errorf("NewConnectionRate(other source) = %f, want 0 (per-source attribution)", other)
 	}
 }

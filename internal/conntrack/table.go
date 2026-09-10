@@ -160,11 +160,71 @@ type Table struct {
 	cfg      Config
 	stats    Stats
 	srcPorts map[string][]uint16 // srcIP -> recent dest ports for scan detection
-	// New connection rate tracking
-	newConns []time.Time
+	// New connection rate tracking — per source IP, bucketed by second.
+	// Pre-R77 the tracker was a TABLE-GLOBAL []time.Time capped at 10000
+	// entries: (a) the cap aliased any sustained new-conn rate >= 1000/s to
+	// exactly 1000.0 (10000 entries / 10s window), so the shipped
+	// deny-override rule deny_new_conn_rate (l3.rego RULE 13, fires only on
+	// input.rate.new_conns_per_sec > 1000 — max_new_connections_per_second
+	// := 1000) could never fire in the production binary no matter how fast
+	// the flood; and (b) the rate was GLOBAL — every packet from every
+	// source inherited the aggregate new-conn rate of all sources, while
+	// opa.BuildInput documents the field as "New connections/sec from this
+	// source" and the policy comment says "Per-IP new connection rate
+	// limit". Fixed one-second bucket rings per source (10 slots) report
+	// any rate without aliasing and attribute it to the right source;
+	// entries are pruned in decrFlowCountLocked (the R39 choke point that
+	// also prunes srcPorts) so spoofed one-flow sources cannot accumulate.
+	newConns map[string]*newConnRate // srcIP -> per-second bucket ring
 	rateMu   sync.Mutex
 	// Per-source flow count tracking
 	srcFlowCount map[string]int // srcIP -> number of active flows
+}
+
+// connRateWindowSecs is the number of one-second buckets in a per-source
+// new-connection rate tracker. 10 buckets cover the same 10-second window the
+// pre-R77 global slice measured ("new connections per second over the last 10
+// seconds").
+const connRateWindowSecs = 10
+
+// newConnRate counts new connections from one source IP in fixed one-second
+// buckets. Slots are indexed by second % connRateWindowSecs; a slot whose
+// stored second differs from the write second holds a count from >= 10
+// seconds ago (the same residue recurs every 10s) and is safely overwritten.
+// Fixed memory (connRateWindowSecs int64s) per active source regardless of
+// connection rate — no cap to alias against, unlike the pre-R77 global
+// timestamp slice (R77).
+type newConnRate struct {
+	secs   [connRateWindowSecs]int64 // unix second each slot holds
+	counts [connRateWindowSecs]int64 // connections recorded in that second
+}
+
+// record counts one new connection from the source at the given time.
+func (r *newConnRate) record(now time.Time) {
+	sec := now.Unix()
+	i := sec % connRateWindowSecs
+	if r.secs[i] != sec {
+		r.secs[i] = sec
+		r.counts[i] = 0
+	}
+	r.counts[i]++
+}
+
+// rate returns new connections per second averaged over the window: the sum
+// of bucket counts whose second is within the last connRateWindowSecs seconds
+// (>= now-9, i.e. strictly newer than now-10) divided by the window width.
+// Bucket counts are int64 — unbounded per second, so a sustained flood of any
+// rate reports a value above the policy threshold instead of saturating at it
+// (R77).
+func (r *newConnRate) rate(now time.Time) float64 {
+	sec := now.Unix()
+	var sum int64
+	for i := 0; i < connRateWindowSecs; i++ {
+		if r.secs[i] != 0 && r.secs[i] > sec-connRateWindowSecs {
+			sum += r.counts[i]
+		}
+	}
+	return float64(sum) / float64(connRateWindowSecs)
 }
 
 // NewTable creates a connection tracking table with the given configuration.
@@ -203,6 +263,7 @@ func NewTable(cfg Config) *Table {
 		cfg:          cfg,
 		srcPorts:     make(map[string][]uint16),
 		srcFlowCount: make(map[string]int),
+		newConns:     make(map[string]*newConnRate),
 	}
 }
 
@@ -281,47 +342,49 @@ func (t *Table) LookupOrCreate(srcIP, dstIP, protocol string, srcPort, dstPort u
 	t.stats.Created++
 	t.incrFlowCountLocked(srcIP)
 
-	// Track new connection timestamp for rate calculation
-	t.recordNewConn()
+	// Track new connection for this source's rate calculation (R77)
+	t.recordNewConn(srcIP)
 
 	return f
 }
 
-// recordNewConn records a new connection timestamp for rate calculation.
-func (t *Table) recordNewConn() {
+// recordNewConn records a new connection timestamp for rate calculation,
+// attributed to the source IP that opened it (R77 — the pre-R77 tracker was
+// table-global, so one source's flood was reported to every packet of every
+// source and the per-source policy rule could never attribute correctly).
+// Callers pass the normalized srcIP (already canonicalized by the flow-key
+// methods).
+func (t *Table) recordNewConn(srcIP string) {
 	t.rateMu.Lock()
 	defer t.rateMu.Unlock()
 	now := time.Now()
-	t.newConns = append(t.newConns, now)
-	// Prune timestamps older than 10 seconds
-	cutoff := now.Add(-10 * time.Second)
-	start := 0
-	for i, ts := range t.newConns {
-		if ts.After(cutoff) {
-			start = i
-			break
-		}
+	r := t.newConns[srcIP]
+	if r == nil {
+		r = &newConnRate{}
+		t.newConns[srcIP] = r
 	}
-	t.newConns = t.newConns[start:]
-	// Cap slice length
-	if len(t.newConns) > 10000 {
-		t.newConns = t.newConns[len(t.newConns)-10000:]
-	}
+	r.record(now)
 }
 
-// NewConnectionRate returns the number of new connections per second (over last 10 seconds).
-func (t *Table) NewConnectionRate() float64 {
+// NewConnectionRate returns the number of new connections per second from the
+// given source IP (over the last 10 seconds). Per-source attribution (R77):
+// opa.BuildInput documents Rate.NewConnsPerSec as "New connections/sec from
+// this source" and the policy's deny_new_conn_rate is a per-IP limit, but the
+// pre-R77 implementation summed a TABLE-GLOBAL timestamp slice — every packet
+// carried the aggregate new-conn rate of all sources, and the 10000-entry cap
+// aliased sustained floods at exactly 1000.0 conn/s so the rule's strict
+// `> 1000` could never fire. Bucketed per-source counting reports any rate
+// without aliasing and attributes it to the source that owns it. Returns 0 for
+// an unknown source (or when srcIP does not parse).
+func (t *Table) NewConnectionRate(srcIP string) float64 {
+	srcIP = normalizeIP(srcIP)
 	t.rateMu.Lock()
 	defer t.rateMu.Unlock()
-	now := time.Now()
-	cutoff := now.Add(-10 * time.Second)
-	count := 0
-	for _, ts := range t.newConns {
-		if ts.After(cutoff) {
-			count++
-		}
+	r := t.newConns[srcIP]
+	if r == nil {
+		return 0
 	}
-	return float64(count) / 10.0
+	return r.rate(time.Now())
 }
 
 // UpdateTCPState finds or creates a flow and transitions its TCP state based on
@@ -356,7 +419,7 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 		t.flows[key] = f
 		t.stats.Created++
 		t.incrFlowCountLocked(srcIP)
-		t.recordNewConn()
+		t.recordNewConn(srcIP)
 	} else {
 		f.touch()
 		t.stats.Hits++
@@ -556,11 +619,19 @@ func (t *Table) incrFlowCountLocked(srcIP string) {
 // meaningful while the source has active flows. Without this prune, srcPorts
 // grows unboundedly — every unique (possibly spoofed) srcIP leaves a permanent
 // entry, enabling memory exhaustion over the firewall's lifetime (R39).
+// The per-source new-connection rate tracker (newConns) is pruned in the same
+// choke point: a source whose last flow died is not actively connecting, so
+// its rate history is stale by definition — retaining it would let spoofed
+// one-flow sources accumulate map entries forever (R77, the R39 companion-map
+// rule applied to the R77 per-source tracker).
 func (t *Table) decrFlowCountLocked(srcIP string) {
 	t.srcFlowCount[srcIP]--
 	if t.srcFlowCount[srcIP] <= 0 {
 		delete(t.srcFlowCount, srcIP)
 		delete(t.srcPorts, srcIP)
+		t.rateMu.Lock()
+		delete(t.newConns, srcIP)
+		t.rateMu.Unlock()
 	}
 }
 

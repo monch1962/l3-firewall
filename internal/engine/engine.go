@@ -333,7 +333,13 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		return &opa.Result{Allowed: false, Reason: reason}
 	}
 
-	newConnRate := e.conntrack.NewConnectionRate()
+	// New connections/sec from THIS source (per-IP attribution, R77). The
+	// pre-R77 NewConnectionRate() summed a table-global timestamp slice —
+	// every packet from every source carried the aggregate new-conn rate
+	// (BuildInput documents the field as "from this source"; the policy
+	// deny_new_conn_rate is a per-IP limit), and the 10000-entry cap aliased
+	// sustained floods at exactly 1000.0 so the rule could never fire.
+	newConnRate := e.conntrack.NewConnectionRate(pi.SrcIP)
 
 	// 3. Get recent ports for port scan detection
 	recentPorts := e.conntrack.GetRecentDestPorts(pi.SrcIP)
