@@ -389,19 +389,26 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 
 	result, err := e.eval.Evaluate(input)
 	if err != nil {
-		if e.failClosed {
-			e.packetsBlocked.Add(1)
-			reason := fmt.Sprintf("OPA error: %v — blocked for safety", err)
-			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
-				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
-			e.recordBlock(pi, reason, tid)
-			e.logAudit("packet_block", tid, pi, reason)
-			e.fireAlert(alert.AlertOPAError, reason)
-			return &opa.Result{Allowed: false, Reason: reason}
-		}
-		e.packetsAllowed.Add(1)
-		e.logAudit("packet_allow", tid, pi, "")
-		return &opa.Result{Allowed: true}
+		// A policy EVALUATION error is not "OPA unreachable": it is a
+		// decision the policy failed to produce for THIS input, and that
+		// input is attacker-controlled — one crafted packet can force one
+		// (R78: the shipped policy's conflicting deny_reason complete rules
+		// made every two-rule packet raise eval_conflict_error, and the
+		// error was converted to an allow). Undecidable input must fail
+		// closed, exactly like unparseable packets (R40.3) and nil payloads
+		// (R49): the block is unconditional, not gated on --opa-fail-closed.
+		// That flag still governs the evaluator-not-configured branch above,
+		// where no decision was ever submitted. Allowing on an eval error
+		// meant any policy defect (or a malicious hot-reloaded policy) turned
+		// the firewall into allow-all for packets an attacker could craft.
+		e.packetsBlocked.Add(1)
+		reason := fmt.Sprintf("OPA error: %v — blocked for safety", err)
+		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
+			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
+		e.recordBlock(pi, reason, tid)
+		e.logAudit("packet_block", tid, pi, reason)
+		e.fireAlert(alert.AlertOPAError, reason)
+		return &opa.Result{Allowed: false, Reason: reason}
 	}
 
 	// 6. Audit-only mode overrides blocks (but still logs them)

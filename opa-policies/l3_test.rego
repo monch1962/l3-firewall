@@ -394,3 +394,66 @@ test_geoip_allowed_dst_reason if {
         with allowed_dst_countries as {"US"}
         with input.geo as {"src_country": "", "dst_country": "CN"}
 }
+
+# =============================================================================
+# R78: OVERLAPPING DENY RULES MUST NOT CONFLICT
+# =============================================================================
+# Several deny rules can match the same packet. deny_reasons is a partial set
+# so all of them may contribute and the decision document still evaluates.
+# Spelling them as repeated complete rules (`deny_reason := "..." if {...}`)
+# makes OPA raise `eval_conflict_error: complete rules must not produce
+# multiple outputs` for the WHOLE data.l3_firewall document as soon as two
+# bodies are true — and the engine's default (non-fail-closed) error path
+# turned that into an ALLOW, i.e. a two-rule packet bypassed every deny rule.
+# These tests pin the conflict-free behavior for the overlapping cases an
+# attacker can craft.
+
+# Stealth probe: blocked port 22 AND invalid SYN+RST flags.
+test_overlapping_blocked_port_and_anomaly_denies if {
+    allow == false with input.packet as {"protocol": "TCP", "dst_port": 22, "tcp_flags": {"syn": true, "rst": true}}
+}
+
+test_overlapping_blocked_port_and_anomaly_both_reasons_match if {
+    count(deny_reasons) == 2 with input.packet as {"protocol": "TCP", "dst_port": 22, "tcp_flags": {"syn": true, "rst": true}}
+}
+
+test_overlapping_blocked_port_and_anomaly_reason_is_single_string if {
+    reason == "blocked port 22 (TCP)" with input.packet as {"protocol": "TCP", "dst_port": 22, "tcp_flags": {"syn": true, "rst": true}}
+}
+
+# Fast SYN scan: port-scan AND SYN-flood thresholds crossed by the same packet.
+test_overlapping_port_scan_and_syn_flood_denies if {
+    allow == false
+        with input.packet as {"protocol": "TCP", "dst_port": 443, "tcp_flags": {"syn": true, "ack": false}}
+        with input.connection as {"packets_in_flow": 1, "recent_ports": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]}
+        with input.rate as {"src_ip_pps": 500}
+}
+
+test_overlapping_port_scan_and_syn_flood_reason_is_deterministic if {
+    # sort() picks the lexicographically first matched reason ("SYN ..." < "port ...").
+    reason == "SYN flood detected"
+        with input.packet as {"protocol": "TCP", "dst_port": 443, "tcp_flags": {"syn": true, "ack": false}}
+        with input.connection as {"packets_in_flow": 1, "recent_ports": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]}
+        with input.rate as {"src_ip_pps": 500}
+}
+
+# ICMP echo flood: denied type 8 AND the ICMP flood rate threshold.
+test_overlapping_icmp_type_and_flood_denies if {
+    allow == false
+        with input.packet as {"protocol": "ICMP", "icmp_type": 8, "icmp_code": 0}
+        with input.rate as {"src_ip_pps": 50}
+}
+
+test_overlapping_icmp_type_and_flood_both_reasons_match if {
+    count(deny_reasons) == 2
+        with input.packet as {"protocol": "ICMP", "icmp_type": 8, "icmp_code": 0}
+        with input.rate as {"src_ip_pps": 50}
+}
+
+# No deny rule matches: the partial set is empty and reason is undefined
+# (the engine leaves its Reason field empty), never an error.
+test_no_deny_rule_means_no_reason if {
+    allow
+    not deny_reason
+        with input.packet as {"protocol": "TCP", "dst_port": 443, "tcp_flags": {"syn": true, "ack": false}}
+}

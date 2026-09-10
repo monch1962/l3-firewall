@@ -86,7 +86,7 @@ deny_ip_spoofing if {
 }
 
 allow := false if { deny_ip_spoofing }
-deny_reason := "IP spoofing detected" if { deny_ip_spoofing }
+deny_reasons contains "IP spoofing detected" if { deny_ip_spoofing }
 
 # =============================================================================
 # RULE 2: Port Scanning — rapid connections to multiple ports
@@ -101,7 +101,7 @@ deny_port_scan if {
 }
 
 allow := false if { deny_port_scan }
-deny_reason := "port scan detected" if { deny_port_scan }
+deny_reasons contains "port scan detected" if { deny_port_scan }
 
 # =============================================================================
 # RULE 3: SYN Flood — rate of SYN-only packets exceeds threshold
@@ -116,7 +116,7 @@ deny_syn_flood if {
 }
 
 allow := false if { deny_syn_flood }
-deny_reason := "SYN flood detected" if { deny_syn_flood }
+deny_reasons contains "SYN flood detected" if { deny_syn_flood }
 
 # =============================================================================
 # RULE 4: Protocol Anomaly — invalid flag combinations
@@ -128,7 +128,7 @@ deny_protocol_anomaly if {
 }
 
 allow := false if { deny_protocol_anomaly }
-deny_reason := "protocol anomaly detected" if { deny_protocol_anomaly }
+deny_reasons contains "protocol anomaly detected" if { deny_protocol_anomaly }
 
 invalid_tcp_flags(flags) if { flags.syn == true; flags.rst == true }
 invalid_tcp_flags(flags) if { flags.fin == true; flags.rst == true }
@@ -145,7 +145,7 @@ deny_ingress_egress if {
 }
 
 allow := false if { deny_ingress_egress }
-deny_reason := "ingress/egress filtering blocked" if { deny_ingress_egress }
+deny_reasons contains "ingress/egress filtering blocked" if { deny_ingress_egress }
 
 # =============================================================================
 # RULE 6: Port Control — block specific ports (with range support)
@@ -157,7 +157,7 @@ allow := false if { deny_blocked_port }
 deny_blocked_port if { input.packet.protocol == "UDP"; port_in_ranges(input.packet.dst_port, blocked_ports) }
 allow := false if { deny_blocked_port }
 
-deny_reason := sprintf("blocked port %v (%s)", [input.packet.dst_port, input.packet.protocol]) if { deny_blocked_port }
+deny_reasons contains sprintf("blocked port %v (%s)", [input.packet.dst_port, input.packet.protocol]) if { deny_blocked_port }
 
 # =============================================================================
 # RULE 7: ICMP Control — block specific ICMP types/codes, rate-limit floods
@@ -169,11 +169,11 @@ allow := false if { deny_icmp }
 deny_icmp if { input.packet.protocol == "ICMP"; blocked_icmp_codes[input.packet.icmp_code] }
 allow := false if { deny_icmp }
 
-deny_reason := sprintf("blocked ICMP type=%v code=%v", [input.packet.icmp_type, input.packet.icmp_code]) if { deny_icmp }
+deny_reasons contains sprintf("blocked ICMP type=%v code=%v", [input.packet.icmp_type, input.packet.icmp_code]) if { deny_icmp }
 
 deny_icmp_flood if { input.packet.protocol == "ICMP"; input.rate.src_ip_pps > icmp_rate_per_second }
 allow := false if { deny_icmp_flood }
-deny_reason := "ICMP flood detected" if { deny_icmp_flood }
+deny_reasons contains "ICMP flood detected" if { deny_icmp_flood }
 
 # =============================================================================
 # RULE 8: Connection State Violation — RST to non-existent flow
@@ -187,7 +187,7 @@ deny_state_violation if {
 }
 
 allow := false if { deny_state_violation }
-deny_reason := "connection state violation: RST to non-existent flow" if { deny_state_violation }
+deny_reasons contains "connection state violation: RST to non-existent flow" if { deny_state_violation }
 
 # =============================================================================
 # RULE 9: Protocol Blocking
@@ -195,7 +195,7 @@ deny_reason := "connection state violation: RST to non-existent flow" if { deny_
 
 deny_blocked_protocol if { blocked_protocols[input.packet.protocol] }
 allow := false if { deny_blocked_protocol }
-deny_reason := sprintf("blocked protocol %v", [input.packet.protocol]) if { deny_blocked_protocol }
+deny_reasons contains sprintf("blocked protocol %v", [input.packet.protocol]) if { deny_blocked_protocol }
 
 # =============================================================================
 # RULE 10: Traffic Rate Limit — per-IP packets/sec budget
@@ -203,7 +203,7 @@ deny_reason := sprintf("blocked protocol %v", [input.packet.protocol]) if { deny
 
 deny_traffic_rate if { input.rate.src_ip_pps > max_packets_per_second }
 allow := false if { deny_traffic_rate }
-deny_reason := sprintf("rate limit exceeded: %v pps", [input.rate.src_ip_pps]) if { deny_traffic_rate }
+deny_reasons contains sprintf("rate limit exceeded: %v pps", [input.rate.src_ip_pps]) if { deny_traffic_rate }
 
 # =============================================================================
 # RULE 11: Fragment Attack — non-zero-offset IP fragments
@@ -216,7 +216,7 @@ deny_fragment_attack if {
 }
 
 allow := false if { deny_fragment_attack }
-deny_reason := sprintf("fragment attack: offset=%v", [input.packet.fragment.offset]) if { deny_fragment_attack }
+deny_reasons contains sprintf("fragment attack: offset=%v", [input.packet.fragment.offset]) if { deny_fragment_attack }
 
 # =============================================================================
 # RULE 12: Source Port Filtering — block traffic from specific source ports
@@ -224,11 +224,11 @@ deny_reason := sprintf("fragment attack: offset=%v", [input.packet.fragment.offs
 
 deny_source_port if { input.packet.protocol == "TCP"; port_in_ranges(input.packet.src_port, blocked_ports) }
 allow := false if { deny_source_port }
-deny_reason := sprintf("blocked source port %v (TCP)", [input.packet.src_port]) if { deny_source_port }
+deny_reasons contains sprintf("blocked source port %v (TCP)", [input.packet.src_port]) if { deny_source_port }
 
 deny_source_port if { input.packet.protocol == "UDP"; port_in_ranges(input.packet.src_port, blocked_ports) }
 allow := false if { deny_source_port }
-deny_reason := sprintf("blocked source port %v (UDP)", [input.packet.src_port]) if { deny_source_port }
+deny_reasons contains sprintf("blocked source port %v (UDP)", [input.packet.src_port]) if { deny_source_port }
 
 # =============================================================================
 # RULE 13: New Connection Rate Limit
@@ -236,7 +236,7 @@ deny_reason := sprintf("blocked source port %v (UDP)", [input.packet.src_port]) 
 
 deny_new_conn_rate if { input.rate.new_conns_per_sec > max_new_connections_per_second }
 allow := false if { deny_new_conn_rate }
-deny_reason := sprintf("new connection rate exceeded: %v/sec", [input.rate.new_conns_per_sec]) if { deny_new_conn_rate }
+deny_reasons contains sprintf("new connection rate exceeded: %v/sec", [input.rate.new_conns_per_sec]) if { deny_new_conn_rate }
 
 # =============================================================================
 # RULE 14: Per-Port Rate Limit — too much traffic to a specific dst port
@@ -244,7 +244,7 @@ deny_reason := sprintf("new connection rate exceeded: %v/sec", [input.rate.new_c
 
 deny_port_rate if { input.rate.src_port_pps > max_port_pps }
 allow := false if { deny_port_rate }
-deny_reason := sprintf("per-port rate limit: %v pps to port %v", [input.rate.src_port_pps, input.packet.dst_port]) if { deny_port_rate }
+deny_reasons contains sprintf("per-port rate limit: %v pps to port %v", [input.rate.src_port_pps, input.packet.dst_port]) if { deny_port_rate }
 
 # =============================================================================
 # RULE 16: GeoIP Country Blocking — block by source/destination country
@@ -257,7 +257,7 @@ deny_geoip_blocked_src if {
 }
 
 allow := false if { deny_geoip_blocked_src }
-deny_reason := sprintf("blocked source country: %v", [input.geo.src_country]) if { deny_geoip_blocked_src }
+deny_reasons contains sprintf("blocked source country: %v", [input.geo.src_country]) if { deny_geoip_blocked_src }
 
 # Only allow traffic from allowed countries (if any are specified)
 deny_geoip_src_not_allowed if {
@@ -267,7 +267,7 @@ deny_geoip_src_not_allowed if {
 }
 
 allow := false if { deny_geoip_src_not_allowed }
-deny_reason := sprintf("source country %v not in allowed list", [input.geo.src_country]) if { deny_geoip_src_not_allowed }
+deny_reasons contains sprintf("source country %v not in allowed list", [input.geo.src_country]) if { deny_geoip_src_not_allowed }
 
 # Only allow traffic to allowed destination countries (if any are specified)
 deny_geoip_dst_not_allowed if {
@@ -277,7 +277,7 @@ deny_geoip_dst_not_allowed if {
 }
 
 allow := false if { deny_geoip_dst_not_allowed }
-deny_reason := sprintf("destination country %v not in allowed list", [input.geo.dst_country]) if { deny_geoip_dst_not_allowed }
+deny_reasons contains sprintf("destination country %v not in allowed list", [input.geo.dst_country]) if { deny_geoip_dst_not_allowed }
 
 # =============================================================================
 # RULE 15: Time-Based Access Control — schedule-based port allow/deny
@@ -309,7 +309,7 @@ deny_time_based if {
 
 allow := false if { deny_time_based }
 
-deny_reason := sprintf("time-based block: port=%v during restricted hours (UTC %v:00-%v:00)", [
+deny_reasons contains sprintf("time-based block: port=%v during restricted hours (UTC %v:00-%v:00)", [
     input.packet.dst_port, rule.start_hour, rule.end_hour
 ]) if {
     some rule in time_based_rules
@@ -331,7 +331,7 @@ deny_time_based_outside_window if {
 
 allow := false if { deny_time_based_outside_window }
 
-deny_reason := sprintf("time-based block outside window: port=%v (only allowed UTC %v:00-%v:00)", [
+deny_reasons contains sprintf("time-based block outside window: port=%v (only allowed UTC %v:00-%v:00)", [
     input.packet.dst_port, rule.start_hour, rule.end_hour
 ]) if {
     some rule in time_based_rules
@@ -366,7 +366,33 @@ port_in_ranges(port, ranges) if {
 port_in_ranges(port, ranges) if { ranges[port] }
 
 # =============================================================================
-# RESULT — single reason string from the first matching deny rule
+# RESULT — single deterministic reason string from the matching deny rules
 # =============================================================================
+#
+# deny_reasons is a PARTIAL SET on purpose: several deny rules can match the
+# same packet (a fast SYN scan trips deny_port_scan AND deny_syn_flood; a
+# stealth probe to a blocked port trips deny_blocked_port AND
+# deny_protocol_anomaly; an ICMP flood trips deny_icmp AND deny_icmp_flood).
+#
+# It MUST NOT be spelled as one complete rule per condition
+# (`deny_reason := "..." if { ... }` repeated): Rego forbids a complete rule
+# from producing multiple outputs, so when two bodies are true evaluation
+# fails with
+#   eval_conflict_error: complete rules must not produce multiple outputs.
+# The engine queries the whole document (data.l3_firewall) and that document
+# includes `reason`, which reads deny_reason — so the conflict aborts the
+# ENTIRE packet decision. Engine.evaluatePacket then treats the error as
+# allow when --opa-fail-closed is at its default (false), i.e. a single
+# crafted packet that matches two deny rules bypassed every deny rule in the
+# shipped policy (R78). A partial set has no such failure mode: any number of
+# conditions may contribute, and the document always evaluates.
+#
+# deny_reason stays a single complete rule with exactly ONE body, so it can
+# never conflict, and reports the lexicographically first matched reason
+# (stable for a given packet, so the log/reason is deterministic).
+deny_reason := sorted[0] if {
+    sorted := sort(deny_reasons)
+    count(sorted) > 0
+}
 
 reason := deny_reason if { deny_reason != "" }

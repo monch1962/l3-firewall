@@ -27,7 +27,7 @@ deny_icmp_type if {
 }
 
 allow := false if { deny_icmp_type }
-deny_reason := sprintf("blocked ICMP type %v", [input.packet.icmp_type]) if { deny_icmp_type }
+deny_reasons contains sprintf("blocked ICMP type %v", [input.packet.icmp_type]) if { deny_icmp_type }
 
 # Block specific ICMP codes
 deny_icmp_code if {
@@ -44,10 +44,39 @@ deny_icmp_flood if {
 }
 
 allow := false if { deny_icmp_flood }
-deny_reason := "ICMP flood" if { deny_icmp_flood }
+deny_reasons contains "ICMP flood" if { deny_icmp_flood }
+
+# Result: exactly one deterministic reason string. deny_reasons is a partial
+# set on purpose — an ICMP echo request during a flood matches deny_icmp_type
+# AND deny_icmp_flood, and spelling these as repeated complete rules
+# (`deny_reason := "..." if {...}`) makes OPA raise
+#   eval_conflict_error: complete rules must not produce multiple outputs
+# for the whole document, which an embedded engine can turn into an allow (R78).
+deny_reason := sorted[0] if {
+    sorted := sort(deny_reasons)
+    count(sorted) > 0
+}
 
 test_echo_request_blocked if {
     not allow with data.params as {} with input.packet as {"protocol": "ICMP", "icmp_type": 8, "icmp_code": 0}
+}
+
+# Overlapping rules must deny with a settled reason, not error out (R78).
+test_echo_request_during_flood_denies if {
+    not allow
+        with data.params as {}
+        with input.packet as {"protocol": "ICMP", "icmp_type": 8, "icmp_code": 0}
+        with input.rate as {"src_ip_pps": 50}
+}
+
+test_echo_request_during_flood_reason_is_settled if {
+    # Both deny_icmp_type and deny_icmp_flood match; the single-body
+    # deny_reason rule reports the lexicographically first, so the document
+    # evaluates instead of raising eval_conflict_error.
+    deny_reason == "ICMP flood"
+        with data.params as {}
+        with input.packet as {"protocol": "ICMP", "icmp_type": 8, "icmp_code": 0}
+        with input.rate as {"src_ip_pps": 50}
 }
 
 test_echo_reply_allowed if {
