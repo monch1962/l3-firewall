@@ -20,7 +20,19 @@ import rego.v1
 # =============================================================================
 
 # Network filtering
-allowed_subnets := {"0.0.0.0/0"}           # Authorized source/destination subnets
+# allowed_subnets is an anti-spoofing ALLOWLIST (RULE 1/RULE 5): a packet whose
+# source or destination is NOT in the set is denied. It must therefore carry a
+# wildcard for EVERY address family the firewall sees. net.cidr_contains() is
+# family-strict — an IPv4 CIDR never contains an IPv6 address — so an IPv4-only
+# wildcard makes ip_in_subnets() false for every IPv6 packet and RULE 1/RULE 5
+# deny 100% of IPv6 traffic as "IP spoofing detected" (R79.1: the shipped
+# default silently dropped every IPv6 packet, violating the deny-override
+# "traffic passes by default" contract for a whole address family).
+# A v4-only list is still honored as written: IPv6 then stays fail-CLOSED
+# (an unlisted family is denied), which is the safe reading of a deliberate
+# restriction — but the shipped default means "allow everything", so it must
+# name both families.
+allowed_subnets := {"0.0.0.0/0", "::/0"}     # Authorized source/destination subnets
 blocked_ports := {22, 23, 3389, 5900, 5901} # Blocked TCP/UDP ports
 blocked_protocols := {}                      # Blocked IP protocols (e.g. {"ICMP"})
 

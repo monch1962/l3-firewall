@@ -457,3 +457,88 @@ test_no_deny_rule_means_no_reason if {
     not deny_reason
         with input.packet as {"protocol": "TCP", "dst_port": 443, "tcp_flags": {"syn": true, "ack": false}}
 }
+
+# =============================================================================
+# R79: IPv6 ADDRESS-FAMILY COVERAGE
+# =============================================================================
+# allowed_subnets defaulted to {"0.0.0.0/0"} — an IPv4-only wildcard.
+# net.cidr_contains() is family-strict, so no IPv6 address is ever contained in
+# an IPv4 CIDR: ip_in_subnets("2001:db8::1", {"0.0.0.0/0"}) is false. RULE 1
+# (deny_ip_spoofing) and RULE 5 (deny_ingress_egress) are both enabled by
+# default and both fire on that false, so EVERY IPv6 packet — benign TCP, UDP,
+# ICMPv6, the lot — was denied with deny_reason == "IP spoofing detected".
+# The deny-override model's documented contract ("traffic passes by default")
+# was violated for an entire address family, and internal/packet parses IPv6
+# (including extension headers), so the firewall silently dropped 100% of IPv6
+# traffic in its shipped configuration.
+#
+# The default allowlist must therefore carry a wildcard for BOTH families.
+# The helper itself is NOT made family-tolerant on purpose: an operator who
+# configures a v4-only allowlist is keeping IPv6 fail-CLOSED (unlisted family
+# = denied), which is the safe reading of an explicit restriction. Only the
+# shipped default — whose intent is "allow everything" — was wrong.
+
+test_ip_in_subnets_v6_wildcard if { ip_in_subnets("2001:db8::1", {"::/0"}) }
+
+# A benign IPv6 packet must pass with the shipped default configuration.
+test_default_allows_benign_ipv6_tcp if {
+    allow with input.packet as {"protocol": "TCP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 80, "tcp_flags": {"syn": true, "ack": false}}
+}
+test_default_allows_benign_ipv6_udp if {
+    allow with input.packet as {"protocol": "UDP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 53}
+}
+test_default_allows_benign_ipv6_icmpv6 if {
+    allow with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 128, "icmp_code": 0}
+}
+test_default_ipv6_traffic_produces_no_deny_reason if {
+    allow
+    not deny_reason
+        with input.packet as {"protocol": "TCP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 80, "tcp_flags": {"syn": true, "ack": false}}
+}
+
+# The R79 fix must not blind the deny rules that DO apply to IPv6: a SYN to a
+# blocked port from an IPv6 source is still denied — and now for the right
+# reason (pre-fix the packet was denied as "IP spoofing detected", which masked
+# the port rule entirely).
+test_ipv6_blocked_port_denied_for_the_port_reason if {
+    allow == false
+        with input.packet as {"protocol": "TCP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 22, "tcp_flags": {"syn": true, "ack": false}}
+    deny_reason == "blocked port 22 (TCP)"
+        with input.packet as {"protocol": "TCP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 22, "tcp_flags": {"syn": true, "ack": false}}
+}
+test_ipv6_udp_blocked_port_denied if {
+    allow == false
+        with input.packet as {"protocol": "UDP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 3389}
+}
+
+# An IPv6 allowlist still enforces IPv6 source authorization (anti-spoofing on
+# the v6 side, the RULE 1 contract applied to a v6 prefix).
+test_ipv6_source_outside_v6_allowlist_denied if {
+    allow == false
+        with allowed_subnets as {"2001:db8::/32"}
+        with input.packet as {"protocol": "TCP", "src_ip": "2001:dead::1", "dst_ip": "2001:db8::2", "dst_port": 80, "tcp_flags": {"syn": true, "ack": false}}
+}
+test_ipv6_source_inside_v6_allowlist_allowed if {
+    allow
+        with allowed_subnets as {"2001:db8::/32"}
+        with input.packet as {"protocol": "TCP", "src_ip": "2001:db8::9", "dst_ip": "2001:db8::2", "dst_port": 80, "tcp_flags": {"syn": true, "ack": false}}
+}
+
+# A v4-only operator allowlist keeps IPv6 fail-closed (documented semantics —
+# the helper is deliberately family-strict, only the shipped default changed).
+test_v4_only_allowlist_keeps_ipv6_denied if {
+    not allow
+        with allowed_subnets as {"10.0.0.0/8"}
+        with input.packet as {"protocol": "TCP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 80, "tcp_flags": {"syn": true, "ack": false}}
+}
+
+# Regression: the IPv4 default path is unchanged.
+test_default_allows_benign_ipv4_tcp if {
+    allow with input.packet as {"protocol": "TCP", "src_ip": "10.0.1.100", "dst_ip": "10.0.2.50", "dst_port": 80, "tcp_flags": {"syn": true, "ack": false}}
+}
+test_default_allows_benign_ipv4_udp if {
+    allow with input.packet as {"protocol": "UDP", "src_ip": "10.0.1.100", "dst_ip": "10.0.2.50", "dst_port": 53}
+}
+test_ipv4_blocked_port_still_denied if {
+    allow == false with input.packet as {"protocol": "TCP", "src_ip": "10.0.1.100", "dst_ip": "10.0.2.50", "dst_port": 22, "tcp_flags": {"syn": true, "ack": false}}
+}
