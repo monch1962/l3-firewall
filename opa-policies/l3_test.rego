@@ -170,6 +170,62 @@ test_fragment_attack_disabled if {
 }
 
 # =============================================================================
+# RULE 11b: UNINSPECTABLE FRAGMENT (RFC 1858 tiny fragment) — R80
+# =============================================================================
+# internal/packet sets fragment.l4_incomplete when a packet must carry an L4
+# header but does not (a first fragment short of its protocol's minimum header
+# size). No L4-keyed rule can judge such a packet, while the destination
+# reassembles the datagram and processes the segment — so it is denied
+# fail-closed, with the reason visible in the log and the deny_reason document.
+
+test_incomplete_fragment_blocked if {
+    not allow with input.packet as {
+        "protocol": "TCP", "dst_port": 0, "fragment": {
+            "is_fragment": true, "offset": 0, "more_fragments": true, "l4_incomplete": true,
+        },
+    }
+}
+test_incomplete_fragment_reason if {
+    deny_reason == "uninspectable fragment: incomplete L4 header (RFC 1858 tiny fragment)" with input.packet as {
+        "protocol": "TCP", "dst_port": 0, "fragment": {
+            "is_fragment": true, "offset": 0, "more_fragments": true, "l4_incomplete": true,
+        },
+    }
+}
+# A first fragment carrying its COMPLETE L4 header is judged by the ordinary
+# port rules instead: it must NOT be dropped by the incompleteness rule, and a
+# benign port has to stay allowed (legitimate fragmented traffic keeps working).
+test_complete_header_fragment_not_marked_incomplete if {
+    allow with input.packet as {
+        "protocol": "TCP", "dst_port": 443, "fragment": {
+            "is_fragment": true, "offset": 0, "more_fragments": true, "l4_incomplete": false,
+        },
+    }
+}
+test_complete_header_fragment_blocked_port_still_denied if {
+    not allow with input.packet as {
+        "protocol": "TCP", "dst_port": 22, "fragment": {
+            "is_fragment": true, "offset": 0, "more_fragments": true, "l4_incomplete": false,
+        },
+    }
+}
+# A continuation fragment (offset > 0) is never marked incomplete: the header
+# is judged in the datagram's first fragment.
+test_continuation_fragment_not_blocked_by_incompleteness_rule if {
+    allow with input.packet as {
+        "protocol": "TCP", "dst_port": 443, "fragment": {
+            "is_fragment": true, "offset": 5, "more_fragments": false, "l4_incomplete": false,
+        },
+    }
+}
+# Absent field (pre-R80 input shape) must not change any existing decision.
+test_incomplete_fragment_absent_field_allows if {
+    allow with input.packet as {
+        "protocol": "TCP", "dst_port": 443, "fragment": {"is_fragment": true, "offset": 0, "more_fragments": true},
+    }
+}
+
+# =============================================================================
 # PORT RANGES
 # =============================================================================
 

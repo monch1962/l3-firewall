@@ -231,6 +231,38 @@ allow := false if { deny_fragment_attack }
 deny_reasons contains sprintf("fragment attack: offset=%v", [input.packet.fragment.offset]) if { deny_fragment_attack }
 
 # =============================================================================
+# RULE 11b: Uninspectable fragment — L4 header not (fully) on the wire
+# =============================================================================
+
+# A packet whose L4 header is not fully on the wire cannot be judged by ANY
+# L4-keyed rule: it carries no ports, no flags and no ICMP type, so
+# deny_blocked_port, deny_source_port, deny_syn_flood, deny_port_scan,
+# deny_protocol_anomaly, deny_state_violation and deny_icmp are all inert —
+# while the DESTINATION reassembles the datagram and processes the segment.
+# internal/packet reports that condition as `fragment.l4_incomplete` on both
+# address families (R80), and this rule drops the packet: the fail-closed
+# doctrine already applied to unparseable packets (engine packetHandler) and to
+# undecidable OPA input (R78). Leaving it to "allow" made every port and flag
+# rule evadeable by sending the segment as two IP fragments whose first
+# fragment stops short of the 20-byte TCP header (RFC 1858 tiny fragment) —
+# and, on the IPv4 plane alone, even a first fragment carrying the COMPLETE
+# header was reported with zero ports before the R80 parser fix.
+#
+# Deliberately NOT gated on enable_fragment: a control an attacker evades by
+# splitting the segment at byte 4 is not a control. Legitimate fragmented
+# traffic carries the COMPLETE L4 header in its FIRST fragment (fragmentation
+# is 8-byte aligned and the minimum MTU leaves room for a 20-byte TCP header),
+# so this rule does not touch it — a complete-header first fragment is judged
+# by the ordinary L4 rules, and continuation fragments (offset > 0) are never
+# marked incomplete.
+deny_incomplete_fragment if {
+    input.packet.fragment.l4_incomplete == true
+}
+
+allow := false if { deny_incomplete_fragment }
+deny_reasons contains "uninspectable fragment: incomplete L4 header (RFC 1858 tiny fragment)" if { deny_incomplete_fragment }
+
+# =============================================================================
 # RULE 12: Source Port Filtering — block traffic from specific source ports
 # =============================================================================
 

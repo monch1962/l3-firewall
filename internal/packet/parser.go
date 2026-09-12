@@ -22,6 +22,20 @@ type FragmentInfo struct {
 	IsFragment    bool `json:"is_fragment"`
 	MoreFragments bool `json:"more_fragments"`
 	Offset        int  `json:"offset"` // fragment offset in 8-byte units
+	// L4Incomplete reports a packet that MUST carry an L4 header but does not
+	// (R80): a first fragment (offset 0) short of its protocol's minimum
+	// header size, at either address family. No L4-keyed rule can judge such a
+	// packet — it has no ports, flags or ICMP type on the wire — while the
+	// destination reassembles the datagram and processes the segment (the
+	// classic RFC 1858 tiny-fragment firewall evasion). The shipped policy
+	// denies it (fail-closed on input that cannot be judged, the R40.3/R49
+	// doctrine for uninspectable packets).
+	//
+	// Always false for a NON-first fragment (offset > 0): an L4 header is not
+	// expected on the wire there — the datagram's FIRST fragment carries it and
+	// is judged there. Marking continuation fragments would deny every
+	// legitimate fragmented datagram.
+	L4Incomplete bool `json:"l4_incomplete"`
 }
 
 // IPv6ExtHeaderType is a string representation of an IPv6 extension header.
@@ -98,8 +112,44 @@ func parseIPv4Packet(raw []byte) (*PacketInfo, error) {
 		},
 	}
 
-	// Populate L4 fields based on the IP protocol number.
-	populateL4(info, packet, ipv4.Protocol)
+	// Populate L4 fields from the RAW bytes at IHL*4 — the offset the
+	// destination's reassembled datagram carries its L4 header at.
+	//
+	// R80: the pre-R80 path used gopacket's DECODED layers (populateL4), and
+	// gopacket refuses to decode the L4 layer of ANY fragmented IPv4 packet
+	// (MF set or offset > 0). A FIRST fragment (offset 0, MF set) whose
+	// payload begins with a complete TCP header was therefore reported as
+	// protocol "TCP" with src_port/dst_port 0 and every flag false: every
+	// L4-keyed rule (blocked_ports, source-port filtering, SYN flood, port
+	// scan, protocol anomaly, state violation, ICMP type/code) went inert
+	// while the destination reassembled the datagram and delivered the
+	// unchanged segment — the R79.2 class on the IPv4 plane, which R79 fixed
+	// for IPv6 only. Reading the bytes the kernel acts on, at the same offset
+	// the IPv6 chain walk resolves to behind a Fragment header with offset 0,
+	// makes the two planes judge a fragmented packet identically.
+	//
+	// A NON-first fragment (offset > 0) carries only continuation data — no
+	// L4 header is on the wire — so it keeps the protocol-only contract and is
+	// NOT marked L4Incomplete: the datagram's first fragment is where the
+	// header is judged, and marking continuations would deny every legitimate
+	// fragmented datagram.
+	if ipv4.FragOffset > 0 {
+		info.Protocol = protocolName(ipv4.Protocol)
+		return info, nil
+	}
+	// A malformed IHL (< 5) puts the L4 offset INSIDE the IP header, where
+	// reading "ports" would fabricate them out of the IP header's own bytes
+	// (measured pre-R80: gopacket rejected the layer, so the fields stayed
+	// zero). Such a packet is uninspectable — the kernel drops it — so report
+	// the protocol name only and mark it incomplete rather than inventing
+	// evidence.
+	l4Off := int(ipv4.IHL) * 4
+	if l4Off < ipv4HeaderLen {
+		info.Protocol = protocolName(ipv4.Protocol)
+		info.Fragment.L4Incomplete = true
+		return info, nil
+	}
+	populateL4FromBytes(info, raw, l4Off, ipv4.Protocol)
 	return info, nil
 }
 
@@ -115,15 +165,18 @@ var extHeaderTypes = map[layers.IPProtocol]IPv6ExtHeaderType{
 }
 
 const (
+	// ipv4HeaderLen is the minimum IPv4 header size, i.e. IHL == 5.
+	ipv4HeaderLen = 20
 	// ipv6HeaderLen is the fixed IPv6 header size (RFC 8200 §3).
 	ipv6HeaderLen = 40
 	// ipv6FragmentHeaderLen is the fixed Fragment extension header size
 	// (RFC 8200 §4.5) — it has no Hdr Ext Len field.
 	ipv6FragmentHeaderLen = 8
 	// Minimum L4 header sizes used before reading port/flag/type fields.
-	tcpMinHeaderLen   = 20
-	udpHeaderLen      = 8
-	icmp6MinHeaderLen = 4 // type + code + checksum
+	tcpMinHeaderLen = 20
+	udpHeaderLen    = 8
+	// icmpMinHeaderLen is the ICMPv4/ICMPv6 minimum (type + code + checksum).
+	icmpMinHeaderLen = 4
 )
 
 // ipv6HeaderChain is the result of following an IPv6 packet's next-header chain
@@ -236,19 +289,33 @@ func walkIPv6HeaderChain(raw []byte, first layers.IPProtocol) ipv6HeaderChain {
 
 // populateL4FromBytes fills the L4 fields the policy keys on — protocol name,
 // ports, TCP flags, ICMP type/code — directly from the packet bytes at off (the
-// offset walkIPv6HeaderChain resolved). It is the IPv6 counterpart of
-// populateL4, which reads gopacket's decoded layers for IPv4; the IPv6 path
-// cannot use those layers because gopacket does not decode the L4 header behind
-// an IPv6 extension header (see walkIPv6HeaderChain).
+// offset walkIPv6HeaderChain resolved, or IHL*4 for IPv4 since R80).
 //
-// off < 0, or a packet too short to hold the respective header, sets the
-// protocol name and leaves the remaining fields zero — the honest
-// "no L4 header on the wire" report.
+// It is the ONLY L4 population path for both address families: gopacket's
+// decoded layers cannot be trusted for this job. For IPv6, gopacket does not
+// decode the L4 layer behind an extension header; for IPv4, gopacket refuses to
+// decode the L4 layer of ANY fragmented packet — including a FIRST fragment
+// (offset 0, MF set) whose payload begins with the L4 header the destination
+// reassembles and the kernel acts on (R79 and R80 respectively).
+//
+// off < 0, or a packet too short to hold the protocol's minimum header, sets
+// the protocol name and leaves the remaining fields zero — the honest "no L4
+// header on the wire" report. When a header IS expected at off but does not fit
+// (off >= 0), Fragment.L4Incomplete is set so the policy can fail closed on a
+// packet no L4-keyed rule can judge (R80: the RFC 1858 tiny-fragment evasion —
+// the destination still reassembles and processes the segment). Partial fields
+// are never reported: an incomplete header yields zeros, not invented ports.
 func populateL4FromBytes(info *PacketInfo, raw []byte, off int, proto layers.IPProtocol) {
+	info.Protocol = protocolName(proto)
+	if off < 0 {
+		// No L4 header is on the wire at all (non-first fragment, or a
+		// truncated chain): nothing to report and nothing to expect.
+		return
+	}
 	switch proto {
 	case layers.IPProtocolTCP:
-		info.Protocol = "TCP"
-		if off < 0 || off+tcpMinHeaderLen > len(raw) {
+		if off+tcpMinHeaderLen > len(raw) {
+			info.Fragment.L4Incomplete = true
 			return
 		}
 		info.SrcPort = binary.BigEndian.Uint16(raw[off : off+2])
@@ -262,30 +329,45 @@ func populateL4FromBytes(info *PacketInfo, raw []byte, off int, proto layers.IPP
 		}
 
 	case layers.IPProtocolUDP:
-		info.Protocol = "UDP"
-		if off < 0 || off+udpHeaderLen > len(raw) {
+		if off+udpHeaderLen > len(raw) {
+			info.Fragment.L4Incomplete = true
 			return
 		}
 		info.SrcPort = binary.BigEndian.Uint16(raw[off : off+2])
 		info.DstPort = binary.BigEndian.Uint16(raw[off+2 : off+4])
 
-	case layers.IPProtocolICMPv6:
-		// Named separately from IPv4 "ICMP" so the shipped policy's ICMP rules
-		// (keyed on protocol == "ICMP", thresholds tuned for IPv4 and for
-		// traffic such as NDP/router advertisements that IPv6 needs) do not
-		// silently start policing ICMPv6. Pre-R79 ICMPv6 fell through to the
-		// default branch as "IP-58" with nil type/code, so no rule, log field
-		// or OPA input field could identify it at all.
-		info.Protocol = "ICMPv6"
-		if off < 0 || off+icmp6MinHeaderLen > len(raw) {
+	case layers.IPProtocolICMPv4, layers.IPProtocolICMPv6:
+		// ICMPv6 is named separately from IPv4 "ICMP" so the shipped policy's
+		// ICMP rules (keyed on protocol == "ICMP", thresholds tuned for IPv4
+		// and for traffic such as NDP/router advertisements that IPv6 needs)
+		// do not silently start policing ICMPv6 (R79).
+		if off+icmpMinHeaderLen > len(raw) {
+			info.Fragment.L4Incomplete = true
 			return
 		}
 		t, c := raw[off], raw[off+1]
 		info.ICMPType = &t
 		info.ICMPCode = &c
+	}
+}
 
+// protocolName maps an IP protocol number to the policy-facing protocol name
+// without reading any L4 bytes — the naming half of populateL4FromBytes, for
+// packets that carry no readable L4 header (non-first fragments and truncated
+// chains). The switch is deliberately identical to populateL4FromBytes's so a
+// packet's protocol name never depends on whether its L4 header was readable.
+func protocolName(proto layers.IPProtocol) string {
+	switch proto {
+	case layers.IPProtocolTCP:
+		return "TCP"
+	case layers.IPProtocolUDP:
+		return "UDP"
+	case layers.IPProtocolICMPv4:
+		return "ICMP"
+	case layers.IPProtocolICMPv6:
+		return "ICMPv6"
 	default:
-		info.Protocol = fmt.Sprintf("IP-%d", proto)
+		return fmt.Sprintf("IP-%d", proto)
 	}
 }
 
@@ -328,73 +410,6 @@ func parseIPv6Packet(raw []byte) (*PacketInfo, error) {
 
 	populateL4FromBytes(info, raw, chain.L4Offset, chain.L4Proto)
 	return info, nil
-}
-
-// populateL4 fills in L4 protocol fields (TCP, UDP, ICMP, ICMPv6) from a
-// decoded packet.
-func populateL4(info *PacketInfo, packet gopacket.Packet, proto layers.IPProtocol) {
-	switch proto {
-	case layers.IPProtocolTCP:
-		info.Protocol = "TCP"
-		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-			tcp, ok := tcpLayer.(*layers.TCP)
-			if ok {
-				info.SrcPort = uint16(tcp.SrcPort)
-				info.DstPort = uint16(tcp.DstPort)
-				info.TCPFlags = TCPFlags{
-					SYN: tcp.SYN,
-					ACK: tcp.ACK,
-					RST: tcp.RST,
-					FIN: tcp.FIN,
-				}
-			}
-		}
-
-	case layers.IPProtocolUDP:
-		info.Protocol = "UDP"
-		if udpLayer := packet.Layer(layers.LayerTypeUDP); udpLayer != nil {
-			udp, ok := udpLayer.(*layers.UDP)
-			if ok {
-				info.SrcPort = uint16(udp.SrcPort)
-				info.DstPort = uint16(udp.DstPort)
-			}
-		}
-
-	case layers.IPProtocolICMPv4:
-		info.Protocol = "ICMP"
-		if icmpLayer := packet.Layer(layers.LayerTypeICMPv4); icmpLayer != nil {
-			icmp, ok := icmpLayer.(*layers.ICMPv4)
-			if ok {
-				t := uint8(icmp.TypeCode.Type())
-				c := uint8(icmp.TypeCode.Code())
-				info.ICMPType = &t
-				info.ICMPCode = &c
-			}
-		}
-
-	case layers.IPProtocolICMPv6:
-		// R79: ICMPv6 fell through to the default branch as protocol "IP-58"
-		// with nil type/code, so no policy rule, conntrack timeout, log field
-		// or OPA input field could ever identify an ICMPv6 packet. It is named
-		// separately from IPv4 "ICMP" so the shipped policy's ICMP rules
-		// (keyed on protocol == "ICMP", tuned thresholds for IPv4) do not
-		// silently start policing ICMPv6 — notably NDP/RA traffic that IPv6
-		// needs. Operators can police it explicitly via blocked_protocols or a
-		// v6-specific rule now that the type/code are reported.
-		info.Protocol = "ICMPv6"
-		if icmpLayer := packet.Layer(layers.LayerTypeICMPv6); icmpLayer != nil {
-			icmp, ok := icmpLayer.(*layers.ICMPv6)
-			if ok {
-				t := uint8(icmp.TypeCode.Type())
-				c := uint8(icmp.TypeCode.Code())
-				info.ICMPType = &t
-				info.ICMPCode = &c
-			}
-		}
-
-	default:
-		info.Protocol = fmt.Sprintf("IP-%d", proto)
-	}
 }
 
 // extractMAC returns the source and destination MAC addresses from the ethernet layer.
