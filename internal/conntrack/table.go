@@ -286,7 +286,14 @@ func (t *Table) idleTimeoutFor(protocol string) time.Duration {
 	switch protocol {
 	case "UDP":
 		return t.cfg.UDPTimeout
-	case "ICMP":
+	case "ICMP", "ICMPv6":
+		// R81: ICMPv6 is a distinct protocol NAME in the policy/conntrack key
+		// space (internal/packet reports "ICMPv6" so RULE 7 can police it), and
+		// before this case it fell through to the TCP timeout — ICMPv6 flows
+		// lived 300s instead of 5s. ICMP-family flows have no handshake for the
+		// table to key on, so they need the short timeout at BOTH families; the
+		// 60x residency let a spoofed-source ICMPv6 flood pin the flow table
+		// against legitimate traffic 60x more effectively.
 		return t.cfg.ICMPTimeout
 	default:
 		return t.cfg.IdleTimeout

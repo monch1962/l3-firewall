@@ -37,12 +37,22 @@ blocked_ports := {22, 23, 3389, 5900, 5901} # Blocked TCP/UDP ports
 blocked_protocols := {}                      # Blocked IP protocols (e.g. {"ICMP"})
 
 # ICMP control
+# RULE 7 must cover BOTH families the parser classifies: IPv4 ICMP is protocol
+# "ICMP", IPv6 ICMP is protocol "ICMPv6" (R79). The type/code sets are
+# per-family because the type spaces differ (echo request is 8 on v4, 128 on
+# v6), and keeping them separate means an operator's v4 tuning is never applied
+# to IPv6 plumbing such as NDP/router advertisements. The v6 sets default to the
+# direct twins of the v4 defaults so "block ping" means the same thing on both
+# families.
 blocked_icmp_types := {8}                    # Blocked ICMP types (8 = Echo Request)
 blocked_icmp_codes := {}                     # Blocked ICMP codes
+blocked_icmpv6_types := {128}                # Blocked ICMPv6 types (128 = Echo Request) — R81
+blocked_icmpv6_codes := {}                   # Blocked ICMPv6 codes — R81
 
 # Rate limits
 syn_rate_per_second := 100                   # SYN flood threshold (packets/sec)
 icmp_rate_per_second := 10                   # ICMP flood threshold (packets/sec)
+icmpv6_rate_per_second := 100                # ICMPv6 flood threshold (packets/sec) — R81
 max_packets_per_second := 10000              # Per-IP rate limit (packets/sec)
 max_port_pps := 500                          # Per-destination-port rate limit (packets/sec)
 max_new_connections_per_second := 1000       # Per-IP new connection rate limit
@@ -186,6 +196,30 @@ deny_reasons contains sprintf("blocked ICMP type=%v code=%v", [input.packet.icmp
 deny_icmp_flood if { input.packet.protocol == "ICMP"; input.rate.src_ip_pps > icmp_rate_per_second }
 allow := false if { deny_icmp_flood }
 deny_reasons contains "ICMP flood detected" if { deny_icmp_flood }
+
+# R81 — the ICMPv6 half of RULE 7. R79 gave internal/packet an "ICMPv6"
+# protocol name with icmp_type/icmp_code populated, but the two rule bodies
+# above test protocol == "ICMP" literally, so an ICMPv6 packet could never match
+# either one: "block echo request" was unimplementable for v6 (even listing 128
+# in blocked_icmp_types had no effect) and the ICMP flood control did not exist
+# on the v6 family — the destination still answers the echo and still absorbs
+# the flood. The v6 rules are separate so their deny reasons stay unambiguous
+# and so v4 operator tuning is never applied to v6 plumbing (NDP type 133-137
+# and RA 134 are not in the default v6 set). The v6 flood threshold is 10x the
+# v4 one: legitimate neighbour-discovery bursts must not be policed by a
+# number tuned for IPv4 ping floods, while a real ICMPv6 flood is thousands of
+# packets per second.
+deny_icmpv6 if { input.packet.protocol == "ICMPv6"; blocked_icmpv6_types[input.packet.icmp_type] }
+allow := false if { deny_icmpv6 }
+
+deny_icmpv6 if { input.packet.protocol == "ICMPv6"; blocked_icmpv6_codes[input.packet.icmp_code] }
+allow := false if { deny_icmpv6 }
+
+deny_reasons contains sprintf("blocked ICMPv6 type=%v code=%v", [input.packet.icmp_type, input.packet.icmp_code]) if { deny_icmpv6 }
+
+deny_icmpv6_flood if { input.packet.protocol == "ICMPv6"; input.rate.src_ip_pps > icmpv6_rate_per_second }
+allow := false if { deny_icmpv6_flood }
+deny_reasons contains "ICMPv6 flood detected" if { deny_icmpv6_flood }
 
 # =============================================================================
 # RULE 8: Connection State Violation — RST to non-existent flow

@@ -543,8 +543,14 @@ test_default_allows_benign_ipv6_tcp if {
 test_default_allows_benign_ipv6_udp if {
     allow with input.packet as {"protocol": "UDP", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "dst_port": 53}
 }
+# R81: this test used to send an ICMPv6 ECHO REQUEST (type 128) and assert it
+# was allowed — R79 documented that the policy's ICMP rules were IPv4-keyed, so
+# ICMPv6 was visible to the parser but unpoliced. R81 makes RULE 7
+# family-complete: a v6 echo request is now denied (the v6 twin of blocked
+# IPv4 type 8), while genuine IPv6 plumbing stays allowed. Neighbour
+# solicitation (type 135) is the benign-ICMPv6 case that must keep flowing.
 test_default_allows_benign_ipv6_icmpv6 if {
-    allow with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 128, "icmp_code": 0}
+    allow with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 135, "icmp_code": 0}
 }
 test_default_ipv6_traffic_produces_no_deny_reason if {
     allow
@@ -597,4 +603,66 @@ test_default_allows_benign_ipv4_udp if {
 }
 test_ipv4_blocked_port_still_denied if {
     allow == false with input.packet as {"protocol": "TCP", "src_ip": "10.0.1.100", "dst_ip": "10.0.2.50", "dst_port": 22, "tcp_flags": {"syn": true, "ack": false}}
+}
+
+# =============================================================================
+# R81 — RULE 7 is family-complete: the ICMP controls must police ICMPv6 too
+# =============================================================================
+# R79 taught internal/packet to classify ICMPv6 as protocol "ICMPv6" and to
+# populate icmp_type/icmp_code, but RULE 7's two bodies were keyed on
+# protocol == "ICMP" — so a v6 echo request could never match blocked_icmp_types
+# (even if an operator listed 128) and the flood control did not exist for the
+# v6 family at all. The v6 type set defaults to {128} (echo request, the twin of
+# IPv4 type 8) and the v6 flood threshold is 10x the IPv4 one so legitimate
+# neighbour-discovery bursts are not policed by IPv4-tuned numbers.
+
+test_icmpv6_echo_request_blocked if {
+    not allow with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 128, "icmp_code": 0}
+}
+test_icmpv6_echo_request_deny_reason if {
+    allow == false with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 128, "icmp_code": 0}
+    deny_reason == "blocked ICMPv6 type=128 code=0" with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 128, "icmp_code": 0}
+}
+test_icmpv6_echo_reply_allowed if {
+    allow with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 129, "icmp_code": 0}
+}
+test_icmpv6_neighbor_solicitation_allowed if {
+    allow with input.packet as {"protocol": "ICMPv6", "src_ip": "fe80::1", "dst_ip": "ff02::1:ff00:2", "icmp_type": 135, "icmp_code": 0}
+}
+test_icmpv6_router_advertisement_allowed_by_default if {
+    allow with input.packet as {"protocol": "ICMPv6", "src_ip": "fe80::1", "dst_ip": "ff02::1", "icmp_type": 134, "icmp_code": 0}
+}
+test_icmpv6_type_set_is_operator_extendable if {
+    not allow
+        with blocked_icmpv6_types as {128, 136}
+        with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 136, "icmp_code": 0}
+}
+test_icmpv6_flood_blocked if {
+    not allow
+        with input.rate as {"src_ip_pps": 500}
+        with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 129, "icmp_code": 0}
+}
+test_icmpv6_flood_deny_reason if {
+    allow == false
+        with input.rate as {"src_ip_pps": 500}
+        with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 129, "icmp_code": 0}
+    deny_reason == "ICMPv6 flood detected"
+        with input.rate as {"src_ip_pps": 500}
+        with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 129, "icmp_code": 0}
+}
+# The v6 threshold is deliberately higher than the IPv4 one: NDP/MLD bursts are
+# legitimate, an ICMP flood is thousands of packets per second.
+test_icmpv6_below_v6_flood_threshold_allowed if {
+    allow
+        with input.rate as {"src_ip_pps": 50}
+        with input.packet as {"protocol": "ICMPv6", "src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "icmp_type": 129, "icmp_code": 0}
+}
+# Regressions: the IPv4 arm of RULE 7 is unchanged.
+test_icmpv4_echo_request_still_blocked_r81 if {
+    allow == false with input.packet as {"protocol": "ICMP", "src_ip": "10.0.0.1", "dst_ip": "10.0.0.2", "icmp_type": 8, "icmp_code": 0}
+}
+test_icmpv4_flood_still_blocked_r81 if {
+    allow == false
+        with input.rate as {"src_ip_pps": 200}
+        with input.packet as {"protocol": "ICMP", "src_ip": "10.0.0.1", "dst_ip": "10.0.0.2", "icmp_type": 0, "icmp_code": 0}
 }
