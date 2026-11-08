@@ -41,6 +41,15 @@ type Blocklist struct {
 	nets    []*net.IPNet        // CIDR network entries
 	netKeys map[string]struct{} // canonical CIDR string -> present (R45 dedup)
 	stopCh  chan struct{}
+
+	// One-shot warning latches, guarded by mu. Every silent-drop path in
+	// Add warns ONCE per process: a hostile feed can carry thousands of
+	// offending lines per refresh, so an unlatched warning would be a
+	// log-flood vector of its own (the R54 overlong-line posture). The
+	// latch is what makes the drop observable at all (R82.2).
+	capWarned    bool // total entry cap reached — new intelligence dropped
+	netCapWarned bool // distinct-CIDR cap reached (R58)
+	familyWarned bool // whole-address-family entry rejected (R82)
 }
 
 // NewBlocklist creates an empty blocklist.
@@ -52,64 +61,131 @@ func NewBlocklist() *Blocklist {
 	}
 }
 
+// wholeFamilyNet reports whether the parsed network matches every address
+// of an address family, i.e. it asserts "everything is hostile".
+//
+// This is the shape an IPv4-mapped IPv6 CIDR collapses into. Go's
+// net.IPNet.Contains normalises an IPv4 source with To4() and then compares
+// the masked 4-byte tail (networkNumberAndMask rewrites a 16-byte mask to
+// its last 4 bytes when the network address is mapped), so
+//
+//	::ffff:0:0/96  ->  canonical "0.0.0.0/0"  -> matches EVERY IPv4 source
+//
+// A blocklist entry spelled that way is common in the wild — it is the
+// canonical "the IPv4-mapped space" entry that SSRF/deny lists use to mean
+// "IPv4-mapped literals only" — and here it silently blackholes the whole
+// IPv4 plane from ONE feed line (R82.1; same whole-family false-block class
+// as R79.1). No threat-intel entry can meaningfully assert "all addresses";
+// a firewall-wide block belongs in the policy, where it is explicit and
+// auditable. Mapped entries that DO name IPv4 addresses
+// (::ffff:a.b.c.d/(96+N)) are unaffected: their effective v4 prefix is N>0.
+func wholeFamilyNet(ipnet *net.IPNet) bool {
+	ones, bits := ipnet.Mask.Size()
+	if ones == 0 {
+		// 0.0.0.0/0 or ::/0.
+		return true
+	}
+	if bits == 128 && ones == 96 && ipnet.IP.To4() != nil {
+		// The IPv4-mapped space itself: /96 in the mapped range is a /0
+		// once the network address is normalised to 4 bytes.
+		return true
+	}
+	return false
+}
+
 // Add inserts an IP or CIDR into the blocklist. Supports both exact IPs
 // (e.g. "10.0.0.1") and CIDR notation (e.g. "10.0.0.0/24").
 // IPv4-mapped IPv6 addresses (e.g. "::ffff:10.0.0.1") are normalized
 // to their IPv4 form via To4() so they match bare IPv4 entries.
-func (bl *Blocklist) Add(entry string) {
+//
+// Returns true when this call is what made the entry present, false when
+// the entry was rejected (unparseable, whole-address-family, list at
+// capacity) or was already present. Callers use the bool to report an
+// honest "new entries" count: the pre-R82 signal-free Add let a feed that
+// had filled the cap keep logging a healthy refresh while the deny plane
+// silently stopped consuming new threat intelligence (R82.2 — the R40.4
+// silently-dropped-control doctrine applied to the threat-intel plane).
+func (bl *Blocklist) Add(entry string) bool {
 	if bl == nil {
-		return
+		return false
 	}
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 
 	// Check total cap
 	if len(bl.ips)+len(bl.nets) >= maxBlocklistEntries {
-		return
+		if !bl.capWarned {
+			bl.capWarned = true
+			slog.Warn("threat intel: blocklist at capacity — new entries are being dropped",
+				"cap", maxBlocklistEntries, "entries", len(bl.ips)+len(bl.nets))
+		}
+		return false
 	}
 
 	if strings.Contains(entry, "/") {
 		_, ipnet, err := net.ParseCIDR(entry)
-		if err == nil {
-			// Dedup on the canonical form: StartRefresher re-fetches the
-			// same feed every interval and old entries are never cleared,
-			// so a stable CIDR list re-appends every network each cycle.
-			// Without dedup the nets slice grows monotonically until the
-			// cap fills with DUPLICATES — newly discovered threats are then
-			// silently dropped by the cap check and Contains() scans tens
-			// of thousands of duplicate networks per packet (R45 — CIDR
-			// duplicate accumulation).
-			key := ipnet.String()
-			if _, dup := bl.netKeys[key]; dup {
-				return
-			}
-			// Separate distinct-network cap (R58): Contains() scans the
-			// WHOLE nets slice on every packet in the NFQUEUE hot path
-			// (engine.evaluatePacket calls threatIntel.Contains per packet
-			// before OPA evaluation). The R45 dedup stops DUPLICATES from
-			// accumulating, but the total cap (ips+nets jointly, 500k)
-			// still lets a single malicious feed fetch fill all 500k slots
-			// with DISTINCT networks — measured ~4.7ms scan per packet,
-			// stalling the receive loop and dropping all traffic. Exact IPs
-			// are O(1) map lookups and keep the full budget; networks are
-			// O(n) per packet and get their own bound.
-			if len(bl.nets) >= maxCIDRNetworks {
-				return
-			}
-			bl.netKeys[key] = struct{}{}
-			bl.nets = append(bl.nets, ipnet)
+		if err != nil {
+			return false
 		}
-	} else {
-		ip := net.ParseIP(entry)
-		if ip != nil {
-			// Normalize IPv4-mapped IPv6 to IPv4 form for consistent matching
-			if ip4 := ip.To4(); ip4 != nil {
-				bl.ips[ip4.String()] = struct{}{}
-			} else {
-				bl.ips[ip.String()] = struct{}{}
+		if wholeFamilyNet(ipnet) {
+			if !bl.familyWarned {
+				bl.familyWarned = true
+				slog.Warn("threat intel: rejecting whole-address-family entry",
+					"entry", entry, "canonical", ipnet.String())
 			}
+			return false
 		}
+		// Dedup on the canonical form: StartRefresher re-fetches the
+		// same feed every interval and old entries are never cleared,
+		// so a stable CIDR list re-appends every network each cycle.
+		// Without dedup the nets slice grows monotonically until the
+		// cap fills with DUPLICATES — newly discovered threats are then
+		// silently dropped by the cap check and Contains() scans tens
+		// of thousands of duplicate networks per packet (R45 — CIDR
+		// duplicate accumulation).
+		key := ipnet.String()
+		if _, dup := bl.netKeys[key]; dup {
+			return false
+		}
+		// Separate distinct-network cap (R58): Contains() scans the
+		// WHOLE nets slice on every packet in the NFQUEUE hot path
+		// (engine.evaluatePacket calls threatIntel.Contains per packet
+		// before OPA evaluation). The R45 dedup stops DUPLICATES from
+		// accumulating, but the total cap (ips+nets jointly, 500k)
+		// still lets a single malicious feed fetch fill all 500k slots
+		// with DISTINCT networks — measured ~4.7ms scan per packet,
+		// stalling the receive loop and dropping all traffic. Exact IPs
+		// are O(1) map lookups and keep the full budget; networks are
+		// O(n) per packet and get their own bound.
+		if len(bl.nets) >= maxCIDRNetworks {
+			if !bl.netCapWarned {
+				bl.netCapWarned = true
+				slog.Warn("threat intel: CIDR network cap reached — new networks are being dropped",
+					"cap", maxCIDRNetworks)
+			}
+			return false
+		}
+		bl.netKeys[key] = struct{}{}
+		bl.nets = append(bl.nets, ipnet)
+		return true
 	}
+
+	ip := net.ParseIP(entry)
+	if ip == nil {
+		return false
+	}
+	// Normalize IPv4-mapped IPv6 to IPv4 form for consistent matching
+	var key string
+	if ip4 := ip.To4(); ip4 != nil {
+		key = ip4.String()
+	} else {
+		key = ip.String()
+	}
+	if _, dup := bl.ips[key]; dup {
+		return false
+	}
+	bl.ips[key] = struct{}{}
+	return true
 }
 
 // Contains checks if the given IP is in the blocklist (exact or within a CIDR).
@@ -284,8 +360,14 @@ func (bl *Blocklist) parseReader(r io.Reader) (int, error) {
 			}
 			continue
 		}
-		bl.Add(lineStr)
-		count++
+		// Count only entries that were actually STORED (R82.2): Add
+		// reports false for duplicates, rejected entries and a list at
+		// capacity, so the reported count is new intelligence rather than
+		// lines parsed. Pre-R82 a cap-filled blocklist logged a healthy
+		// "refreshed entries=N" on every cycle while dropping all of them.
+		if bl.Add(lineStr) {
+			count++
+		}
 		if err == io.EOF {
 			return count, nil
 		}

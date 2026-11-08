@@ -44,9 +44,13 @@ func TestAttack_FetchFromURLSSRFViaRedirect(t *testing.T) {
 }
 
 // ── R11.4: Add silently fails after cap is reached ─────────────────
-// Once maxBlocklistEntries is reached, Add() silently drops entries.
-// The count returned from FetchFromURL is misleading — it reports
-// entries parsed from the feed, not entries actually added.
+// Once maxBlocklistEntries is reached, Add() refuses entries. R11
+// documented that the count returned from FetchFromURL was misleading
+// (it reported entries parsed, not entries added) and that the denial
+// was silent; R82 fixed both — Add reports whether it stored the entry,
+// parseReader counts only stored entries, and the cap transition is
+// logged once — so this test now asserts the observable contract instead
+// of logging the gap.
 func TestAttack_AddSilentlyFailsAfterCap(t *testing.T) {
 	bl := NewBlocklist()
 
@@ -62,12 +66,12 @@ func TestAttack_AddSilentlyFailsAfterCap(t *testing.T) {
 		t.Fatalf("expected %d entries at cap, got %d", maxBlocklistEntries, bl.Len())
 	}
 
-	// Adding beyond the cap silently drops entries
-	bl.Add("192.168.1.1")
+	// Adding beyond the cap is refused, and the caller can SEE it (R82).
+	if added := bl.Add("192.168.1.1"); added {
+		t.Error("Add reported success at cap — the drop is still invisible to the caller")
+	}
 	if bl.Contains("192.168.1.1") {
 		t.Error("192.168.1.1 was added despite cap being full")
-	} else {
-		t.Logf("Add beyond cap silently dropped entry 192.168.1.1 (len=%d)", bl.Len())
 	}
 
 	// Also test with CIDR
@@ -75,7 +79,7 @@ func TestAttack_AddSilentlyFailsAfterCap(t *testing.T) {
 	if bl.Len() > maxBlocklistEntries {
 		t.Errorf("CIDR added beyond cap — len=%d exceeds max=%d", bl.Len(), maxBlocklistEntries)
 	}
-	t.Logf("Add beyond cap: len=%d, max=%d — entries silently dropped", bl.Len(), maxBlocklistEntries)
+	t.Logf("Add beyond cap refused with an explicit false (len=%d, max=%d); cap drop logged once", bl.Len(), maxBlocklistEntries)
 }
 
 // ── R11.5: Remove with IP that has multiple CIDR matches ────────────
