@@ -19,7 +19,7 @@ RUN apk add --no-cache ca-certificates tzdata nftables
 WORKDIR /app
 COPY --from=builder /app/l3-firewall .
 COPY --from=builder /app/opa-policies/ ./opa-policies/
-COPY config/params.json ./config/
+COPY config/README.md ./config/
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

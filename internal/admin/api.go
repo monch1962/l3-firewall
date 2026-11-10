@@ -240,17 +240,36 @@ func (a *API) StartServer(addr string) *http.Server {
 }
 
 // StartServerTLS starts the admin HTTP server with TLS in a goroutine.
-// If certFile or keyFile is empty, falls back to plain HTTP.
+//
+// TLS configuration is a CONTROL, so a configuration failure must not remove
+// it silently (R83). Pre-R83 every failure — a missing/expired certificate, a
+// botched rotation, or a certificate planted/removed by an attacker with write
+// access to the configured path (the standing R42/R45/R62/R70 model) — fell
+// through to StartServer and served the SAME routes, including the full-write
+// POST /admin/policy/reload, in CLEARTEXT on the caller's address, returning a
+// nil error. A supervisor cannot detect that downgrade (one log line, no
+// error), a passive observer captures the bearer token — which is full write
+// access to the running firewall's policy — and a MITM can inject a reload
+// response on the same channel. The pre-R83 fallback is exactly the R78/R40.3
+// fail-open doctrine inverted: instead of blocking when a decision cannot be
+// made, it downgraded when a protection could not be established.
+//
+// The empty-paths case is unchanged and deliberate: no certificate means the
+// operator did not request TLS, so plain HTTP is the documented behaviour. A
+// PARTIAL pair (one path set) is a misconfiguration and is rejected.
 func (a *API) StartServerTLS(addr, certFile, keyFile string) (*http.Server, string, error) {
-	if certFile == "" || keyFile == "" {
+	if certFile == "" && keyFile == "" {
 		srv := a.StartServer(addr)
 		return srv, srv.Addr, nil
 	}
+	if certFile == "" || keyFile == "" {
+		return nil, "", fmt.Errorf("admin TLS: both a certificate and a key are required (cert=%q key=%q) — refusing to start an unencrypted admin API", certFile, keyFile)
+	}
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
-		slog.Error("admin API: failed to load TLS cert", "error", err)
-		srv := a.StartServer(addr)
-		return srv, srv.Addr, nil
+		slog.Error("admin API: TLS key material could not be loaded — refusing to start (no plaintext fallback)",
+			"cert", certFile, "key", keyFile, "error", err)
+		return nil, "", fmt.Errorf("admin TLS: loading key pair: %w", err)
 	}
 	listener, err := tls.Listen("tcp", addr, &tls.Config{
 		Certificates: []tls.Certificate{cert},
