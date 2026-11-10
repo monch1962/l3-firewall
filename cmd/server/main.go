@@ -121,6 +121,7 @@ func main() {
 		listenAddr              = flag.String("admin-listen", ":8082", "Admin API listen address")
 		adminToken              = flag.String("admin-token", "", "Bearer token for admin API auth (full access)")
 		adminReadToken          = flag.String("admin-read-token", "", "Bearer token for read-only admin API access")
+		adminAllowedHosts       = flag.String("admin-allowed-hosts", "", "Comma-separated DNS names the admin API accepts in its Host header (IP literals and localhost are always accepted; a Host allowlist blocks DNS rebinding — R84)")
 		queueNum                = flag.Uint("queue", 0, "NFQUEUE number for forward traffic")
 		queueNumInput           = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic (parsed but NOT yet enforced — see startup warning)")
 		opaEmbed                = flag.String("opa-embed", "./opa-policies/l3.rego", "Path to Rego policy file")
@@ -300,6 +301,14 @@ func main() {
 
 	// Admin API — configuration is in the policy file, no external params needed
 	adminAPI := admin.New(opaEval, eng, version, *adminToken, *adminReadToken)
+	// R84: host allowlist for the admin transport (DNS-rebinding guard).
+	// IP literals and localhost are always accepted; this adds DNS names
+	// used by a reverse proxy or service DNS. Both servers install it.
+	if h := strings.TrimSpace(*adminAllowedHosts); h != "" {
+		allowed := strings.Split(h, ",")
+		adminAPI.WithAllowedHosts(allowed...)
+		slog.Info("admin API host allowlist configured", "hosts", allowed)
+	}
 	var adminServer *http.Server
 	if *listenAddr != "" {
 		adminServer = adminAPI.StartServer(*listenAddr)

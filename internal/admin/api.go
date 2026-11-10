@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +30,12 @@ type API struct {
 	// admin API is unauthenticated when no tokens are configured).
 	versionsMu     sync.RWMutex
 	policyVersions []PolicyVersion
+
+	// allowedHosts is the operator-configured DNS-name allowlist for the
+	// transport-layer Host guard (R84). IP literals and localhost are
+	// always accepted; this list adds named hosts (reverse proxy / service
+	// DNS). Set via WithAllowedHosts before serving.
+	allowedHosts []string
 }
 
 // PolicyVersion records a policy reload event.
@@ -51,6 +59,20 @@ func New(eval *opa.EmbeddedEvaluator, eng *engine.Engine, version, token, readTo
 	}
 }
 
+// WithAllowedHosts adds DNS names that the transport-layer Host guard
+// accepts in addition to IP literals and localhost (R84). Entries are
+// matched case-insensitively on the hostname with any :port and a trailing
+// dot removed, so "Admin.Internal:8082" and "admin.internal." both match a
+// request whose Host is "admin.internal:8082". Chainable for use from main.
+func (a *API) WithAllowedHosts(hosts ...string) *API {
+	for _, h := range hosts {
+		if h = strings.TrimSpace(h); h != "" {
+			a.allowedHosts = append(a.allowedHosts, h)
+		}
+	}
+	return a
+}
+
 // Handler returns the admin HTTP handler with all routes and security headers.
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -71,6 +93,115 @@ func withSecurityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		next.ServeHTTP(w, r)
+	})
+}
+
+// normalizeHost reduces a Host header value or allowlist entry to a
+// comparable lower-case hostname: the :port is removed, IPv6 brackets are
+// stripped, and a trailing FQDN dot is removed. "Admin.Internal.:8082"
+// normalises to "admin.internal".
+func normalizeHost(h string) string {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	h = strings.TrimPrefix(h, "[")
+	h = strings.TrimSuffix(h, "]")
+	h = strings.TrimSuffix(h, ".")
+	return strings.ToLower(h)
+}
+
+// isWildcardListenHost reports whether a listen address binds every
+// interface (so it contributes no useful hostname to the allowlist).
+func isWildcardListenHost(addr string) bool {
+	switch normalizeHost(addr) {
+	case "", "0.0.0.0", "::":
+		return true
+	}
+	return false
+}
+
+// hostAllowed is the R84 DNS-rebinding predicate. A Host header is accepted
+// when it is an IP literal (127.0.0.1, a pod/container IP, ::1), localhost
+// or any *.localhost name (RFC 6761 — never publicly resolvable, so unusable
+// for rebinding), a configured --admin-allowed-hosts entry, or the host part
+// of the listen address. Every other value is an attacker-controlled
+// hostname and is refused. A request with no Host at all (HTTP/1.0) is
+// refused: the admin API is HTTP/1.1-only in practice and a missing Host is
+// exactly the ambiguity the guard exists to remove.
+func (a *API) hostAllowed(host string, extra []string) bool {
+	// Reject Host values carrying characters that are never legal in a Host
+	// header (userinfo '@', path/query/fragment delimiters, whitespace,
+	// control bytes). Without this, a crafted value like
+	// "admin.internal:8082@evil.example" would be splittable by
+	// net.SplitHostPort into the allowlisted "admin.internal" — a parsing
+	// confusion a browser would not produce but a direct client can.
+	if strings.ContainsAny(host, "@/\\?# 	\r\n") {
+		return false
+	}
+	h := normalizeHost(host)
+	if h == "" {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	// Only [a-z0-9.-] can remain for a DNS name; anything else (stray
+	// colons, brackets, unicode, percent-escapes) is not a hostname.
+	for _, r := range h {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' {
+			continue
+		}
+		return false
+	}
+	for _, candidate := range a.allowedHosts {
+		if normalizeHost(candidate) == h {
+			return true
+		}
+	}
+	for _, candidate := range extra {
+		if normalizeHost(candidate) == h {
+			return true
+		}
+	}
+	return false
+}
+
+// hostGuard installs the R84 Host allowlist on the transport. It is applied
+// by StartServer and StartServerTLS — the only ways this binary serves the
+// API — and NOT by Handler(), so embedding callers that mount Handler() on
+// their own listener keep their previous behaviour and must add an equivalent
+// check themselves (documented contract).
+//
+// Rationale: without a Host check, an unauthenticated (default) admin API on
+// a routable address is exploitable by DNS rebinding — a page on
+// attacker.example re-resolves to the firewall, the browser then makes
+// SAME-ORIGIN requests (X-Frame-Options does not apply to fetch; CORS does
+// not apply to same-origin), and the attacker reads /admin/stats,
+// /admin/blocks and posts /admin/policy/reload. The browser never rewrites
+// the Host header, so rejecting unrecognised hosts breaks the attack without
+// touching legitimate IP/localhost/reverse-proxy access.
+func (a *API) hostGuard(next http.Handler, listenAddr string) http.Handler {
+	var extra []string
+	if !isWildcardListenHost(listenAddr) {
+		extra = append(extra, listenAddr)
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.hostAllowed(r.Host, extra) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		slog.Warn("admin API: refused request with an unrecognised Host header (possible DNS rebinding)",
+			"host", r.Host, "remote", r.RemoteAddr)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("{\"error\":\"unrecognised Host header\"}\n"))
 	})
 }
 
@@ -229,7 +360,7 @@ func (a *API) handlePolicyVersions(w http.ResponseWriter, r *http.Request) {
 
 // StartServer starts the admin HTTP server in a goroutine (plain HTTP).
 func (a *API) StartServer(addr string) *http.Server {
-	srv := newServer(addr, a.Handler())
+	srv := newServer(addr, a.hostGuard(a.Handler(), addr))
 	go func() {
 		slog.Info("admin API listening", "addr", addr, "tls", false)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -278,7 +409,7 @@ func (a *API) StartServerTLS(addr, certFile, keyFile string) (*http.Server, stri
 	if err != nil {
 		return nil, "", fmt.Errorf("TLS listen: %w", err)
 	}
-	srv := newServer("", a.Handler())
+	srv := newServer("", a.hostGuard(a.Handler(), addr))
 	go func() {
 		slog.Info("admin API listening", "addr", listener.Addr().String(), "tls", true)
 		if err := srv.Serve(listener); err != nil && err != http.ErrServerClosed {
