@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -86,7 +85,15 @@ func readPolicyFile(path string) ([]byte, time.Time, error) {
 	// Reject symlinks at directory components (R62/R70): O_NOFOLLOW on
 	// the open below only protects the FINAL component, but the kernel
 	// resolves intermediate directory symlinks before the open.
-	if err := securepath.RejectSymlinkComponents(filepath.Dir(path)); err != nil {
+	//
+	// R85: use RejectUnsafePath, NOT RejectSymlinkComponents(filepath.Dir
+	// (path)). filepath.Dir applies filepath.Clean, which consumes a ".."
+	// component before the walk can see it — so --opa-embed=/base/evil/
+	// ../attacker.rego (evil -> /escape/victim) validated only /base
+	// while the open returned /escape/attacker.rego: attacker-chosen Rego
+	// became the ENFORCED policy at startup and on every 5-second reload
+	// (fail-open). RejectUnsafePath rejects ".." on the RAW path first.
+	if err := securepath.RejectUnsafePath(path); err != nil {
 		return nil, time.Time{}, err
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)

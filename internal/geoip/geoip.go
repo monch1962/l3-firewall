@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -61,7 +60,15 @@ func NewReader(path string) (*Reader, error) {
 	// Reject symlinks at directory components (R62/R71): O_NOFOLLOW on
 	// the open below only protects the FINAL component, but the kernel
 	// resolves intermediate directory symlinks before the open.
-	if err := securepath.RejectSymlinkComponents(filepath.Dir(path)); err != nil {
+	//
+	// R85: use RejectUnsafePath, NOT RejectSymlinkComponents(filepath.Dir
+	// (path)). filepath.Dir applies filepath.Clean, which consumes a ".."
+	// component before the walk can see it — so --geoip-db=/base/evil/
+	// ../evil.mmdb (evil -> /escape/victim) validated only /base while
+	// the open landed on /escape/evil.mmdb: an attacker-chosen database
+	// loaded from OUTSIDE the checked tree, flipping every country-based
+	// OPA deny rule. RejectUnsafePath rejects ".." on the RAW path first.
+	if err := securepath.RejectUnsafePath(path); err != nil {
 		return nil, err
 	}
 	// Open with O_NONBLOCK to prevent blocking on FIFO/named pipes, and
