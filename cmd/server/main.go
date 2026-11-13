@@ -300,19 +300,24 @@ func main() {
 
 	rl := ratelimit.NewLimiter(*rateLimitPPS, *rateLimitBPS)
 
-	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist, pcapCapture, *stateFile, nil)
-
-	// Initialize metrics
-	metrics.Init(func() int { return ct.Len() })
+	// Metrics must be initialised BEFORE the engine is constructed so the
+	// engine can report into it from the first packet (R86). Before this
+	// round the collectors were registered here and incremented NOWHERE:
+	// /metrics served a valid Prometheus document with no l3_firewall_*
+	// sample, so an operator's alerting on block counters could never fire.
+	m := metrics.Init(func() int { return ct.Len() })
 	slog.Info("metrics initialized")
+
+	eng := engine.New(opaEval, ct, rl, *opaFailClosed, *opaAuditOnly, auditLogger, alertRouter, geoIPReader, threatIntelBlocklist, pcapCapture, *stateFile, nil).WithMetrics(m)
 
 	// Admin API — configuration is in the policy file, no external params needed
 	adminAPI := admin.New(opaEval, eng, version, *adminToken, *adminReadToken)
 	// R84: host allowlist for the admin transport (DNS-rebinding guard).
 	// IP literals and localhost are always accepted; this adds DNS names
 	// used by a reverse proxy or service DNS. Both servers install it.
+	var allowed []string
 	if h := strings.TrimSpace(*adminAllowedHosts); h != "" {
-		allowed := strings.Split(h, ",")
+		allowed = strings.Split(h, ",")
 		adminAPI.WithAllowedHosts(allowed...)
 		slog.Info("admin API host allowlist configured", "hosts", allowed)
 	}
@@ -340,10 +345,8 @@ func main() {
 
 	// Metrics HTTP handler on separate port or admin port
 	if *metricsListen != "" {
-		metricsMux := http.NewServeMux()
-		metricsMux.Handle("/metrics", metrics.Handler())
 		metricsServer := newMetricsServer(*metricsListen)
-		metricsServer.Handler = metricsMux
+		metricsServer.Handler = metricsHandler(allowed, *metricsListen)
 		go func() {
 			slog.Info("metrics listening", "addr", *metricsListen)
 			if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -524,4 +527,18 @@ func newMetricsServer(addr string) *http.Server {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 	}
+}
+
+// metricsHandler builds the /metrics transport handler. /metrics is the
+// SECOND HTTP transport this binary serves (its own listener, no auth), and
+// it carries the same DNS-rebinding exposure R84 closed on the admin
+// transport: a page on attacker.example that rebinds to the firewall reads
+// the scrape same-origin from a victim's browser. The guard is the SHARED
+// admin predicate (R85: centralise a guard class instead of copying it), and
+// the operator's --admin-allowed-hosts names are accepted here too so a
+// reverse proxy can scrape through a DNS name.
+func metricsHandler(allowedHosts []string, listenAddr string) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.Handler())
+	return admin.NewHostGuard(allowedHosts, listenAddr)(mux)
 }

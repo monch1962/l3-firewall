@@ -205,6 +205,24 @@ func (a *API) hostGuard(next http.Handler, listenAddr string) http.Handler {
 	})
 }
 
+// NewHostGuard returns the R84 transport-layer Host allowlist as chainable
+// middleware, for any listener that serves firewall state.
+//
+// It exists because /metrics is a SECOND HTTP transport in the shipped binary
+// (its own listener, no authentication) and R84 installed the guard only on
+// the admin transport — the R85 propagation class applied to HTTP surfaces
+// instead of file paths. A guard copy in cmd/server would drift from this
+// predicate, so both listeners share this one.
+//
+// IP literals, localhost/*.localhost and the listen-address host are always
+// accepted; extra DNS names come from --admin-allowed-hosts.
+func NewHostGuard(allowedHosts []string, listenAddr string) func(http.Handler) http.Handler {
+	a := &API{allowedHosts: append([]string(nil), allowedHosts...)}
+	return func(next http.Handler) http.Handler {
+		return a.hostGuard(next, listenAddr)
+	}
+}
+
 // extractToken reads the bearer token from the Authorization header.
 func extractToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")

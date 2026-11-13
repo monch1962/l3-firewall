@@ -83,8 +83,11 @@ type Engine struct {
 	geoipReader *geoip.Reader          // nil = no GeoIP lookups
 	threatIntel *threatintel.Blocklist // nil = no threat intel blocking
 	pcapWriter  PcapWriter             // nil = no pcap capture
-	statePath   string                 // path for persisting state (empty = no persistence)
-	l2Filter    *l2filter.Filter       // nil = no L2 filtering
+	// metrics reports every decision to the observability endpoint (R86).
+	// nil = no sink configured (feature not wired).
+	metrics   MetricsSink
+	statePath string           // path for persisting state (empty = no persistence)
+	l2Filter  *l2filter.Filter // nil = no L2 filtering
 
 	// Stats counters. Atomics: incremented on the go-nfqueue callback
 	// goroutine (NFQUEUE hot path) and read on the admin API HTTP
@@ -108,6 +111,24 @@ type Engine struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	running     atomic.Bool
+}
+
+// MetricsSink is the minimal decision-reporting surface the engine needs.
+// It lives in the CONSUMER package (R10 doctrine) so *metrics.Metrics
+// satisfies it implicitly without the engine importing the producer, and so
+// tests can record decisions with a local fake.
+type MetricsSink interface {
+	ObservePacket(protocol string)
+	ObserveAllowed(protocol string)
+	ObserveBlocked(reason string)
+	ObserveAuditBlock(reason string)
+}
+
+// WithMetrics attaches a decision-reporting sink (R86). Chainable like
+// admin.WithAllowedHosts so existing New() callers are unaffected.
+func (e *Engine) WithMetrics(s MetricsSink) *Engine {
+	e.metrics = s
+	return e
 }
 
 // New creates a firewall engine with the given components.
@@ -214,6 +235,44 @@ func (e *Engine) recordBlock(pi *packet.PacketInfo, reason, traceID string) {
 	e.blockStatsMu.Unlock()
 }
 
+// ── R86: single place where a decision advances BOTH observability surfaces ─
+//
+// The engine keeps two views of the same event: the atomic counters behind
+// /admin/stats and the Prometheus sink behind /metrics. Advancing them at the
+// same call site is what makes it impossible for the two to disagree — the
+// exact failure this round fixed (the panic path counted a DROP as allowed in
+// one surface and never reported it in the other).
+
+func (e *Engine) countProcessed(protocol string) {
+	e.packetsProcessed.Add(1)
+	if e.metrics != nil {
+		e.metrics.ObservePacket(protocol)
+	}
+}
+
+func (e *Engine) countAllowed(protocol string) {
+	e.packetsAllowed.Add(1)
+	if e.metrics != nil {
+		e.metrics.ObserveAllowed(protocol)
+	}
+}
+
+func (e *Engine) countBlocked(reason string) {
+	e.packetsBlocked.Add(1)
+	if e.metrics != nil {
+		e.metrics.ObserveBlocked(reason)
+	}
+}
+
+// countAuditBlock reports a would-be block that --opa-audit-only let through.
+// It deliberately does not touch packetsBlocked: the packet WAS allowed, and
+// the audit series is the signal that a policy would have blocked it.
+func (e *Engine) countAuditBlock(reason string) {
+	if e.metrics != nil {
+		e.metrics.ObserveAuditBlock(reason)
+	}
+}
+
 // logAudit writes a structured audit event if the audit logger is configured.
 func (e *Engine) logAudit(eventType, traceID string, pi *packet.PacketInfo, reason string) {
 	if e.auditLogger == nil {
@@ -253,19 +312,20 @@ func (e *Engine) fireAlert(alertType alert.AlertType, message string) {
 func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *opa.Result) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			e.packetsProcessed.Add(1)
-			e.packetsBlocked.Add(1)
-			result = &opa.Result{
-				Allowed: false,
-				Reason:  fmt.Sprintf("internal error: %v", rec),
-			}
+			// The packet is dropped by the caller (Allowed=false), so it must
+			// be counted as a block — see R86.7 for the sibling bug in
+			// packetHandler's recover, which counted the same drop as allowed.
+			// packetsProcessed is NOT incremented here: it was already counted
+			// at the top of this function and the pre-R86 code double-counted.
+			reason := fmt.Sprintf("internal error: %v", rec)
+			e.countBlocked(reason)
+			result = &opa.Result{Allowed: false, Reason: reason}
 			slog.Error("panic in evaluatePacket", "panic", fmt.Sprintf("%v", rec))
 		}
 	}()
 
-	e.packetsProcessed.Add(1)
+	e.countProcessed(pi.Protocol)
 
-	// Generate a trace ID for correlating log entries across the pipeline
 	tid := newTraceID()
 
 	// 1. Connection tracking with TCP state machine
@@ -287,7 +347,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 
 	// Connection limit exceeded — block immediately
 	if flowLimited {
-		e.packetsBlocked.Add(1)
+		e.countBlocked("connection limit exceeded for source IP")
 		reason := "connection limit exceeded for source IP"
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
@@ -305,7 +365,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// 3. L2 filtering — MAC address check
 	if e.l2Filter != nil {
 		if ok, reason := e.l2Filter.MACAllowed(pi.SrcMAC); !ok {
-			e.packetsBlocked.Add(1)
+			e.countBlocked(reason)
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "mac", pi.SrcMAC,
 				"protocol", pi.Protocol, "trace_id", tid)
 			e.recordBlock(pi, reason, tid)
@@ -324,8 +384,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// hardcoded policy threshold applied (R40.4). Mirror the connection-limit
 	// block: hard deny regardless of audit-only mode.
 	if e.ratelimit.ExceedsLimit(pps, bps) {
-		e.packetsBlocked.Add(1)
 		reason := fmt.Sprintf("per-IP rate limit exceeded: %.0f pps / %.0f bps", pps, bps)
+		e.countBlocked(reason)
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 		e.recordBlock(pi, reason, tid)
@@ -354,8 +414,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 
 	// 5. Threat intel check (if blocklist is configured)
 	if e.threatIntel != nil && e.threatIntel.Contains(pi.SrcIP) {
-		e.packetsBlocked.Add(1)
 		reason := "source IP in threat intelligence blocklist"
+		e.countBlocked(reason)
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 		e.recordBlock(pi, reason, tid)
@@ -374,15 +434,15 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// 6. OPA evaluation
 	if e.eval == nil {
 		if e.failClosed {
-			e.packetsBlocked.Add(1)
 			reason := "evaluator unavailable — blocked for safety"
+			e.countBlocked(reason)
 			slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 				"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 			e.recordBlock(pi, reason, tid)
 			e.logAudit("packet_block", tid, pi, reason)
 			return &opa.Result{Allowed: false, Reason: reason}
 		}
-		e.packetsAllowed.Add(1)
+		e.countAllowed(pi.Protocol)
 		e.logAudit("packet_allow", tid, pi, "")
 		return &opa.Result{Allowed: true}
 	}
@@ -401,8 +461,8 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		// where no decision was ever submitted. Allowing on an eval error
 		// meant any policy defect (or a malicious hot-reloaded policy) turned
 		// the firewall into allow-all for packets an attacker could craft.
-		e.packetsBlocked.Add(1)
 		reason := fmt.Sprintf("OPA error: %v — blocked for safety", err)
+		e.countBlocked(reason)
 		slog.Warn("blocked", "reason", reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 		e.recordBlock(pi, reason, tid)
@@ -415,20 +475,21 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	if !result.Allowed && e.auditOnly {
 		slog.Warn("[AUDIT] would block", "reason", result.Reason, "src", pi.SrcIP,
 			"dst", pi.DstIP, "protocol", pi.Protocol, "port", pi.DstPort)
-		e.packetsAllowed.Add(1)
+		e.countAllowed(pi.Protocol)
+		e.countAuditBlock(result.Reason)
 		e.logAudit("audit_block", tid, pi, result.Reason)
 		return &opa.Result{Allowed: true}
 	}
 
 	if result.Allowed {
-		e.packetsAllowed.Add(1)
+		e.countAllowed(pi.Protocol)
 		e.logAudit("packet_allow", tid, pi, "")
 	} else {
-		e.packetsBlocked.Add(1)
 		// Truncate long reason strings
 		if len(result.Reason) > maxReasonLength {
 			result.Reason = result.Reason[:maxReasonLength]
 		}
+		e.countBlocked(result.Reason)
 		slog.Warn("blocked", "reason", result.Reason, "src", pi.SrcIP, "dst", pi.DstIP,
 			"protocol", pi.Protocol, "port", pi.DstPort, "trace_id", tid)
 		e.recordBlock(pi, result.Reason, tid)
@@ -445,8 +506,12 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 	defer func() {
 		if rec := recover(); rec != nil {
-			e.packetsProcessed.Add(1)
-			e.packetsAllowed.Add(1)
+			// The verdict below is NF_DROP (fail-closed). The decision
+			// counters are NOT touched here: the packet's decision was already
+			// recorded by evaluatePacket, and pre-R86 this recover incremented
+			// packetsProcessed (double count) and packetsAllowed — reporting a
+			// DROP as allowed traffic in the very counters an operator watches
+			// for "the firewall is blocking" (R86.7).
 			slog.Error("panic recovered in packet handler",
 				"panic", fmt.Sprintf("%v", rec))
 			ret = 1 // fail-closed: blocked packets stay blocked on panic
@@ -454,14 +519,14 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 	}()
 
 	if attr.Payload == nil {
-		// A packet with no payload is the most uninspectable case of all —
-		// it cannot be policy-checked, so it must be dropped like any other
+		// A packet with no payload is the most uninspectable case of all — it
+		// cannot be policy-checked, so it must be dropped like any other
 		// unparseable packet. R40 made parse errors fail-closed (ret=1) but
 		// left this nil-payload branch returning 0 (NF_ACCEPT): an
 		// uninspectable packet silently passed every policy layer (R49 —
 		// nil-payload fail-open sibling).
-		e.packetsProcessed.Add(1)
-		e.packetsBlocked.Add(1)
+		e.countProcessed("")
+		e.countBlocked("nil payload — nothing to inspect")
 		slog.Warn("packet with nil payload dropped (fail-closed): nothing to inspect")
 		return 1
 	}
@@ -473,8 +538,8 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 		// fail-closed (ret=1) but parse errors still returned 0 (NF_ACCEPT),
 		// silently bypassing every policy layer for malformed/truncated
 		// packets (R40.3).
-		e.packetsProcessed.Add(1)
-		e.packetsBlocked.Add(1)
+		e.countProcessed("")
+		e.countBlocked("unparseable packet — dropped")
 		slog.Warn("unparseable packet dropped (fail-closed)", "error", err)
 		return 1
 	}
