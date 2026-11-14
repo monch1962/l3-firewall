@@ -9,7 +9,10 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +62,52 @@ type Config struct {
 	Cooldown   time.Duration // minimum interval between same-type alerts
 }
 
+// warnPlaintextWebhook logs loudly when alerts will carry a bearer credential
+// over plain HTTP to a host that is not loopback (R88.3).
+//
+// The webhook URL IS the credential — Slack/Discord/Teams put the secret in the
+// path — so every POST hands it to anyone on the path. This is not fatal
+// (a TLS-terminating sidecar or a pod-local collector is a legitimate
+// deployment), but it must not be SILENT: an operator who configured
+// `http://` for an internal collector and one who believes their `https://`
+// proxy handles it look identical in the logs otherwise.
+//
+// Loopback (127.0.0.0/8, ::1, localhost) is exempt: those bytes never leave the
+// host, so there is nothing on the wire to observe. Warning there would train
+// the operator to ignore this warning.
+func warnPlaintextWebhook(raw string) {
+	if raw == "" {
+		return
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || !strings.EqualFold(u.Scheme, "http") {
+		return
+	}
+	if isLocalWebhookHost(u.Hostname()) {
+		return
+	}
+	slog.Warn("alert: webhook URL is plain HTTP — the webhook URL IS the bearer credential "+
+		"(the secret is in the path), so every alert transmits it in cleartext where an on-path "+
+		"observer can recover it and forge messages into the incident channel; use an https:// "+
+		"webhook URL, or terminate TLS in front of the collector (a loopback/pod-local "+
+		"http collector is exempt)", "host", u.Hostname())
+}
+
+// isLocalWebhookHost reports whether host cannot put bytes on a network.
+func isLocalWebhookHost(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if h == "" {
+		return false
+	}
+	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
+		return true
+	}
+	if ip := net.ParseIP(h); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // Router manages alert dispatch with per-type cooldown suppression.
 type Router struct {
 	mu       sync.Mutex
@@ -72,6 +121,7 @@ func NewRouter(cfg Config) *Router {
 	if cfg.Cooldown <= 0 {
 		cfg.Cooldown = 30 * time.Second
 	}
+	warnPlaintextWebhook(cfg.WebhookURL)
 	return &Router{
 		cfg: cfg,
 		client: &http.Client{

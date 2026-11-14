@@ -224,7 +224,11 @@ func main() {
 			slog.Warn("etcd syncer not available", "error", err)
 		} else if policySyncer != nil {
 			policySyncer.Start(context.Background())
-			slog.Info("etcd syncer started", "endpoints", *etcdEndpoints, "key", *etcdKey)
+			// R88: an etcd endpoint is a URL (etcdctl and Helm values accept
+			// `https://user:password@etcd-0:2379`), so it can carry a
+			// credential and always discloses cluster topology. Same helper as
+			// the webhook/feed lines, so the three cannot drift (R87 class).
+			slog.Info("etcd syncer started", "endpoints", redact.URLs(*etcdEndpoints), "key", *etcdKey)
 		}
 	}
 

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/monch1962/l3-firewall/internal/redact"
 )
 
 // maxBlocklistEntries prevents memory exhaustion from a very large blocklist.
@@ -406,9 +408,17 @@ func (bl *Blocklist) StartRefresher(urls []string, interval time.Duration) chan 
 				for _, url := range urls {
 					count, err := bl.FetchFromURL(url)
 					if err != nil {
-						slog.Warn("threat intel refresh failed", "url", url, "error", err)
+						// R88: the refresher runs for the life of the process,
+						// so this is the line that actually leaks. A feed URL is
+						// a bearer credential (?auth_key=…), and the error text
+						// carries it twice — FetchFromURL wraps it and net/http
+						// repeats it inside *url.Error. Both must be redacted
+						// here, not only in cmd/server's startup loop (R87).
+						slog.Warn("threat intel refresh failed",
+							"url", redact.URL(url),
+							"error", redact.ScrubIn(err.Error(), url))
 					} else {
-						slog.Info("threat intel refreshed", "url", url, "entries", count)
+						slog.Info("threat intel refreshed", "url", redact.URL(url), "entries", count)
 					}
 				}
 			}
