@@ -34,6 +34,7 @@ import (
 	"github.com/monch1962/l3-firewall/internal/metrics"
 	"github.com/monch1962/l3-firewall/internal/opa"
 	"github.com/monch1962/l3-firewall/internal/ratelimit"
+	"github.com/monch1962/l3-firewall/internal/redact"
 	"github.com/monch1962/l3-firewall/internal/securepath"
 	"github.com/monch1962/l3-firewall/internal/syncer"
 	"github.com/monch1962/l3-firewall/internal/threatintel"
@@ -129,6 +130,8 @@ func main() {
 		adminToken              = flag.String("admin-token", "", "Bearer token for admin API auth (full access)")
 		adminReadToken          = flag.String("admin-read-token", "", "Bearer token for read-only admin API access")
 		adminAllowedHosts       = flag.String("admin-allowed-hosts", "", "Comma-separated DNS names the admin API accepts in its Host header (IP literals and localhost are always accepted; a Host allowlist blocks DNS rebinding — R84)")
+		adminTLSCert            = flag.String("admin-tls-cert", "", "Path to the admin API TLS certificate (requires --admin-tls-key; empty = plain HTTP, warned when a token is set — R87)")
+		adminTLSKey             = flag.String("admin-tls-key", "", "Path to the admin API TLS private key (requires --admin-tls-cert)")
 		queueNum                = flag.Uint("queue", 0, "NFQUEUE number for forward traffic")
 		queueNumInput           = flag.Uint("queue-input", 1, "NFQUEUE number for input traffic (parsed but NOT yet enforced — see startup warning)")
 		opaEmbed                = flag.String("opa-embed", "./opa-policies/l3.rego", "Path to Rego policy file")
@@ -254,7 +257,10 @@ func main() {
 		alertRouter = alert.NewRouter(alert.Config{
 			WebhookURL: *alertWebhookURL,
 		})
-		slog.Info("alerts enabled", "webhook", *alertWebhookURL)
+		// R87: a webhook URL is a bearer credential (the secret lives in the
+		// path). Log only the redacted form — container stdout and any log
+		// shipper have a wider readership than the process environment.
+		slog.Info("alerts enabled", "webhook", redact.URL(*alertWebhookURL))
 	}
 
 	// Create GeoIP reader if database path is specified
@@ -277,14 +283,21 @@ func main() {
 			url = strings.TrimSpace(url)
 			count, err := bl.FetchFromURL(url)
 			if err != nil {
-				slog.Warn("threat intel fetch failed", "url", url, "error", err)
+				// R87: redact both the URL and the error text — net/http (and
+				// threatintel's own wrapping) repeats the URL inside the error,
+				// so redacting only the attribute would re-leak the auth_key.
+				slog.Warn("threat intel fetch failed",
+					"url", redact.URL(url),
+					"error", redact.ScrubIn(err.Error(), url))
 			} else {
-				slog.Info("threat intel loaded", "url", url, "entries", count)
+				slog.Info("threat intel loaded", "url", redact.URL(url), "entries", count)
 			}
 		}
 		bl.StartRefresher(urls, 30*time.Minute)
 		threatIntelBlocklist = bl
-		slog.Info("threat intel enabled", "urls", *threatIntelURL)
+		// R87: feed URLs can carry an auth_key query parameter (OTX, abuse.ch
+		// and most commercial feeds do), so log the redacted form only.
+		slog.Info("threat intel enabled", "urls", redact.URLs(*threatIntelURL))
 	}
 
 	// Create pcap capture writer if directory is specified
@@ -323,7 +336,33 @@ func main() {
 	}
 	var adminServer *http.Server
 	if *listenAddr != "" {
-		adminServer = adminAPI.StartServer(*listenAddr)
+		certFile, keyFile, useTLS, err := resolveAdminTLS(*adminTLSCert, *adminTLSKey)
+		if err != nil {
+			log.Fatalf("admin TLS configuration: %v", err)
+		}
+		if useTLS {
+			// R87: StartServerTLS fails closed on unloadable/rejected key
+			// material (R83) — it returns an error and starts NO listener, so a
+			// missing or expired certificate can never degrade the control
+			// plane to cleartext.
+			srv, addr, err := adminAPI.StartServerTLS(*listenAddr, certFile, keyFile)
+			if err != nil {
+				log.Fatalf("admin TLS: %v", err)
+			}
+			adminServer = srv
+			slog.Info("admin API listening with TLS", "addr", addr)
+		} else {
+			// Plaintext mode is supported (TLS-terminating proxy, loopback-only
+			// sidecar) but must never be silent when a credential is in play:
+			// the bearer token and every admin response would cross the network
+			// readable, so an on-path observer gets full control-plane write
+			// access (POST /admin/policy/reload) — the R40.4 "control that is
+			// not what the deployment says it is" class.
+			if *adminToken != "" || *adminReadToken != "" {
+				slog.Warn("admin API is serving PLAINTEXT HTTP while an admin token is configured: the bearer token and every admin response travel in cleartext, so an on-path observer can read the token and take over the control plane — set --admin-tls-cert/--admin-tls-key, or terminate TLS in front of this listener")
+			}
+			adminServer = adminAPI.StartServer(*listenAddr)
+		}
 	}
 
 	// Start file watcher for hot-reload of the OPA policy file. The watcher
@@ -384,6 +423,34 @@ func main() {
 	}
 
 	slog.Info("shutdown complete")
+}
+
+// resolveAdminTLS validates the admin TLS flag pair and reports how the
+// control plane should listen (R87).
+//
+//   - neither flag set  → plaintext mode (supported: many deployments front the
+//     admin API with a TLS-terminating proxy, or expose it only on a loopback/
+//     pod-local address). main() logs a loud warning when a bearer token is
+//     configured in this mode.
+//   - both flags set    → TLS mode.
+//   - exactly one set   → ERROR. A half-configured pair is the dangerous case:
+//     StartServerTLS's empty-empty fallback (R83) means a secret mount that
+//     silently produced an empty value would serve the control plane in
+//     cleartext while the operator believes TLS is on. Failing closed at
+//     startup is the only reading that cannot be mistaken for success.
+//
+// Whitespace-only values count as unset, because that is what a templated
+// `--admin-tls-cert=${CERT_PATH}` expands to when the variable is missing.
+func resolveAdminTLS(cert, key string) (string, string, bool, error) {
+	cert = strings.TrimSpace(cert)
+	key = strings.TrimSpace(key)
+	switch {
+	case cert == "" && key == "":
+		return "", "", false, nil
+	case cert == "" || key == "":
+		return "", "", false, fmt.Errorf("admin TLS: refusing to start — both --admin-tls-cert and --admin-tls-key are required (cert set: %t, key set: %t); a half-configured pair would silently serve the control plane in cleartext", cert != "", key != "")
+	}
+	return cert, key, true, nil
 }
 
 // policyReloader abstracts the hot-reload target so the poll decision

@@ -7,10 +7,13 @@ package alert
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/monch1962/l3-firewall/internal/redact"
 )
 
 // AlertType identifies the category of an alert event.
@@ -128,12 +131,23 @@ func (r *Router) fire(e AlertEvent) {
 
 	resp, err := r.client.Post(r.cfg.WebhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
-		slog.Warn("alert: webhook request failed", "url", r.cfg.WebhookURL, "error", err)
+		// R87: the URL is a bearer credential (Slack/Discord put the secret in
+		// the path) and net/http echoes it into err.Error(), so BOTH the url
+		// attribute and the error text must be redacted before they reach the
+		// log stream. Docker's log driver and any SIEM that ingests it have a
+		// wider readership than the process environment.
+		slog.Warn("alert: webhook request failed",
+			"url", redact.URL(r.cfg.WebhookURL),
+			"error", redact.ScrubIn(err.Error(), r.cfg.WebhookURL))
 		return
 	}
 	defer resp.Body.Close()
+	// Drain a bounded amount so the connection can be reused; the body of an
+	// alert webhook carries no information the firewall needs.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
 
 	if resp.StatusCode >= 400 {
-		slog.Warn("alert: webhook returned error", "url", r.cfg.WebhookURL, "status", resp.StatusCode)
+		slog.Warn("alert: webhook returned error",
+			"url", redact.URL(r.cfg.WebhookURL), "status", resp.StatusCode)
 	}
 }
