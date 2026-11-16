@@ -57,11 +57,12 @@ func SaveState(path string, state *EngineState) error {
 		return err
 	}
 	tmpPath := path + ".tmp"
-	// Open with O_NOFOLLOW: os.Create would follow a symlink planted at the
-	// .tmp path by an attacker with write access to the state directory,
-	// truncating and overwriting an arbitrary file writable by the firewall's
-	// UID (R42 — symlink write-through). A symlink at the .tmp path is never
-	// legitimate; rename over the final path is already symlink-safe.
+	// Open with O_NOFOLLOW: a symlink planted at the .tmp path by an
+	// attacker with write access to the state directory would otherwise be
+	// followed, truncating and overwriting an arbitrary file writable by the
+	// firewall's UID (R42 — symlink write-through). A symlink at the .tmp
+	// path is never legitimate; rename over the final path is already
+	// symlink-safe.
 	// Also O_NONBLOCK: opening an existing FIFO planted at the .tmp path
 	// O_WRONLY (without O_NONBLOCK) blocks until a reader appears — the
 	// 60-second saveState ticker goroutine would hang forever, and with it
@@ -69,7 +70,11 @@ func SaveState(path string, state *EngineState) error {
 	// R55 — the R38 FIFO class applied to the CREATE open, where O_NOFOLLOW
 	// alone does not protect). With O_NONBLOCK the FIFO open fails
 	// immediately with ENXIO; regular files are unaffected.
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0666)
+	// The mode is 0600, applied with fchmod on the opened descriptor (R89):
+	// the state file carries blocked-host telemetry (per-reason counters
+	// whose keys embed offender IPs and ports), so it must not be readable
+	// outside the firewall's UID. See securepath.CreateOwnerOnly.
+	f, err := securepath.CreateOwnerOnly(tmpPath)
 	if err != nil {
 		return fmt.Errorf("creating temp state file: %w", err)
 	}

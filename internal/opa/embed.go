@@ -27,15 +27,21 @@ import (
 // allow-all firewall (R75).
 const decisionQuery = "data.l3_firewall"
 
+// decisionRuleRef is the fully-qualified reference to the rule that must
+// exist for the decision query to be meaningful (R89). The package gate
+// alone accepted a module that declares `package l3_firewall` and nothing
+// else — see verifyPolicyPackage.
+const decisionRuleRef = "data.l3_firewall.allow"
+
 // EmbedConfig configures the in-process OPA evaluator.
 type EmbedConfig struct {
 	Policy  string        // Rego policy source code
 	Timeout time.Duration // Evaluation timeout (0 = default 500ms)
 }
 
-// verifyPolicyPackage rejects a compiled module set that does not declare
-// the decision package (R75). Both Load and NewEmbedded gate on it: without
-// the gate, a compile-valid policy with a wrong package line (a typo, a
+// verifyPolicyPackage rejects a compiled module set that does not declare the
+// decision package (R75). Both Load and NewEmbedded gate on it: without the
+// gate, a compile-valid policy with a wrong package line (a typo, a
 // `package firewall`/`package evil` module, or a sub-package such as
 // `l3_firewall.sub` whose rules never surface at the queried document) is
 // accepted with a nil error while the firewall silently allows every packet
@@ -43,6 +49,13 @@ type EmbedConfig struct {
 // loudly and keeps the last-good policy. The exact-match requirement mirrors
 // the query: rules under a descendant package (l3_firewall.sub) do not
 // define `allow` at data.l3_firewall, so only the exact package can govern.
+//
+// The gate deliberately checks WHERE the rules are declared, not WHETHER an
+// `allow` rule exists: this firewall is a DENY-OVERRIDE engine (R5), so a
+// correct-package policy that defines only deny rules — or none at all —
+// must still load and permit (R75.3/R75.4 pin that contract). A policy that
+// cannot produce a decision is handled by warnIfNoDecision below: it permits,
+// but it is no longer silent (R89).
 func verifyPolicyPackage(compiler *ast.Compiler) error {
 	for _, mod := range compiler.Modules {
 		if mod != nil && mod.Package != nil && mod.Package.Path.String() == decisionQuery {
@@ -50,6 +63,39 @@ func verifyPolicyPackage(compiler *ast.Compiler) error {
 		}
 	}
 	return fmt.Errorf("policy must declare package at %s: compiled modules declare %s (a policy in any other package can never produce a decision for the %q query and would silently allow every packet)", decisionQuery, declaredPackages(compiler), decisionQuery)
+}
+
+// warnIfNoDecision logs when a loaded policy can never produce an explicit
+// `allow` decision, i.e. when the module set declares no COMPLETE rule named
+// allow at the decision package.
+//
+// This is the R89 observability half of the R75 gate, and it is warn-only by
+// design. The deny-override contract (R5/R75.3/R75.4) says such a policy
+// loads and permits — a firewall whose decisions are "deny unless allowed"
+// must not start rejecting policies that simply deny nothing. But "permits
+// everything because nobody ever wrote an allow rule" is indistinguishable,
+// in the logs, from a healthy reload: `package l3_firewall` alone, a rule
+// renamed by a refactor typo (`default permit := false; permit if {...}`), an
+// `allow` that is a FUNCTION (`allow(x) := ...` — functions never become
+// document values), or an `allow` that is a partial set (`allow contains ...`,
+// which Evaluate cannot read as a boolean) all leave the firewall allowing
+// every packet while the process logs "OPA policy reloaded". R40.4's doctrine
+// — a control that is not what the deployment says it is must at least be
+// audible — is what this warning restores.
+func warnIfNoDecision(compiler *ast.Compiler, origin string) {
+	for _, rule := range compiler.GetRulesExact(ast.MustParseRef(decisionRuleRef)) {
+		if rule == nil || rule.Head == nil {
+			continue
+		}
+		// Complete rules (including `default allow := ...`) carry a value;
+		// functions carry arguments, partial sets/objects carry a key. None
+		// of the latter produce a boolean the evaluator can read.
+		if len(rule.Head.Args) == 0 && rule.Head.Key == nil && rule.Head.Value != nil {
+			return
+		}
+	}
+	slog.Warn("OPA policy cannot produce an allow decision — every packet will be PERMITTED (deny-override: the policy defines no complete `allow` rule at "+decisionRuleRef+"); if this is unintended (renamed rule, function or set-valued allow), the firewall is allowing all traffic",
+		"origin", origin)
 }
 
 // declaredPackages lists the package paths of a compiled module set for
@@ -117,6 +163,9 @@ func NewEmbedded(cfg EmbedConfig) (*EmbeddedEvaluator, error) {
 	if err := verifyPolicyPackage(compiler); err != nil {
 		return nil, err
 	}
+	// A correct-package policy that can never produce a decision permits
+	// everything by the deny-override contract — make that audible (R89).
+	warnIfNoDecision(compiler, "startup")
 
 	e := &EmbeddedEvaluator{
 		compiler:    compiler,
@@ -169,6 +218,10 @@ func (e *EmbeddedEvaluator) Load(policy string) error {
 	if err := verifyPolicyPackage(compiler); err != nil {
 		return err
 	}
+	// Same observability rule on the hot-reload path (etcd syncer / policy
+	// file watcher): a reload that silently switches the firewall to
+	// allow-all must say so (R89).
+	warnIfNoDecision(compiler, "reload")
 
 	// Atomically swap the compiler and rebuild the prepared query
 	e.mu.Lock()
@@ -238,11 +291,17 @@ func (e *EmbeddedEvaluator) Evaluate(input *Input) (*Result, error) {
 		return nil, fmt.Errorf("OPA eval: %w", err)
 	}
 
+	// DENY-OVERRIDE (R5/R75): the result starts as allow and only an explicit
+	// false-ish `allow` value denies. An empty document, a document without an
+	// `allow` key (deny rules only, or `allow` undefined for this input) and a
+	// non-boolean `allow` all mean "no deny rule fired" and therefore permit —
+	// R75.3/R75.4 pin this contract. The silent-allow-all risk of a policy
+	// that can NEVER produce a decision is surfaced where it belongs, once per
+	// load, by warnIfNoDecision.
 	if len(results) == 0 {
 		return &Result{Allowed: true}, nil
 	}
 
-	// Extract allow and reason from the result bindings
 	result := &Result{Allowed: true}
 	for _, r := range results {
 		for _, expr := range r.Expressions {
@@ -257,8 +316,7 @@ func (e *EmbeddedEvaluator) Evaluate(input *Input) (*Result, error) {
 				case string:
 					result.Allowed = a == "true" || a == "1"
 				case json.Number:
-					n, err := a.Float64()
-					if err == nil {
+					if n, nErr := a.Float64(); nErr == nil {
 						result.Allowed = n != 0
 					}
 				case nil:

@@ -45,7 +45,7 @@ func TestAttack_UnboundedDistinctCIDRScan(t *testing.T) {
 		bl.Add(cidrFor(i))
 	}
 
-	if got := len(bl.nets); got > maxCIDRNetworks {
+	if got := bl.netCount; got > maxCIDRNetworks {
 		t.Errorf("nets slice unbounded: %d distinct CIDRs stored (max %d) — every hot-path packet scans all of them",
 			got, maxCIDRNetworks)
 	}
@@ -62,7 +62,7 @@ func TestAttack_ExactIPsUnaffectedByCIDRNetCap(t *testing.T) {
 	for i := 0; i < maxCIDRNetworks; i++ {
 		bl.Add(cidrFor(i))
 	}
-	if got := len(bl.nets); got != maxCIDRNetworks {
+	if got := bl.netCount; got != maxCIDRNetworks {
 		t.Fatalf("expected nets at cap %d, got %d", maxCIDRNetworks, got)
 	}
 
@@ -89,7 +89,7 @@ func TestAttack_DistinctCIDRsUnderCapStillMatch(t *testing.T) {
 	for i := 0; i < maxCIDRNetworks; i++ {
 		bl.Add(cidrFor(i))
 	}
-	if got := len(bl.nets); got != maxCIDRNetworks {
+	if got := bl.netCount; got != maxCIDRNetworks {
 		t.Fatalf("expected nets at cap %d, got %d", maxCIDRNetworks, got)
 	}
 

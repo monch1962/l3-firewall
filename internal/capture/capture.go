@@ -148,7 +148,15 @@ func (w *Writer) rotateLocked() error {
 	// where O_NOFOLLOW alone does not protect). With O_NONBLOCK the FIFO
 	// open fails immediately with ENXIO (packet simply not captured);
 	// regular files are unaffected.
-	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0666)
+	// The mode is 0600, applied with fchmod on the opened descriptor (R89).
+	// A pcap holds the payload of every blocked packet — cleartext
+	// credentials, DNS queries, protocol metadata — i.e. exactly the traffic
+	// the firewall exists to stop. Created 0666 it lands world-readable
+	// under any ordinary umask, so any local user (or a neighbouring
+	// container sharing the volume) can read it; R6 flagged this and it was
+	// never fixed. fchmod also tightens a rotation file left 0644 by an
+	// older build that is still inside the retention window.
+	f, err := securepath.CreateOwnerOnly(fname)
 	if err != nil {
 		return fmt.Errorf("creating pcap file %s: %w", fname, err)
 	}

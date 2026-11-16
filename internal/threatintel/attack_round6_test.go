@@ -1,7 +1,6 @@
 package threatintel
 
 import (
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -43,30 +42,42 @@ func TestAttack_SSRFViaFetchFromURL(t *testing.T) {
 }
 
 // ── R6.16: IPv4 mapped IPv6 bypass in Contains ──────────────────────────
-// net.ParseIP("::ffff:10.0.0.1") returns the same IP as "10.0.0.1",
-// which could bypass CIDR matching.
+// net.ParseIP("::ffff:10.0.0.1") produces a 16-byte IP whose String() keeps
+// the mapped form, so a bare-v4 CIDR entry could miss it. Fixed in R41
+// (To4 normalization in Add/Contains/Remove) and kept as a regression
+// guard here: the mapped alias MUST match, and a mapped /120 entry must
+// match the equivalent bare-v4 /24 (R82.2/R89 — the assertion replaces the
+// R6-era t.Log that documented the old, unfixed behaviour round after round).
 func TestAttack_IPv4MappedIPv6InContains(t *testing.T) {
 	bl := NewBlocklist()
 
-	// Add a CIDR
-	_, ipnet, _ := net.ParseCIDR("10.0.0.0/24")
-	bl.mu.Lock()
-	bl.nets = append(bl.nets, ipnet)
-	bl.mu.Unlock()
+	// Add a CIDR through the public API (the pre-R89 test reached into the
+	// unexported slice, which would bypass validation and the index).
+	if !bl.Add("10.0.0.0/24") {
+		t.Fatal("Add(10.0.0.0/24) rejected")
+	}
 
 	// Test normal IPv4
 	if !bl.Contains("10.0.0.1") {
 		t.Error("Contains('10.0.0.1') = false, want true")
 	}
 
-	// Test IPv4-mapped IPv6
+	// Test IPv4-mapped IPv6 — must match the bare-v4 entry (R41)
 	if !bl.Contains("::ffff:10.0.0.1") {
-		t.Log("Contains('::ffff:10.0.0.1') = false — IPv4-mapped IPv6 addresses may not match CIDR rules correctly")
-		// This documents the behavior; Go's net.IPNet.Contains doesn't handle mapped addresses
+		t.Error("Contains('::ffff:10.0.0.1') = false — IPv4-mapped IPv6 source bypasses the v4 CIDR entry")
 	}
 
-	// Test IPv4-compatible IPv6
-	_ = bl.Contains("::10.0.0.1")
+	// A mapped CIDR entry is the v4 network it names (R82)
+	bl2 := NewBlocklist()
+	if !bl2.Add("::ffff:10.0.0.0/120") {
+		t.Fatal("Add(::ffff:10.0.0.0/120) rejected")
+	}
+	if !bl2.Contains("10.0.0.9") {
+		t.Error("Contains('10.0.0.9') = false — ::ffff:10.0.0.0/120 must block 10.0.0.0/24")
+	}
+	if bl2.Contains("10.0.1.9") {
+		t.Error("Contains('10.0.1.9') = true — ::ffff:10.0.0.0/120 must not block 10.0.1.0/24")
+	}
 }
 
 // ── R6.17: Unbounded fetch from slow/streaming server ───────────────────

@@ -19,30 +19,50 @@ import (
 // maxBlocklistEntries prevents memory exhaustion from a very large blocklist.
 const maxBlocklistEntries = 500000
 
-// maxCIDRNetworks caps the number of DISTINCT CIDR networks separately from
-// the total entry count. Exact-IP entries are O(1) map lookups, but
-// Contains() scans the entire nets slice on EVERY packet in the NFQUEUE hot
-// path — a feed poisoned with 500k distinct networks makes each packet pay a
-// ~5ms linear scan (measured on this host: 12ns per IPNet.Contains check),
-// stalling the single-goroutine receive loop and dropping ALL traffic (R58 —
-// the R45 dedup fix eliminated DUPLICATE accumulation but left the DISTINCT
-// count unbounded up to the 500k total cap). 65536 networks bounds the scan
-// to ~0.8ms worst case; legitimate feeds (Spamhaus DROP etc.) carry a few
-// thousand CIDRs.
+// maxCIDRNetworks caps the number of DISTINCT CIDR networks stored. R58
+// introduced the cap to bound the per-packet scan; R89 removed the scan
+// itself (bucketed lookup below), so the cap now only bounds memory.
 const maxCIDRNetworks = 65536
 
 // maxFeedResponseSize limits the response body from a threat intel feed to
 // prevent memory exhaustion attacks (50MB).
 const maxFeedResponseSize = 50 * 1024 * 1024
 
+// netBucket holds every CIDR entry that shares one prefix length within one
+// address family. mask is the canonical prefix mask for that length (4 bytes
+// for IPv4, 16 for IPv6); nets maps the MASKED network bytes to the entry.
+//
+// R89: before bucketing, Contains() scanned the whole network list on every
+// packet. R58 capped that list at 65536 distinct networks and accepted the
+// residual as "~0.8ms worst case" — but the scan runs on the single-goroutine
+// NFQUEUE receive loop, so the cap replaced "unbounded" with "still
+// catastrophic": measured 295 µs per Contains() at the cap, i.e. a throughput
+// ceiling of a few thousand packets per second, which a 1 Gbps link exceeds
+// by two orders of magnitude (queue overflow → the kernel drops ALL traffic).
+// Membership in a set of prefixes is a hash probe per distinct PREFIX LENGTH
+// (≤33 for IPv4, ≤129 for IPv6) — a property of the address family, never of
+// how many networks the feed carries. Add/Remove pay one map operation each.
+type netBucket struct {
+	mask net.IPMask
+	nets map[string]*net.IPNet
+}
+
+// netBucketSlots is the number of prefix lengths per family (0..32, 0..128).
+const (
+	v4BucketSlots = 33
+	v6BucketSlots = 129
+)
+
 // Blocklist holds a set of blocked IPs and CIDR networks, refreshed from
 // external threat intelligence feeds.
 type Blocklist struct {
-	mu      sync.RWMutex
-	ips     map[string]struct{} // exact IP entries
-	nets    []*net.IPNet        // CIDR network entries
-	netKeys map[string]struct{} // canonical CIDR string -> present (R45 dedup)
-	stopCh  chan struct{}
+	mu       sync.RWMutex
+	ips      map[string]struct{} // exact IP entries
+	nets4    [v4BucketSlots]*netBucket
+	nets6    [v6BucketSlots]*netBucket
+	netKeys  map[string]struct{} // canonical CIDR string -> present (R45 dedup)
+	netCount int                 // stored networks across both families
+	stopCh   chan struct{}
 
 	// One-shot warning latches, guarded by mu. Every silent-drop path in
 	// Add warns ONCE per process: a hostile feed can carry thousands of
@@ -95,6 +115,89 @@ func wholeFamilyNet(ipnet *net.IPNet) bool {
 	return false
 }
 
+// bucketFor resolves the bucket that holds (or would hold) ipnet, together
+// with the masked-network key used inside it. With create=false it returns
+// (nil, nil) when no entry with that prefix length exists, so lookups and
+// removals never allocate.
+//
+// The IPv4-mapped special case mirrors net.IPNet.Contains exactly: when the
+// MASKED network address is IPv4-mapped, Go truncates the 16-byte mask to its
+// last 4 bytes and compares 4-byte addresses, so ::ffff:a.b.c.d/(96+N) is a
+// v4 network with prefix N (R82). Any other 16-byte mask keeps 16-byte
+// comparison, and a v4 source can never match it.
+func (bl *Blocklist) bucketFor(ipnet *net.IPNet, create bool) (*netBucket, string) {
+	mask := ipnet.Mask
+	network := ipnet.IP
+	if len(mask) == net.IPv6len {
+		if v4 := network.To4(); v4 != nil {
+			mask = mask[12:]
+			network = v4
+		}
+	}
+	ones, bits := mask.Size()
+	if ones <= 0 || len(network) != len(mask) {
+		// ones == 0 is the whole-family shape rejected by wholeFamilyNet;
+		// a length mismatch cannot be produced by ParseCIDR.
+		return nil, ""
+	}
+	var slot **netBucket
+	switch {
+	case bits == 32 && len(mask) == net.IPv4len && ones <= 32:
+		slot = &bl.nets4[ones]
+	case bits == 128 && len(mask) == net.IPv6len && ones <= 128:
+		slot = &bl.nets6[ones]
+	default:
+		return nil, ""
+	}
+	masked := make([]byte, len(mask))
+	for i := range mask {
+		masked[i] = network[i] & mask[i]
+	}
+	if *slot == nil {
+		if !create {
+			return nil, ""
+		}
+		*slot = &netBucket{mask: net.CIDRMask(ones, bits), nets: make(map[string]*net.IPNet)}
+	}
+	return *slot, string(masked)
+}
+
+// matchNets reports whether ip (4-byte or 16-byte, already normalised) falls
+// inside any stored network. Cost is one masked probe per occupied prefix
+// length — independent of the number of networks stored (R89).
+func (bl *Blocklist) matchNets(ip net.IP) bool {
+	if len(ip) == net.IPv4len {
+		var key [net.IPv4len]byte
+		for ones := 1; ones < v4BucketSlots; ones++ {
+			b := bl.nets4[ones]
+			if b == nil {
+				continue
+			}
+			for i := 0; i < net.IPv4len; i++ {
+				key[i] = ip[i] & b.mask[i]
+			}
+			if _, ok := b.nets[string(key[:])]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	var key [net.IPv6len]byte
+	for ones := 1; ones < v6BucketSlots; ones++ {
+		b := bl.nets6[ones]
+		if b == nil {
+			continue
+		}
+		for i := 0; i < net.IPv6len; i++ {
+			key[i] = ip[i] & b.mask[i]
+		}
+		if _, ok := b.nets[string(key[:])]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Add inserts an IP or CIDR into the blocklist. Supports both exact IPs
 // (e.g. "10.0.0.1") and CIDR notation (e.g. "10.0.0.0/24").
 // IPv4-mapped IPv6 addresses (e.g. "::ffff:10.0.0.1") are normalized
@@ -115,11 +218,11 @@ func (bl *Blocklist) Add(entry string) bool {
 	defer bl.mu.Unlock()
 
 	// Check total cap
-	if len(bl.ips)+len(bl.nets) >= maxBlocklistEntries {
+	if len(bl.ips)+bl.netCount >= maxBlocklistEntries {
 		if !bl.capWarned {
 			bl.capWarned = true
 			slog.Warn("threat intel: blocklist at capacity — new entries are being dropped",
-				"cap", maxBlocklistEntries, "entries", len(bl.ips)+len(bl.nets))
+				"cap", maxBlocklistEntries, "entries", len(bl.ips)+bl.netCount)
 		}
 		return false
 	}
@@ -139,27 +242,20 @@ func (bl *Blocklist) Add(entry string) bool {
 		}
 		// Dedup on the canonical form: StartRefresher re-fetches the
 		// same feed every interval and old entries are never cleared,
-		// so a stable CIDR list re-appends every network each cycle.
-		// Without dedup the nets slice grows monotonically until the
-		// cap fills with DUPLICATES — newly discovered threats are then
-		// silently dropped by the cap check and Contains() scans tens
-		// of thousands of duplicate networks per packet (R45 — CIDR
-		// duplicate accumulation).
+		// so a stable CIDR list re-inserts every network each cycle.
+		// Without dedup the index grows monotonically until the cap
+		// fills with DUPLICATES — newly discovered threats are then
+		// silently dropped by the cap check (R45 — CIDR duplicate
+		// accumulation).
 		key := ipnet.String()
 		if _, dup := bl.netKeys[key]; dup {
 			return false
 		}
-		// Separate distinct-network cap (R58): Contains() scans the
-		// WHOLE nets slice on every packet in the NFQUEUE hot path
-		// (engine.evaluatePacket calls threatIntel.Contains per packet
-		// before OPA evaluation). The R45 dedup stops DUPLICATES from
-		// accumulating, but the total cap (ips+nets jointly, 500k)
-		// still lets a single malicious feed fetch fill all 500k slots
-		// with DISTINCT networks — measured ~4.7ms scan per packet,
-		// stalling the receive loop and dropping all traffic. Exact IPs
-		// are O(1) map lookups and keep the full budget; networks are
-		// O(n) per packet and get their own bound.
-		if len(bl.nets) >= maxCIDRNetworks {
+		// Distinct-network cap (R58): bounds stored memory. Since R89 the
+		// lookup cost no longer depends on this count (matchNets probes one
+		// bucket per occupied prefix length), so the cap is a budget in
+		// bytes/IPNet allocations only.
+		if bl.netCount >= maxCIDRNetworks {
 			if !bl.netCapWarned {
 				bl.netCapWarned = true
 				slog.Warn("threat intel: CIDR network cap reached — new networks are being dropped",
@@ -167,8 +263,22 @@ func (bl *Blocklist) Add(entry string) bool {
 			}
 			return false
 		}
+		bucket, maskedKey := bl.bucketFor(ipnet, true)
+		if bucket == nil {
+			// Unreachable for ParseCIDR output (wholeFamilyNet already
+			// rejects the prefix lengths bucketFor declines); never store an
+			// entry the lookup cannot find.
+			return false
+		}
+		if _, dup := bucket.nets[maskedKey]; dup {
+			// A different spelling of a network already stored (e.g. the
+			// IPv4-mapped alias of a v4 CIDR): it matches exactly the same
+			// packets, so record nothing new and keep netCount == len(netKeys).
+			return false
+		}
+		bucket.nets[maskedKey] = ipnet
 		bl.netKeys[key] = struct{}{}
-		bl.nets = append(bl.nets, ipnet)
+		bl.netCount++
 		return true
 	}
 
@@ -214,14 +324,9 @@ func (bl *Blocklist) Contains(ipStr string) bool {
 		return true
 	}
 
-	// Check CIDR match
-	for _, n := range bl.nets {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
+	// Check CIDR match — one masked probe per occupied prefix length, so the
+	// cost is a property of the address family, not of the feed size (R89).
+	return bl.matchNets(ip)
 }
 
 // Remove deletes an entry from the blocklist.
@@ -234,16 +339,24 @@ func (bl *Blocklist) Remove(entry string) {
 
 	if strings.Contains(entry, "/") {
 		_, ipnet, err := net.ParseCIDR(entry)
-		if err == nil {
-			key := ipnet.String()
-			for i, n := range bl.nets {
-				if n.String() == key {
-					bl.nets = append(bl.nets[:i], bl.nets[i+1:]...)
-					delete(bl.netKeys, key)
-					return
-				}
-			}
+		if err != nil {
+			return
 		}
+		key := ipnet.String()
+		if _, ok := bl.netKeys[key]; !ok {
+			return
+		}
+		// Locate the bucket exactly as Add placed the entry (same masked
+		// bytes, same prefix length) — no scan of the stored networks.
+		bucket, maskedKey := bl.bucketFor(ipnet, false)
+		if bucket == nil {
+			// Unreachable while the index invariant holds; leave the key so
+			// the caller's view of the blocklist does not silently diverge.
+			return
+		}
+		delete(bucket.nets, maskedKey)
+		delete(bl.netKeys, key)
+		bl.netCount--
 	} else {
 		ip := net.ParseIP(entry)
 		if ip != nil {
@@ -268,7 +381,7 @@ func (bl *Blocklist) Len() int {
 	}
 	bl.mu.RLock()
 	defer bl.mu.RUnlock()
-	return len(bl.ips) + len(bl.nets)
+	return len(bl.ips) + bl.netCount
 }
 
 // DataForOPA returns a map suitable for OPA's data store.
@@ -279,12 +392,25 @@ func (bl *Blocklist) DataForOPA() map[string]interface{} {
 	}
 	bl.mu.RLock()
 	defer bl.mu.RUnlock()
-	result := make(map[string]interface{}, len(bl.ips)+len(bl.nets))
+	result := make(map[string]interface{}, len(bl.ips)+bl.netCount)
 	for ip := range bl.ips {
 		result[ip] = true
 	}
-	for _, n := range bl.nets {
-		result[n.String()] = true
+	for _, b := range bl.nets4 {
+		if b == nil {
+			continue
+		}
+		for _, n := range b.nets {
+			result[n.String()] = true
+		}
+	}
+	for _, b := range bl.nets6 {
+		if b == nil {
+			continue
+		}
+		for _, n := range b.nets {
+			result[n.String()] = true
+		}
 	}
 	return result
 }
