@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -344,6 +345,18 @@ func main() {
 		if err != nil {
 			log.Fatalf("admin TLS configuration: %v", err)
 		}
+		// R90: a routable listener with no credential is an open control
+		// plane (read endpoints disclose blocked-host telemetry, and
+		// POST /admin/policy/reload is unauthenticated). The R84 Host guard
+		// is a DNS-rebinding defence, not authentication, and R87's warning
+		// only covers the plaintext-with-token case, so this combination
+		// used to start in complete silence. Warn — do not refuse: a
+		// loopback-only sidecar and the documented `docker run -p
+		// 8082:8082` are legitimate, but the operator must hear about the
+		// second one.
+		if w := adminExposureWarning(*listenAddr, *adminToken, *adminReadToken); w != "" {
+			slog.Warn(w)
+		}
 		if useTLS {
 			// R87: StartServerTLS fails closed on unloadable/rejected key
 			// material (R83) — it returns an error and starts NO listener, so a
@@ -455,6 +468,49 @@ func resolveAdminTLS(cert, key string) (string, string, bool, error) {
 		return "", "", false, fmt.Errorf("admin TLS: refusing to start — both --admin-tls-cert and --admin-tls-key are required (cert set: %t, key set: %t); a half-configured pair would silently serve the control plane in cleartext", cert != "", key != "")
 	}
 	return cert, key, true, nil
+}
+
+// adminExposureWarning returns a loud, actionable warning when the admin
+// listener is reachable from off-host AND no credential is configured, and
+// "" otherwise.
+//
+// R90: the shipped defaults are `--admin-listen :8082` (every interface) with
+// `--admin-token ""` and `--admin-read-token ""`, and internal/admin's
+// require*Auth wrappers return the handler unwrapped when BOTH tokens are
+// empty — the documented "no auth configured" mode. A default deployment
+// therefore serves the read endpoints (blocked-host telemetry) and the write
+// endpoint (POST /admin/policy/reload) to anyone who can reach the port.
+// R84's Host guard is not a defence here: it exists to defeat browser
+// DNS-rebinding and accepts any IP literal, which is exactly what a direct
+// attacker sends. R87's warning covers the *plaintext-with-token* case; this
+// covers the *routable-with-no-credential* case, which logged nothing.
+//
+// The default binding is not changed: the README's `docker run -p 8082:8082`
+// is a documented deployment, and silently narrowing it to loopback would
+// break it (and the container would look healthy while being unreachable).
+// Making the exposure audible is the R40.4 requirement — a control that is
+// not what the deployment says it is must at least be measurable.
+func adminExposureWarning(listen, token, readToken string) string {
+	if strings.TrimSpace(listen) == "" {
+		return "" // no admin listener configured
+	}
+	if token != "" || readToken != "" {
+		return "" // a credential is required for every endpoint
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		// ":8082" style (or an unparseable value) binds every interface when
+		// net.Listen resolves it — treat it as routable rather than assuming
+		// the safe reading.
+		host = ""
+	}
+	if host == "localhost" || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return "" // RFC 6761: never publicly resolvable
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return "" // 127.0.0.0/8, ::1
+	}
+	return fmt.Sprintf("admin API is listening on %s with no authentication configured: every admin endpoint (including POST /admin/policy/reload) is reachable from any host that can route to this port, and /admin/blocks + /admin/block-stats disclose the firewall's blocked-host telemetry. The R84 Host allowlist is a DNS-rebinding guard, not authentication. Set --admin-token (or bind to 127.0.0.1 and front it with an authenticated proxy)", listen)
 }
 
 // policyReloader abstracts the hot-reload target so the poll decision

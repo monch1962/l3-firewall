@@ -116,39 +116,54 @@ func RejectUnsafePath(path string) error {
 	return RejectSymlinkComponents(filepath.Dir(path))
 }
 
-// CreateOwnerOnly opens path for writing (create or truncate) and forces
-// mode 0600 on the resulting file descriptor.
+// OwnerOnlyMode is the mode every firewall-owned runtime file is forced to.
+const OwnerOnlyMode = 0o600
+
+// OpenOwnerOnly opens path with the caller's access mode/flags plus the
+// two hardening flags every writer of firewall-owned runtime data needs,
+// and forces OwnerOnlyMode on the resulting file descriptor.
 //
-// It centralises three separate hardening rules that every writer of
-// firewall-owned runtime data needs (persist state file, capture rotation
-// files), so a consumer cannot pick up two and miss the third (R85/R89 —
-// the "centralise a guard class instead of copying it" rule):
+// It centralises three separate rules, so a consumer cannot pick up two and
+// miss the third (R85/R89/R90 — the "centralise a guard class, then find
+// every consumer" rule; R89 centralised it for persist and capture and this
+// round found the third writer, the audit log, still creating 0644):
 //
 //   - O_NOFOLLOW: a symlink planted at the FINAL component is refused, so
 //     the write cannot be redirected into an arbitrary file writable by the
 //     firewall's UID (R42);
 //   - O_NONBLOCK: a FIFO planted at the (predictable) path is refused with
 //     ENXIO instead of blocking the caller forever waiting for a reader —
-//     the firewall's write paths run on the NFQUEUE hot path and on the
-//     60-second state ticker, where a blocking open stalls the whole engine
-//     (R55);
-//   - mode 0600 applied with fchmod AFTER the open. The mode argument of
+//     these write paths run on the NFQUEUE hot path and on the 60-second
+//     state ticker, where a blocking open stalls the whole engine (R55);
+//   - OwnerOnlyMode applied with fchmod AFTER the open. The mode argument of
 //     open(2) is ignored when the file already exists, so passing 0600 to
-//     OpenFile alone leaves a file created by an older build (or by hand)
-//     world-readable forever, and the contents here are captured traffic
-//     and blocked-host telemetry (R89).
+//     OpenFile alone leaves a file created by an older build (or by hand, or
+//     by an attacker who pre-created the predictable path) world-readable
+//     forever, and the contents here are captured traffic, blocked-host
+//     telemetry and the audit trail (R89/R90).
 //
 // The fchmod runs on the already-opened descriptor, so it cannot be raced
 // against a rename the way a path-based chmod can.
-func CreateOwnerOnly(path string) (*os.File, error) {
-	f, err := os.OpenFile(path,
-		os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o600)
+//
+// accessFlags must express the access intent (O_RDONLY/O_WRONLY/O_RDWR) plus
+// O_CREATE/O_APPEND/O_TRUNC as the caller needs — those are deliberately NOT
+// imposed here, because a truncating default would destroy the audit trail
+// (append-only evidence) if it were used for every consumer.
+func OpenOwnerOnly(path string, accessFlags int) (*os.File, error) {
+	flags := accessFlags | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
+	f, err := os.OpenFile(path, flags, OwnerOnlyMode)
 	if err != nil {
 		return nil, err
 	}
-	if err := f.Chmod(0o600); err != nil {
+	if err := f.Chmod(OwnerOnlyMode); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("forcing owner-only mode on %s: %w", path, err)
 	}
 	return f, nil
+}
+
+// CreateOwnerOnly opens path for writing, creating or truncating it, and
+// forces mode 0600 on the resulting descriptor (see OpenOwnerOnly).
+func CreateOwnerOnly(path string) (*os.File, error) {
+	return OpenOwnerOnly(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 }

@@ -42,7 +42,19 @@ const (
 // audit was missed). Default path /tmp/l3-firewall/audit.log is
 // attacker-writable.
 func openAuditFile(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0644)
+	// R90: mode is 0600 forced on the opened descriptor via
+	// securepath.OpenOwnerOnly, not 0644 via a raw OpenFile. The audit trail
+	// records src_ip/dst_ip/ports/reason for every block, the default path
+	// (/tmp/l3-firewall/audit.log) sits under world-traversable /tmp, and
+	// world-read needs no write access — so none of the symlink/FIFO
+	// hardening below protects the contents. R89 centralised this class in
+	// securepath for persist's state file and capture's pcap; audit is the
+	// third store of the same evidence and was missed.
+	//
+	// O_APPEND (never O_TRUNC): the audit log is append-only evidence, so
+	// the helper takes the access flags rather than imposing create-or-
+	// truncate. It also adds O_NOFOLLOW (R43) and O_NONBLOCK (R15).
+	f, err := securepath.OpenOwnerOnly(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND)
 	if err != nil {
 		return nil, err
 	}
