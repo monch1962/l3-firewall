@@ -414,7 +414,14 @@ func (a *API) StartServerTLS(addr, certFile, keyFile string) (*http.Server, stri
 	if certFile == "" || keyFile == "" {
 		return nil, "", fmt.Errorf("admin TLS: both a certificate and a key are required (cert=%q key=%q) — refusing to start an unencrypted admin API", certFile, keyFile)
 	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	// R91: the pair is read through loadKeyPair, not tls.LoadX509KeyPair.
+	// LoadX509KeyPair is two bare os.ReadFile calls: it follows a planted
+	// symlink at any component (the resulting key pair IS the control-plane
+	// identity, so the admin API would serve TLS with a key the attacker
+	// knows), blocks forever on a FIFO planted at either path (this runs in
+	// main() before eng.Run(), so the firewall never starts), and buffers an
+	// arbitrarily large file before checking anything. See readKeyFile.
+	cert, err := loadKeyPair(certFile, keyFile)
 	if err != nil {
 		slog.Error("admin API: TLS key material could not be loaded — refusing to start (no plaintext fallback)",
 			"cert", certFile, "key", keyFile, "error", err)

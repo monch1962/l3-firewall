@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -141,10 +142,21 @@ func TestAttack_StartupLogsDoNotPrintRawCredentialURLs(t *testing.T) {
 // certificate, and asserts the negative too: a plaintext request to that
 // listener must not receive an HTTP response.
 func TestAttack_AdminTLSPathServesEncryptedControlPlane(t *testing.T) {
-	cert, key, useTLS, err := resolveAdminTLS(
-		"../../internal/admin/testdata/server.crt",
-		"../../internal/admin/testdata/server.key",
-	)
+	// R91: the TLS key-material reader now rejects ".." components on the RAW
+	// path, exactly like every other credential reader (readPolicyFile,
+	// geoip.NewReader, persist.LoadState, audit.openAuditFile) — the guard has
+	// to see the raw string the kernel will resolve, and filepath.Dir/Clean
+	// would consume the component first. So the fixture path is resolved here
+	// rather than spelled with "..".
+	certPath, err := filepath.Abs("../../internal/admin/testdata/server.crt")
+	if err != nil {
+		t.Fatalf("resolving fixture path: %v", err)
+	}
+	keyPath, err := filepath.Abs("../../internal/admin/testdata/server.key")
+	if err != nil {
+		t.Fatalf("resolving fixture path: %v", err)
+	}
+	cert, key, useTLS, err := resolveAdminTLS(certPath, keyPath)
 	if err != nil || !useTLS {
 		t.Fatalf("resolveAdminTLS refused a valid pair: useTLS=%v err=%v", useTLS, err)
 	}

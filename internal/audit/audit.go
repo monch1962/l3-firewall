@@ -9,6 +9,7 @@ package audit
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -170,11 +171,15 @@ func (l *Logger) Log(e AuditEvent) error {
 		return fmt.Errorf("audit logger is closed")
 	}
 
-	// Check if rotation is needed
+	// Check if rotation is needed. A rotation failure is reported AFTER the
+	// event is written (R91): the pre-R91 code returned immediately, so the
+	// event that hit the threshold was dropped even when the failure was
+	// recoverable. recoverLocked leaves an appendable descriptor behind, so
+	// the evidence always lands; the caller still gets the error so the
+	// failed retention is visible (once per window, not per event).
+	var rotErr error
 	if l.size >= int64(l.cfg.MaxSizeMB)*1024*1024 {
-		if err := l.rotateLocked(); err != nil {
-			return fmt.Errorf("rotating audit log: %w", err)
-		}
+		rotErr = l.rotateLocked()
 	}
 
 	// Encode and write the event
@@ -183,7 +188,84 @@ func (l *Logger) Log(e AuditEvent) error {
 	}
 
 	l.size += int64(len(fmt.Sprintf("%+v\n", e))) // rough estimate
-	return nil
+	return rotErr
+}
+
+// maxRotatedNameAttempts bounds how many alternative names a single rotation
+// will try before declaring the rename impossible (R91). The rotated name has
+// one-second resolution, so an attacker with write access to the log directory
+// (the DEFAULT /tmp/l3-firewall is world-writable) can pre-create a directory
+// at the names a rotation is about to pick; rename(2) onto an existing
+// directory fails with EISDIR. A bounded number of uniquifiers
+// (audit.log.<ts>, audit.log.<ts>.1, ...) makes that pre-plant a losing game
+// without turning a hostile directory into an unbounded syscall loop.
+const maxRotatedNameAttempts = 100
+
+// nextRotatedPath returns the path this rotation will rename the live log to.
+//
+// R91: the name is not used blindly. It has one-second resolution
+// (audit.log.<UTC yyyymmddThhmmssZ>), so an attacker with write access to the
+// log directory — the DEFAULT /tmp/l3-firewall is world-writable — can
+// pre-create a DIRECTORY at the names a rotation is about to pick. rename(2)
+// onto an existing directory fails with EISDIR, which used to hit
+// rotateLocked's post-close failure path and permanently disable audit
+// logging. A bounded run of uniquifiers (audit.log.<ts>.1, .2, ...) makes the
+// pre-plant lose: the rotation simply picks a free name and the trail (and its
+// retention) continue. It also removes the silent same-second overwrite, where
+// rename replaced an existing backup — the only copy of the events that
+// triggered that rotation.
+//
+// When every candidate is occupied the plain name is returned so the rename
+// fails loudly and rotateLocked's recovery path keeps appending to the live
+// file (the trail is never sacrificed for retention).
+//
+// Must be called with l.mu held (or from a single-goroutine context).
+func nextRotatedPath(base string) string {
+	ts := time.Now().UTC().Format("20060102T150405Z")
+	base = fmt.Sprintf("%s.%s", base, ts)
+	if _, err := os.Lstat(base); os.IsNotExist(err) {
+		return base
+	}
+	for attempt := 1; attempt < maxRotatedNameAttempts; attempt++ {
+		candidate := fmt.Sprintf("%s.%d", base, attempt)
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+	return base
+}
+
+// recoverLocked re-establishes an appendable descriptor after a rotation that
+// failed AFTER l.file.Close() (R91).
+//
+// Every failure past the close used to leave the Logger holding a closed
+// descriptor with l.closed == false: every later Log returned "file already
+// closed" for the life of the process and the audit trail was dead — the harm
+// R64 documented for the directory-symlink trigger ("permanently destroying the
+// audit trail") while only that one trigger was guarded. Re-opening the live
+// path (append mode, O_NOFOLLOW/O_NONBLOCK/0600 via openAuditFile) keeps the
+// evidence plane alive whatever the cause: a planted rotated-name directory
+// (EISDIR), a cross-device/full filesystem, or a permissions change.
+//
+// l.size is reset so the next rotation attempt waits for another full window
+// instead of paying close/rename/re-open on every subsequent event — the
+// post-failure file may therefore exceed MaxSizeMB by up to one window, the
+// same tolerance the size estimate already has. The caller reports the error
+// (one actionable warning per window, not the per-event flood R64 described)
+// while the event that triggered it is still written.
+//
+// Must be called with l.mu held.
+func (l *Logger) recoverLocked(cause error) error {
+	f, err := openAuditFile(l.cfg.Path)
+	if err != nil {
+		return fmt.Errorf("%w (re-opening the audit trail also failed, so audit logging is disabled until restart: %v)", cause, err)
+	}
+	l.file = f
+	l.encoder = json.NewEncoder(f)
+	l.size = 0
+	slog.Warn("audit log rotation failed — continuing to append to the live log (evidence kept, retention degraded)",
+		"path", l.cfg.Path, "error", cause)
+	return cause
 }
 
 // rotateLocked renames the current file and opens a new one.
@@ -205,22 +287,25 @@ func (l *Logger) rotateLocked() error {
 	if err := securepath.RejectSymlinkComponents(filepath.Dir(l.cfg.Path)); err != nil {
 		return err
 	}
-	// Close current file
+	// Close current file. From here on the live descriptor is gone, so every
+	// failure MUST run through recoverLocked (R91): a closed descriptor with
+	// l.closed == false means every later Log fails and the trail is dead.
 	if err := l.file.Close(); err != nil {
-		return fmt.Errorf("closing current audit log: %w", err)
+		return l.recoverLocked(fmt.Errorf("closing current audit log: %w", err))
 	}
 
-	// Rename with timestamp suffix
-	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	rotatedPath := fmt.Sprintf("%s.%s", l.cfg.Path, timestamp)
+	// Rename with timestamp suffix (R91: uniquified, see nextRotatedPath —
+	// a planted directory at the predictable name must not be able to block
+	// rotation, and a same-second rotation must not overwrite a backup).
+	rotatedPath := nextRotatedPath(l.cfg.Path)
 	if err := os.Rename(l.cfg.Path, rotatedPath); err != nil {
-		return fmt.Errorf("renaming audit log: %w", err)
+		return l.recoverLocked(fmt.Errorf("renaming audit log: %w", err))
 	}
 
 	// Open new file (FIFO-hardened — see openAuditFile)
 	file, err := openAuditFile(l.cfg.Path)
 	if err != nil {
-		return fmt.Errorf("opening new audit log: %w", err)
+		return l.recoverLocked(fmt.Errorf("opening new audit log: %w", err))
 	}
 
 	l.file = file
