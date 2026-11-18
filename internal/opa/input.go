@@ -63,9 +63,20 @@ type Input struct {
 
 // BuildInput constructs the OPA input from parsed packet info, rate data,
 // connection state, TCP state string, per-port rate, new connection rate,
-// and recent destination ports for port-scan detection.
+// recent destination ports for port-scan detection, and the flow's REAL packet
+// count and age.
+//
+// flowPackets and flowAgeMs are connection-tracking facts, not decoration:
+// ConnectionInfo documents both fields and opa-policies/l3.rego advertises them
+// in its input contract (line 9). R92: pre-fix this builder hardcoded
+// PacketsInFlow to 1 and never set AgeMs (always 0), so any policy rule keyed
+// on either — "block flows with packets_in_flow > N", "block flows older than
+// age_ms" — was silently dead, the R76/R77 dead-input class (R76 noticed the
+// two fields and never fixed them). They are parameters rather than constants
+// so a caller cannot forget them and cannot re-introduce the fiction.
 func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpState string,
-	portPPS, portBPS, newConnRate float64, recentPorts []uint16) *Input {
+	portPPS, portBPS, newConnRate float64, recentPorts []uint16,
+	flowPackets, flowAgeMs int64) *Input {
 	now := time.Now().UTC()
 	input := &Input{
 		Packet: PacketInfo{
@@ -83,7 +94,8 @@ func BuildInput(pi *packet.PacketInfo, pps, bps float64, established bool, tcpSt
 		Connection: ConnectionInfo{
 			Established:   established,
 			TCPState:      tcpState,
-			PacketsInFlow: 1,
+			PacketsInFlow: flowPackets,
+			AgeMs:         flowAgeMs,
 		},
 		Rate: RateInfo{
 			SrcIPpps:       pps,

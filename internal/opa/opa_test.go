@@ -45,7 +45,7 @@ func TestBuildInput(t *testing.T) {
 		TCPFlags: packet.TCPFlags{SYN: true, ACK: false},
 	}
 
-	input := BuildInput(pi, 5.2, 42000, false, "", 0, 0, 0, nil)
+	input := BuildInput(pi, 5.2, 42000, false, "", 0, 0, 0, nil, 1, 0)
 
 	if input.Packet.SrcIP != "10.0.1.100" {
 		t.Errorf("SrcIP = %q, want %q", input.Packet.SrcIP, "10.0.1.100")
@@ -72,7 +72,7 @@ func TestBuildInputWithRecentPorts(t *testing.T) {
 	}
 
 	recentPorts := []uint16{22, 23, 25, 80, 443, 8080, 3306, 5432, 6379, 27017}
-	input := BuildInput(pi, 0, 0, false, "", 0, 0, 0, recentPorts)
+	input := BuildInput(pi, 0, 0, false, "", 0, 0, 0, recentPorts, 1, 0)
 
 	if len(input.Connection.RecentPorts) != 10 {
 		t.Errorf("RecentPorts length = %d, want 10", len(input.Connection.RecentPorts))
@@ -90,7 +90,7 @@ func TestBuildInputWithICMP(t *testing.T) {
 		ICMPCode: &icmpCode,
 	}
 
-	input := BuildInput(pi, 0, 0, false, "", 0, 0, 0, nil)
+	input := BuildInput(pi, 0, 0, false, "", 0, 0, 0, nil, 1, 0)
 
 	if input.Packet.Protocol != "ICMP" {
 		t.Errorf("Protocol = %q, want %q", input.Packet.Protocol, "ICMP")

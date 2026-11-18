@@ -410,7 +410,7 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		tcpState = flow.TCPState.String()
 	}
 	input := opa.BuildInput(pi, pps, bps, flow.Established, tcpState,
-		portPPS, portBPS, newConnRate, recentPorts)
+		portPPS, portBPS, newConnRate, recentPorts, flow.Packets, flow.AgeMs())
 
 	// 5. Threat intel check (if blocklist is configured)
 	if e.threatIntel != nil && e.threatIntel.Contains(pi.SrcIP) {

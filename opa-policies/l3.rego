@@ -7,6 +7,8 @@
 # Input structure:
 #   input.packet       — parsed packet headers (src_ip, dst_ip, protocol, ports, flags, fragment)
 #   input.connection   — connection state (established, tcp_state, packets_in_flow, age_ms, recent_ports)
+#                        — every field is populated from conntrack by opa.BuildInput; packets_in_flow
+#                        and age_ms are the flow's REAL values, never constants (R92)
 #   input.rate         — per-source rate info (src_ip_pps, src_ip_bps, src_port_pps, new_conns_per_sec)
 #   input.time         — current UTC time (utc_hour 0-23, utc_day 0=Sun 6=Sat)
 #   input.geo          — GeoIP country info (src_country, dst_country — ISO 3166-1 alpha-2)

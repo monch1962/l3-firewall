@@ -149,20 +149,86 @@ func parseIPv4Packet(raw []byte) (*PacketInfo, error) {
 		info.Fragment.L4Incomplete = true
 		return info, nil
 	}
-	populateL4FromBytes(info, raw, l4Off, ipv4.Protocol)
+	// R92: walk AH (protocol 51). AH is valid on IPv4 as well as IPv6 (RFC
+	// 4302 covers both), it is NOT encryption — the TCP/UDP header behind it
+	// is in the clear — and it is the one IP-protocol header carrying a length
+	// field before the L4 header. Pre-R92 it was reported as protocol "IP-51"
+	// with ports 0 and every flag false, so ONE prepended AH made blocked_ports
+	// and every other L4-keyed rule inert while a destination holding the SA
+	// stripped the header and delivered the unchanged segment. IPv4 has no
+	// HopByHop/Routing/DestOpt chain, so AH is the only hop to walk here (the
+	// IPv6 walk in walkIPv6HeaderChain handles the same header inside a chain).
+	l4Off, proto := skipAuthHeaders(raw, l4Off, ipv4.Protocol)
+	populateL4FromBytes(info, raw, l4Off, proto)
 	return info, nil
 }
 
-// extHeaderTypes maps IPv6 extension-header protocol numbers to short names for
-// the extension header list. The protocol-number key space is deliberate: the
-// walk below reads the chain from the raw bytes, so it must map an on-the-wire
-// protocol number (not a gopacket layer type) to a name.
-var extHeaderTypes = map[layers.IPProtocol]IPv6ExtHeaderType{
-	layers.IPProtocolIPv6HopByHop:    "HopByHop",
-	layers.IPProtocolIPv6Routing:     "Routing",
-	layers.IPProtocolIPv6Fragment:    "Fragment",
-	layers.IPProtocolIPv6Destination: "Destination",
+// skipAuthHeaders advances off past every AH (RFC 4302) header that starts
+// there and returns the resulting L4 offset and protocol.
+//
+// It returns off = -1 (the populateL4FromBytes "no L4 header on the wire"
+// signal) when an AH header is itself truncated — the destination's IPsec
+// layer rejects such a packet, so there is nothing to judge and nothing to
+// fabricate.
+func skipAuthHeaders(raw []byte, off int, proto layers.IPProtocol) (int, layers.IPProtocol) {
+	for proto == layers.IPProtocolAH {
+		if off+2 > len(raw) {
+			return -1, proto
+		}
+		next := layers.IPProtocol(raw[off])
+		off += authHeaderLen(raw[off+1])
+		proto = next
+	}
+	return off, proto
 }
+
+// extHeaderTypes maps IPv6 extension-header protocol numbers to their name and
+// length rule. The protocol-number key space is deliberate: the walk below reads
+// the chain from the raw bytes, so it must map an on-the-wire protocol number
+// (not a gopacket layer type) to a name.
+//
+// R92: the map originally carried only the four RFC 8200 extension headers R79
+// enumerated, and the walk TREATS A MISSING ENTRY AS THE L4 TERMINATOR. AH (51)
+// is an extension-header-shaped protocol with its own length field that hides a
+// cleartext L4 header, so its absence made ONE prepended AH report protocol
+// "IP-51" with ports 0 and every flag false — the R79.2 fail-open, one header
+// shape over. Mobility (135), HIP (139) and Shim6 (140) use the same RFC 8200
+// length convention and are included for the same reason.
+var extHeaderTypes = map[layers.IPProtocol]extHeader{
+	layers.IPProtocolIPv6HopByHop:    {"HopByHop", hdrExtLen8},
+	layers.IPProtocolIPv6Routing:     {"Routing", hdrExtLen8},
+	layers.IPProtocolIPv6Fragment:    {"Fragment", hdrExtLen8}, // length unused: fixed 8 bytes
+	layers.IPProtocolIPv6Destination: {"Destination", hdrExtLen8},
+	layers.IPProtocolAH:              {"AH", authHeaderLen},
+	protoMobility:                    {"Mobility", hdrExtLen8},
+	protoHIP:                         {"HIP", hdrExtLen8},
+	protoShim6:                       {"Shim6", hdrExtLen8},
+}
+
+// Extension-header protocol numbers with no gopacket constant.
+const (
+	protoMobility layers.IPProtocol = 135 // RFC 6275
+	protoHIP      layers.IPProtocol = 139 // RFC 7401
+	protoShim6    layers.IPProtocol = 140 // RFC 5533
+)
+
+// extHeader is one extension-header shape: its policy-facing name and the rule
+// that turns its second byte (Hdr Ext Len / AH Payload Len) into a total size.
+type extHeader struct {
+	name        string
+	lengthBytes func(secondByte byte) int
+}
+
+// hdrExtLen8 is the RFC 8200 extension-header length: Hdr Ext Len counts 8-octet
+// units NOT including the first 8 octets, so total = (len+1)*8 (>= 8).
+func hdrExtLen8(b byte) int { return (int(b) + 1) * 8 }
+
+// authHeaderLen is the RFC 4302 §2.2 AH length: the Payload Len field counts
+// 32-bit words MINUS 2, so total = (len+2)*4 (12 bytes for a bare AH, up to 44
+// with a 32-byte ICV, >= 8). It is deliberately NOT hdrExtLen8 — using the
+// RFC 8200 formula here would land the L4 reader 12 bytes into the TCP header
+// on a 20-byte AH and report ports 0 or garbage.
+func authHeaderLen(b byte) int { return (int(b) + 2) * 4 }
 
 const (
 	// ipv4HeaderLen is the minimum IPv4 header size, i.e. IHL == 5.
@@ -234,13 +300,16 @@ func walkIPv6HeaderChain(raw []byte, first layers.IPProtocol) ipv6HeaderChain {
 	off := ipv6HeaderLen
 
 	for {
-		name, ok := extHeaderTypes[proto]
+		ext, ok := extHeaderTypes[proto]
 		if !ok {
 			// L4 (or unrecognized) protocol terminator.
 			chain.L4Proto = proto
-			if off < len(raw) {
-				chain.L4Offset = off
-			}
+			// R92: set the offset even when it is at/after the end of the
+			// packet. populateL4FromBytes then reports "protocol known, header
+			// absent" and marks L4Incomplete for a protocol that MUST carry an
+			// L4 header (RULE 11b fails closed). Pre-R92 the offset was
+			// withheld here (-1), which silently meant "no header expected".
+			chain.L4Offset = off
 			return chain
 		}
 		if off >= len(raw) {
@@ -250,7 +319,7 @@ func walkIPv6HeaderChain(raw []byte, first layers.IPProtocol) ipv6HeaderChain {
 			chain.L4Proto = proto
 			return chain
 		}
-		chain.ExtHeaders = append(chain.ExtHeaders, name)
+		chain.ExtHeaders = append(chain.ExtHeaders, IPv6ExtHeaderType(ext.name))
 
 		next := layers.IPProtocol(raw[off])
 		if proto == layers.IPProtocolIPv6Fragment {
@@ -281,7 +350,7 @@ func walkIPv6HeaderChain(raw []byte, first layers.IPProtocol) ipv6HeaderChain {
 			chain.L4Proto = proto
 			return chain
 		}
-		hlen := (int(raw[off+1]) + 1) * 8
+		hlen := ext.lengthBytes(raw[off+1])
 		proto = next
 		off += hlen
 	}
