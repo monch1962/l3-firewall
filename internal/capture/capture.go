@@ -133,8 +133,16 @@ func (w *Writer) rotateLocked() error {
 		w.curFile = nil
 	}
 
-	w.curFileN++
-	fname := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", w.curFileN))
+	// The rotation index advances only on SUCCESS (R93): the pre-R93 code
+	// incremented w.curFileN before the create, so a rotation refused by the
+	// hardening guards (a planted hard link / symlink / FIFO at the predictable
+	// name) burned that index — the first successful capture after the attack
+	// was blocked_00002.pcap and mechanism 1's retention arithmetic
+	// (curFileN-MaxFiles) pointed at a slot that never existed. Computing the
+	// next name without committing the index keeps the invariant "index N is
+	// an existing rotation file of this run".
+	nextFileN := w.curFileN + 1
+	fname := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", nextFileN))
 	// Open with O_NOFOLLOW: os.Create would follow a symlink planted at the
 	// rotation filename by an attacker with write access to the pcap
 	// directory, truncating and overwriting an arbitrary file writable by
@@ -171,6 +179,7 @@ func (w *Writer) rotateLocked() error {
 	w.curFile = f
 	w.fw = fw
 	w.pktCount = 0
+	w.curFileN = nextFileN
 
 	// Cleanup old files
 	w.cleanupLocked()

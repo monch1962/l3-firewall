@@ -51,8 +51,11 @@ var (
 // exceeded: 918 pps / 41234 bps", "blocked port 22 (TCP)", "OPA error: ...").
 // The cap is a backstop for anything that still varies.
 //
-// Exact (unfolded) reasons remain available on /admin/block-stats and in the
-// per-packet log lines — metrics are for aggregation, logs for forensics.
+// Exact (unfolded) reasons remain available in the per-packet log lines and the
+// recent-blocks ring buffer; /admin/block-stats folds the same digit runs with
+// engine.blockStatKey, so the two aggregation surfaces agree (R93 — the admin
+// surface's raw keys let attacker-paced numeric reasons fill its cap and hide
+// every later reason). Metrics are for aggregation, logs for forensics.
 const (
 	maxProtocolLabels    = 64
 	maxReasonLabels      = 256 // mirrors engine.maxBlockStatsReasons

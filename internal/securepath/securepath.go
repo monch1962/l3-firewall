@@ -135,6 +135,19 @@ const OwnerOnlyMode = 0o600
 //     ENXIO instead of blocking the caller forever waiting for a reader —
 //     these write paths run on the NFQUEUE hot path and on the 60-second
 //     state ticker, where a blocking open stalls the whole engine (R55);
+//   - no hard link: a file whose link count exceeds one is refused (R93).
+//     O_NOFOLLOW refuses only SYMBOLIC links; a hard link is not resolved at
+//     all — it IS the inode — so no open(2) flag can reject it. O_NOFOLLOW,
+//     the directory walk and O_NONBLOCK therefore all pass while the file the
+//     firewall is about to shorten or append to is shared with an attacker's
+//     chosen name. The standing model (write access to the state/pcap/log
+//     directory: /tmp/l3-firewall, a shared volume, or the 0755 directory the
+//     constructors create) is enough to pre-create <state>.tmp,
+//     blocked_00001.pcap or audit.log as a link to a file the firewall's UID
+//     may write — its OWN evidence always qualifies, and any co-tenant file of
+//     the same UID does too. fs.protected_hardlinks=1 (Linux default) narrows
+//     this to files the attacker owns and is routinely disabled in
+//     container/perf kernels, so the check cannot be delegated to it;
 //   - OwnerOnlyMode applied with fchmod AFTER the open. The mode argument of
 //     open(2) is ignored when the file already exists, so passing 0600 to
 //     OpenFile alone leaves a file created by an older build (or by hand, or
@@ -148,11 +161,17 @@ const OwnerOnlyMode = 0o600
 // accessFlags must express the access intent (O_RDONLY/O_WRONLY/O_RDWR) plus
 // O_CREATE/O_APPEND/O_TRUNC as the caller needs — those are deliberately NOT
 // imposed here, because a truncating default would destroy the audit trail
-// (append-only evidence) if it were used for every consumer.
+// (append-only evidence) if it were used for every consumer. Callers that need
+// create-or-overwrite semantics must use CreateOwnerOnly, which validates the
+// inode BEFORE shortening it.
 func OpenOwnerOnly(path string, accessFlags int) (*os.File, error) {
 	flags := accessFlags | syscall.O_NOFOLLOW | syscall.O_NONBLOCK
 	f, err := os.OpenFile(path, flags, OwnerOnlyMode)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseSharedInode(f, path); err != nil {
+		f.Close()
 		return nil, err
 	}
 	if err := f.Chmod(OwnerOnlyMode); err != nil {
@@ -162,8 +181,50 @@ func OpenOwnerOnly(path string, accessFlags int) (*os.File, error) {
 	return f, nil
 }
 
-// CreateOwnerOnly opens path for writing, creating or truncating it, and
-// forces mode 0600 on the resulting descriptor (see OpenOwnerOnly).
+// refuseSharedInode rejects a file descriptor whose inode has more than one
+// hard link (R93).
+//
+// It runs on the OPENED descriptor, so there is no stat-then-open race: the
+// link count belongs to the same inode the caller is about to write through.
+// A count above one means another name references this inode, and none of the
+// firewall's runtime files (state, pcap rotation, audit log) is ever
+// legitimately hard-linked, so the safe reading is that the name was planted.
+//
+// Note for callers: this check is only sound if the open did not already
+// modify the file. CreateOwnerOnly therefore opens WITHOUT the destructive flag
+// and shortens the file only after this returns nil.
+func refuseSharedInode(f *os.File, path string) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stating %s: %w", path, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot read link count for %s", path)
+	}
+	if st.Nlink > 1 {
+		return fmt.Errorf("refusing hard-linked path (nlink=%d): %s", st.Nlink, path)
+	}
+	return nil
+}
+
+// CreateOwnerOnly opens path for writing, creating it if needed and replacing
+// its contents, and forces mode 0600 on the resulting descriptor (see
+// OpenOwnerOnly).
+//
+// The order matters (R93): the file is opened WITHOUT O_TRUNC, the inode is
+// validated by OpenOwnerOnly (which refuses a hard-linked path), and only then
+// is the content shortened. Opening with O_TRUNC would destroy the target's
+// contents at open(2) time — before any check could run — so the destructive
+// flag would make the hard-link refusal useless.
 func CreateOwnerOnly(path string) (*os.File, error) {
-	return OpenOwnerOnly(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	f, err := OpenOwnerOnly(path, os.O_WRONLY|os.O_CREATE)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Truncate(0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("shortening %s: %w", path, err)
+	}
+	return f, nil
 }

@@ -418,7 +418,20 @@ func (bl *Blocklist) DataForOPA() map[string]interface{} {
 // FetchFromURL fetches a blocklist from the given URL and adds all entries.
 // Returns the number of new entries added. Supports one-IP/CIDR-per-line format.
 // Lines starting with # are comments and are ignored.
+//
+// The URL is trimmed first: this is the function that turns a config string
+// into an HTTP request, and net/http refuses a URL with a leading space
+// ("first path segment in URL cannot contain colon") or a control character.
+// The comma-separated flag value is written by humans
+// ("--threat-intel-url https://a/feed, https://b/feed") and a templated value
+// can carry a trailing newline, so padding is expected input, not a mistake —
+// closing the class here protects the startup loop, the refresher and every
+// future caller at once (R93).
 func (bl *Blocklist) FetchFromURL(url string) (int, error) {
+	url = strings.TrimSpace(url)
+	if url == "" {
+		return 0, fmt.Errorf("fetching blocklist: empty URL")
+	}
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		// Do not follow redirects to prevent SSRF attacks where a malicious
@@ -446,6 +459,43 @@ func (bl *Blocklist) FetchFromURL(url string) (int, error) {
 // entries are IPs/CIDRs — anything longer is not a plausible entry and is
 // skipped (R54). 1MB is generous (IPv6-CIDR lines are <100 bytes).
 const maxFeedLineSize = 1024 * 1024
+
+// ParseURLList splits a comma-separated feed list (the --threat-intel-url
+// flag value) into its entries, trimming surrounding whitespace and dropping
+// blank entries.
+//
+// It exists because the flag is written the way a human writes a list —
+// "--threat-intel-url https://a/feed, https://b/feed" — and net/http cannot
+// parse a URL with a leading space ("first path segment in URL cannot contain
+// colon"). cmd/server used to trim each entry only for the startup fetch and
+// hand the RAW split slice to StartRefresher, so every entry after the first
+// failed on every periodic refresh for the life of the process: the blocklist
+// loaded once at boot and then never saw new intelligence again, while the log
+// said "threat intel enabled" (R93 — the R40.4 silently-degraded-control class
+// on the deny plane). Both the startup loop and the refresher now take their
+// entries from here, and blank entries are dropped so an all-blank list starts
+// no goroutine at all.
+func ParseURLList(raw string) []string {
+	return normalizeURLList(strings.Split(raw, ","))
+}
+
+// normalizeURLList applies the one per-entry rule to a URL list: trim, drop
+// blank. Reached from ParseURLList (the flag), from StartRefresher (a caller's
+// slice) and — for the single-string case — from FetchFromURL, so the class is
+// closed at every door with one implementation (R85/R89: centralise, do not
+// patch each consumer).
+func normalizeURLList(urls []string) []string {
+	out := make([]string, 0, len(urls))
+	for _, u := range urls {
+		if u = strings.TrimSpace(u); u != "" {
+			out = append(out, u)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
 
 // parseReader reads IP/CIDR entries from a reader and adds them to the blocklist.
 // Lines longer than maxFeedLineSize are skipped with a warning, not fatal:
@@ -508,7 +558,16 @@ func (bl *Blocklist) parseReader(r io.Reader) (int, error) {
 // Each call returns a fresh channel so callers can close it without risking
 // a double-close panic on a shared channel.
 func (bl *Blocklist) StartRefresher(urls []string, interval time.Duration) chan struct{} {
-	if bl == nil || len(urls) == 0 {
+	if bl == nil {
+		return nil
+	}
+	// Normalise ONCE at the top (R93): a caller's slice is just as likely to
+	// carry padding as the flag string was, and a padded entry would fail
+	// every refresh forever. An all-blank list starts no goroutine at all
+	// rather than a permanent doomed fetch loop that also reads as "the
+	// refresher is running".
+	urls = normalizeURLList(urls)
+	if len(urls) == 0 {
 		return nil
 	}
 	// Enforce minimum interval to prevent time.NewTicker(0) panic

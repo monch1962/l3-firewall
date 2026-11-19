@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,9 +99,13 @@ type Engine struct {
 	packetsAllowed   atomic.Int64
 	packetsBlocked   atomic.Int64
 
-	// Per-reason block counters for aggregation
-	blockStatsMu sync.RWMutex
-	blockStats   map[string]int64
+	// Per-reason block counters for aggregation. Keys are FOLDED reason
+	// strings (blockStatKey), not raw ones: several deny reasons embed
+	// attacker-controlled numbers, and a raw key space lets an attacker fill
+	// the cap and silently blind the per-reason view (R93).
+	blockStatsMu     sync.RWMutex
+	blockStats       map[string]int64
+	blockStatsWarned bool // one-shot: the cap was reached, new reasons dropped
 
 	// Recent blocks ring buffer
 	recentMu     sync.RWMutex
@@ -200,6 +205,52 @@ func (e *Engine) RecentBlocks() []BlockLogEntry {
 	return result
 }
 
+// blockStatKey folds a deny reason into the aggregation key used by
+// /admin/block-stats and by the persisted state file (R93).
+//
+// It mirrors metrics.sanitiseLabel's reason folding (control bytes → space,
+// runs of digits → '#', length cap) for one reason: a reason is not a constant
+// — several production deny reasons embed values the ATTACKER controls. The
+// per-IP rate-limit reason prints the measured pps/bps, which the attacker
+// paces, so 256 distinct keys ("per-IP rate limit exceeded: 1234 pps / 567 bps")
+// are trivially generated. The map is capped at maxBlockStatsReasons to bound
+// memory, so before this fold the attacker filled the cap and every NEW reason
+// was silently dropped: the operator's per-reason view froze exactly when an
+// incident was producing new deny reasons (threat intel, OPA policy), which is
+// the R40.4 silently-degraded-control class on an observability surface. The
+// Prometheus surface already folded the same strings, so the two views of one
+// event disagreed — the R86 lesson applied to cardinality.
+//
+// Folding costs the numeric detail in the AGGREGATE only: recentBlocks and the
+// per-packet log lines keep the exact reason, which is where forensic
+// precision belongs.
+func blockStatKey(reason string) string {
+	if len(reason) > maxReasonLength {
+		reason = reason[:maxReasonLength]
+	}
+	var b strings.Builder
+	b.Grow(len(reason))
+	prevDigit := false
+	for _, r := range reason {
+		switch {
+		case r >= '0' && r <= '9':
+			if !prevDigit {
+				b.WriteByte('#')
+			}
+			prevDigit = true
+		case r < 0x20 || r == 0x7f:
+			// Control byte (CR/LF/TAB/NUL) — never meaningful in an aggregate
+			// key and would otherwise make one reason look like several.
+			b.WriteByte(' ')
+			prevDigit = false
+		default:
+			prevDigit = false
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // recordBlock appends a block log entry and increments the per-reason counter.
 // Long reason strings are truncated to maxReasonLength to prevent memory bloat.
 func (e *Engine) recordBlock(pi *packet.PacketInfo, reason, traceID string) {
@@ -227,10 +278,19 @@ func (e *Engine) recordBlock(pi *packet.PacketInfo, reason, traceID string) {
 	}
 	e.recentBlocks = append(e.recentBlocks, entry)
 
-	// Per-reason counter (capped to prevent memory exhaustion)
+	// Per-reason counter, keyed on the FOLDED reason (R93) and capped to
+	// prevent memory exhaustion.
+	key := blockStatKey(reason)
 	e.blockStatsMu.Lock()
-	if len(e.blockStats) < maxBlockStatsReasons {
-		e.blockStats[reason]++
+	if _, known := e.blockStats[key]; known || len(e.blockStats) < maxBlockStatsReasons {
+		e.blockStats[key]++
+	} else if !e.blockStatsWarned {
+		// A dropped control must be observable (R82/R82.2 doctrine): with
+		// folding this should be unreachable in practice, so if it does fire
+		// the operator needs to know the aggregate view is now incomplete.
+		e.blockStatsWarned = true
+		slog.Warn("block stats reason cap reached — new deny reasons are not counted in /admin/block-stats",
+			"cap", maxBlockStatsReasons, "reason", key)
 	}
 	e.blockStatsMu.Unlock()
 }
@@ -629,8 +689,14 @@ func (e *Engine) restoreState() {
 	}
 	e.blockStatsMu.Lock()
 	for k, v := range state.BlockStats {
-		if len(e.blockStats) < maxBlockStatsReasons {
-			e.blockStats[k] = v
+		// Fold on the way in (R93): a state file written by an older build (or
+		// one an attacker influenced) carries raw keys, and a map restored
+		// already full of them drops every new reason from the first packet
+		// after startup. Accumulating rather than assigning also merges the
+		// folded duplicates correctly.
+		key := blockStatKey(k)
+		if _, known := e.blockStats[key]; known || len(e.blockStats) < maxBlockStatsReasons {
+			e.blockStats[key] += v
 		}
 	}
 	e.blockStatsMu.Unlock()

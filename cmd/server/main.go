@@ -279,13 +279,21 @@ func main() {
 		slog.Info("GeoIP enabled", "db", *geoipDBPath)
 	}
 
-	// Create threat intel blocklist if URLs are specified
+	// Create threat intel blocklist if URLs are specified.
+	//
+	// The flag value is parsed ONCE by threatintel.ParseURLList and the SAME
+	// slice feeds both the startup fetch and the refresher (R93). Before this,
+	// each entry was trimmed only for the startup fetch and the raw split
+	// slice went to StartRefresher: with the natural spelling
+	// "--threat-intel-url https://a/feed, https://b/feed" every entry after
+	// the first carried a leading space, net/http refused it ("first path
+	// segment in URL cannot contain colon"), and the deny plane loaded once at
+	// boot and then never refreshed — while the log said "threat intel
+	// enabled". The R40.4 silently-degraded-control class on the deny plane.
 	var threatIntelBlocklist *threatintel.Blocklist
-	if *threatIntelURL != "" {
-		urls := strings.Split(*threatIntelURL, ",")
+	if urls := threatintel.ParseURLList(*threatIntelURL); len(urls) > 0 {
 		bl := threatintel.NewBlocklist()
 		for _, url := range urls {
-			url = strings.TrimSpace(url)
 			count, err := bl.FetchFromURL(url)
 			if err != nil {
 				// R87: redact both the URL and the error text — net/http (and
