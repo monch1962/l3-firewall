@@ -48,6 +48,10 @@ const version = "0.1.0"
 // at startup or hot-reload (R8/R38 class).
 const maxPolicyFileSize = 10 * 1024 * 1024
 
+// maxNFQueueNum is the largest NFQUEUE number the kernel's 16-bit attribute
+// can carry (R94 — see validateQueueNumber).
+const maxNFQueueNum = 65535
+
 // readPolicyFile reads a Rego policy file safely. Unlike os.ReadFile, it:
 //   - opens with O_NONBLOCK so a FIFO placed at --opa-embed never blocks
 //     startup or the hot-reload goroutine (R14/R15/R38 class),
@@ -181,6 +185,14 @@ func main() {
 			slog.Warn("--queue-input is parsed but NOT enforced: input traffic is not firewalled (engine.Run registers only the forward queue; wiring deferred — R49)")
 		}
 	})
+
+	// R94: the queue number is passed to the kernel as uint16, so an
+	// out-of-range value wraps to a DIFFERENT queue than the one the operator
+	// (and the nftables ruleset) configured. Refuse it before the policy is
+	// loaded, the listeners are opened or anything else has a side effect.
+	if err := validateQueueNumber(*queueNum); err != nil {
+		log.Fatalf("invalid configuration: %v", err)
+	}
 
 	slog.Info("starting l3-firewall",
 		"version", version,
@@ -526,6 +538,27 @@ func adminExposureWarning(listen, token, readToken string) string {
 // satisfies it implicitly (Load(policy string) error).
 type policyReloader interface {
 	Load(policy string) error
+}
+
+// validateQueueNumber reports whether n can be handed to the kernel as an
+// NFQUEUE number.
+//
+// The NFQUEUE number is a 16-BIT field in the kernel ABI, and main() passes it
+// as uint16(*queueNum). A larger value therefore WRAPS instead of failing:
+// `--queue 65536` becomes 0, `--queue 70000` becomes 4464, and `--queue 65537`
+// becomes 1 — the last one colliding with the shipped `--queue-input 1` default.
+// The engine then registers on a queue the operator never configured while the
+// startup line prints the un-truncated value ("starting firewall engine
+// queue=70000"), so the nftables rule that queues to the configured number
+// matches nothing: traffic is NOT firewalled and the process still reports it
+// is (the R40.4 "control that is not what the deployment says it is" class).
+// A templated deployment value (`--queue ${QUEUE}`) is the realistic source.
+// Refuse it at startup rather than wrap it.
+func validateQueueNumber(n uint) error {
+	if n > maxNFQueueNum {
+		return fmt.Errorf("--queue %d is out of range: NFQUEUE numbers are a 16-bit kernel field (0-%d) and uint16(%d) would register on queue %d instead", n, maxNFQueueNum, n, uint16(n))
+	}
+	return nil
 }
 
 // pollPolicyFile performs ONE hot-reload poll decision: stats the policy

@@ -394,10 +394,37 @@ func (t *Table) NewConnectionRate(srcIP string) float64 {
 	return r.rate(time.Now())
 }
 
+// ConnState is a flow's connection state as it was when the packet ARRIVED,
+// before this packet's own flags were applied.
+//
+// It exists because the OPA input must carry the facts the packet is JUDGED
+// on, not the aftermath of judging it (R94): the engine used to read
+// flow.Established / flow.TCPState AFTER UpdateTCPState had already applied
+// the current packet's transition, so the one packet type that consumes the
+// fact destroyed it first — a RST clears Established, so every RST carried
+// `established: false` and the shipped policy's deny_state_violation
+// ("RST to non-existent flow") fired for EVERY TCP reset, including the
+// teardown of a fully established connection. The policy's own Rego test
+// (l3_test.rego test_state_violation_rst_established_ok) pins the intended
+// contract; no Go producer could ever satisfy it.
+//
+// New reports that THIS packet created the flow (the first packet of the
+// 5-tuple), which is what makes "did we observe a handshake?" answerable.
+type ConnState struct {
+	Established bool     // flow.Established before this packet was applied
+	TCPState    TCPState // flow state before this packet was applied
+	New         bool     // this packet created the flow
+}
+
 // UpdateTCPState finds or creates a flow and transitions its TCP state based on
 // the given TCP flags. This implements a simplified TCP FSM sufficient for
-// firewall state tracking. Returns the flow.
-func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort uint16, syn, ack, rst, fin bool) *Flow {
+// firewall state tracking.
+//
+// It returns the flow (with this packet already accounted for — PacketCount and
+// state are the CURRENT values, which is what the stat surfaces report) AND a
+// ConnState snapshot of the flow as it was when the packet arrived, which is
+// the value a policy rule must judge. See ConnState.
+func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort uint16, syn, ack, rst, fin bool) (*Flow, ConnState) {
 	srcIP = normalizeIP(srcIP)
 	dstIP = normalizeIP(dstIP)
 	key := flowKey{srcIP, dstIP, protocol, srcPort, dstPort}
@@ -406,12 +433,13 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 	defer t.mu.Unlock()
 
 	var isNew bool
+	var arrival ConnState // the facts this packet is JUDGED on (R94)
 	f, ok := t.flows[key]
 	if !ok {
 		// Check per-source flow limit before creating
 		if t.reachedFlowLimitLocked(srcIP) {
 			t.stats.FlowLimitExceeded++
-			return nil
+			return nil, ConnState{}
 		}
 		if len(t.flows) >= t.cfg.MaxEntries {
 			t.evictOneLocked()
@@ -423,11 +451,20 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 			SrcPort: srcPort, DstPort: dstPort,
 			Packets: 1, created: time.Now(), lastSeen: time.Now(),
 		}
+		// A flow created by this packet cannot be established yet: no
+		// handshake has been observed on it (R94). The SYN-ACK arm below
+		// still promotes it, because a SYN-ACK is evidence that the peer
+		// answered someone's SYN; a bare ACK is not evidence of anything.
+		arrival = ConnState{Established: false, TCPState: f.TCPState, New: true}
 		t.flows[key] = f
 		t.stats.Created++
 		t.incrFlowCountLocked(srcIP)
 		t.recordNewConn(srcIP)
 	} else {
+		// Snapshot BEFORE this packet's flags are applied (R94): the RST arm
+		// below clears Established, and reporting the post-transition value
+		// made the shipped policy's deny_state_violation fire for every reset.
+		arrival = ConnState{Established: f.Established, TCPState: f.TCPState}
 		f.touch()
 		t.stats.Hits++
 	}
@@ -447,7 +484,13 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 
 	case syn && !ack && !fin:
 		// SYN from the other direction transitions to SYN_RECEIVED
-		if f.TCPState == TCPSynSent {
+		//
+		// R94: only for a flow we were already tracking. A SYN that CREATES
+		// the flow is the handshake's first packet, so the flow stays
+		// SYN_SENT (the zero value) — otherwise the SYN-ACK arm below (which
+		// promotes from SYN_SENT) could never fire and a real client
+		// handshake never reached ESTABLISHED.
+		if !isNew && f.TCPState == TCPSynSent {
 			f.TCPState = TCPSynReceived
 		}
 
@@ -482,8 +525,14 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 		// ACK (data or handshake continuation)
 		switch f.TCPState {
 		case TCPSynSent:
-			f.TCPState = TCPEstablished
-			f.Established = true
+			// R94: a bare ACK on a flow this packet CREATED did not observe a
+			// handshake — the flow's default state is SYN_SENT, so this arm
+			// used to mark a mid-stream (or spoofed) ACK ESTABLISHED. The fact
+			// is only true for an ACK that continues a flow already in flight.
+			if !isNew {
+				f.TCPState = TCPEstablished
+				f.Established = true
+			}
 		case TCPFinWait1:
 			f.TCPState = TCPFinWait2
 		case TCPClosing:
@@ -500,7 +549,7 @@ func (t *Table) UpdateTCPState(srcIP, dstIP, protocol string, srcPort, dstPort u
 		f.TCPState = TCPSynReceived
 	}
 
-	return f
+	return f, arrival
 }
 
 // Delete removes a flow by 5-tuple and decrements the per-source flow count.

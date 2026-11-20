@@ -257,13 +257,13 @@ func TestMaxFlowsPerSrcIPTCPUpdateState(t *testing.T) {
 	}
 	ct := NewTable(cfg)
 
-	f1 := ct.UpdateTCPState("10.0.1.1", "10.0.2.1", "TCP", 44001, 80, true, false, false, false)
+	f1, _ := ct.UpdateTCPState("10.0.1.1", "10.0.2.1", "TCP", 44001, 80, true, false, false, false)
 	if f1 == nil {
 		t.Fatal("first TCP flow returned nil")
 	}
 
 	// Second TCP update from same src should be blocked
-	f2 := ct.UpdateTCPState("10.0.1.1", "10.0.2.2", "TCP", 44002, 443, true, false, false, false)
+	f2, _ := ct.UpdateTCPState("10.0.1.1", "10.0.2.2", "TCP", 44002, 443, true, false, false, false)
 	if f2 != nil {
 		t.Error("expected nil for second TCP flow from same src (limit exceeded)")
 	}

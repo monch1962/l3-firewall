@@ -8,7 +8,10 @@
 #   input.packet       — parsed packet headers (src_ip, dst_ip, protocol, ports, flags, fragment)
 #   input.connection   — connection state (established, tcp_state, packets_in_flow, age_ms, recent_ports)
 #                        — every field is populated from conntrack by opa.BuildInput; packets_in_flow
-#                        and age_ms are the flow's REAL values, never constants (R92)
+#                        and age_ms are the flow's REAL values, never constants (R92), and
+#                        established/tcp_state are the flow's state when the packet ARRIVED, before
+#                        its own flags were applied (R94) — a RST is judged on the connection it
+#                        tears down, and a handshake-less packet cannot report itself established
 #   input.rate         — per-source rate info (src_ip_pps, src_ip_bps, src_port_pps, new_conns_per_sec)
 #   input.time         — current UTC time (utc_hour 0-23, utc_day 0=Sun 6=Sat)
 #   input.geo          — GeoIP country info (src_country, dst_country — ISO 3166-1 alpha-2)
@@ -226,6 +229,13 @@ deny_reasons contains "ICMPv6 flood detected" if { deny_icmpv6_flood }
 # =============================================================================
 # RULE 8: Connection State Violation — RST to non-existent flow
 # =============================================================================
+# input.connection.established is the flow's state when the packet ARRIVED
+# (R94): the engine feeds conntrack's pre-transition snapshot, so the RST that
+# closes an ESTABLISHED connection is judged on the connection it tears down
+# (established=true → allowed) while a RST to a flow the firewall never saw
+# complete a handshake is denied. Before R94 the engine reported the flow AFTER
+# applying the RST — which clears Established — so this rule denied EVERY TCP
+# reset, including legitimate teardowns, while its name claimed otherwise.
 
 deny_state_violation if {
     enable_stateful == true

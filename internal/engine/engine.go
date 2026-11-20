@@ -389,10 +389,17 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	tid := newTraceID()
 
 	// 1. Connection tracking with TCP state machine
+	//
+	// arrival carries the flow's state BEFORE this packet's flags are applied
+	// (R94): that is the value the policy must judge. Reading flow.Established
+	// / flow.TCPState here instead reported the aftermath of the decision —
+	// a RST clears Established, so every reset reached OPA as
+	// `established: false` and deny_state_violation denied every teardown.
 	var flow *conntrack.Flow
+	var arrival conntrack.ConnState
 	var flowLimited bool
 	if pi.Protocol == "TCP" {
-		flow = e.conntrack.UpdateTCPState(pi.SrcIP, pi.DstIP, pi.Protocol,
+		flow, arrival = e.conntrack.UpdateTCPState(pi.SrcIP, pi.DstIP, pi.Protocol,
 			pi.SrcPort, pi.DstPort,
 			pi.TCPFlags.SYN, pi.TCPFlags.ACK, pi.TCPFlags.RST, pi.TCPFlags.FIN)
 		if flow == nil {
@@ -402,6 +409,13 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 		flow = e.conntrack.LookupOrCreate(pi.SrcIP, pi.DstIP, pi.Protocol, pi.SrcPort, pi.DstPort)
 		if flow == nil {
 			flowLimited = true
+		}
+		// Non-TCP flows are never established: they have no handshake. Report
+		// the flow's own (always false) value so the fact stays uniform. Guard
+		// the nil (per-source flow limit exceeded) case — the block below
+		// returns before the value is used.
+		if flow != nil {
+			arrival = conntrack.ConnState{Established: flow.Established, TCPState: flow.TCPState}
 		}
 	}
 
@@ -467,9 +481,9 @@ func (e *Engine) evaluatePacket(pi *packet.PacketInfo, packetSize int) (result *
 	// 4. Build OPA input
 	tcpState := ""
 	if pi.Protocol == "TCP" {
-		tcpState = flow.TCPState.String()
+		tcpState = arrival.TCPState.String()
 	}
-	input := opa.BuildInput(pi, pps, bps, flow.Established, tcpState,
+	input := opa.BuildInput(pi, pps, bps, arrival.Established, tcpState,
 		portPPS, portBPS, newConnRate, recentPorts, flow.Packets, flow.AgeMs())
 
 	// 5. Threat intel check (if blocklist is configured)
