@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -35,6 +36,101 @@ const maxPacketSize = 65536
 // subsequent rotations.
 const maxCleanupEntries = 4096
 
+// rotateRetryInterval floors the rate of rotation ATTEMPTS after a failure
+// (R96.1). Rotation is designed as a once-per-MaxPackets event — R63 bounded
+// its cleanup scan on exactly that assumption — but a refused create leaves
+// curFile == nil, so without a floor the NEXT blocked packet re-enters the
+// whole rotation path (directory symlink walk, open, fstat, fchmod) and fails
+// again: a per-packet syscall burst on the NFQUEUE receive goroutine. Measured
+// pre-fix: 29 µs per blocked packet (2000 calls = 58 ms). At the documented
+// ~83k pps ceiling of a 1 Gbps link that is ~2.4 CPU-seconds of receive-loop
+// time per second of traffic — the queue overflows and the kernel drops ALL
+// traffic (the R58/R79 outage shape). The trigger sits inside the standing
+// threat model (write access to --pcap-dir: a hard link per R93 or a symlink
+// per R42 at the predictable rotation name), and a plain disk-full or
+// permission change reaches it too. One attempt per interval keeps capture
+// self-healing (once the name is freed the next attempt succeeds) while
+// bounding the cost of a persistent failure to a single attempt per second.
+const rotateRetryInterval = time.Second
+
+// rotationName is the single definition of a rotation file's name. The index
+// is zero-padded to five digits; R96.2 shows why the padding width must not be
+// relied on for ordering (see sortByRotationIndex).
+func rotationName(n int) string {
+	return fmt.Sprintf("blocked_%05d.pcap", n)
+}
+
+// rotationIndex extracts the numeric rotation index from a blocked_*.pcap base
+// name. ok is false for anything that is not exactly one of the firewall's own
+// rotation names.
+func rotationIndex(path string) (int, bool) {
+	base := filepath.Base(path)
+	const prefix, suffix = "blocked_", ".pcap"
+	if !strings.HasPrefix(base, prefix) || !strings.HasSuffix(base, suffix) {
+		return 0, false
+	}
+	digits := base[len(prefix) : len(base)-len(suffix)]
+	if digits == "" {
+		return 0, false
+	}
+	for i := 0; i < len(digits); i++ {
+		if digits[i] < '0' || digits[i] > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// sortByRotationIndex orders capture paths OLDEST-FIRST by their NUMERIC
+// rotation index, so the retention removal loop deletes the oldest captures.
+//
+// R69 fixed retention inversion caused by DIRECTORY order (tmpfs reverse
+// creation) by sorting before removal — but the sort was `sort.Strings` over
+// `blocked_%05d.pcap`, which is numerically ordered only while the index fits
+// in five digits. At rotation 100000 the name is "blocked_100000.pcap", and
+// '1' < '9' means it sorts BEFORE "blocked_99999.pcap": from then on the
+// removal loop deletes the NEWEST captures and keeps the OLDEST — the exact
+// R69 harm on the sort key instead of the read order, and 1e9 blocked packets
+// reach the boundary (~17 minutes of a 1 Mpps flood), which is precisely when
+// the forensic evidence matters. Comparing the parsed index is total and
+// stable; names that are not the firewall's own rotation names sort last so a
+// foreign file can never displace a real capture from the retention window.
+func sortByRotationIndex(paths []string) {
+	sort.Slice(paths, func(i, j int) bool {
+		ni, oki := rotationIndex(paths[i])
+		nj, okj := rotationIndex(paths[j])
+		switch {
+		case oki && okj:
+			return ni < nj
+		case oki != okj:
+			return oki
+		default:
+			return paths[i] < paths[j]
+		}
+	})
+}
+
+// retryError is returned while the rotation retry window is closed (R96.1):
+// the last attempt is known to have failed, so this packet issues no syscalls
+// at all. The message is deliberately CONSTANT — a caller that logs it (the
+// engine logs pcap write errors) must not see a new string on every packet, or
+// the log-flood this fix exists to stop would simply move one layer up. The
+// underlying failure is available through Unwrap.
+type retryError struct {
+	cause    error
+	attempts int
+}
+
+func (e *retryError) Error() string {
+	return "capture unavailable: rotation is failing and will be retried; blocked packets are not being captured"
+}
+
+func (e *retryError) Unwrap() error { return e.cause }
+
 // Config controls the pcap writer behaviour.
 type Config struct {
 	Dir        string // directory to write pcap files to (empty = disabled)
@@ -51,6 +147,14 @@ type Writer struct {
 	curFileN int
 	pktCount int
 	closed   bool
+
+	// Bounded retry state (R96.1). Guarded by mu like the rest of the writer.
+	// retryInterval is a field rather than the constant so tests can shorten
+	// it; production always uses rotateRetryInterval.
+	retryInterval  time.Duration
+	lastRotateErr  error     // cause reported (via Unwrap) while the window is closed
+	nextRotateTry  time.Time // earliest time another attempt may run
+	rotateAttempts int       // total rotation attempts, for the warning text
 }
 
 // NewWriter creates a pcap writer. Returns nil if Dir is empty.
@@ -76,7 +180,7 @@ func NewWriter(cfg Config) (*Writer, error) {
 	if err := securepath.RejectSymlinkComponents(cfg.Dir); err != nil {
 		return nil, err
 	}
-	return &Writer{cfg: cfg}, nil
+	return &Writer{cfg: cfg, retryInterval: rotateRetryInterval}, nil
 }
 
 // WriteBlock writes a blocked packet to the current pcap file.
@@ -113,8 +217,31 @@ func (w *Writer) WriteBlock(raw []byte) error {
 	return nil
 }
 
-// rotateLocked closes the current file and opens a new one.
+// rotateLocked rotates the current file under a bounded failure backoff
+// (R96.1). While the window is closed the call issues no syscalls at all and
+// returns a constant-text retryError, so a persistent failure costs one
+// rotation attempt per interval instead of one per blocked packet.
 func (w *Writer) rotateLocked() error {
+	if time.Now().Before(w.nextRotateTry) {
+		return &retryError{cause: w.lastRotateErr, attempts: w.rotateAttempts}
+	}
+	w.rotateAttempts++
+	if err := w.rotateOnce(); err != nil {
+		w.lastRotateErr = err
+		w.nextRotateTry = time.Now().Add(w.retryInterval)
+		// One actionable warning per window (the R91 audit-rotation posture):
+		// attempts are gated, so this cannot fire per packet.
+		slog.Warn("pcap capture unavailable — rotation failed, retrying",
+			"dir", w.cfg.Dir, "error", err, "attempt", w.rotateAttempts, "retry_in", w.retryInterval)
+		return err
+	}
+	w.lastRotateErr = nil
+	w.nextRotateTry = time.Time{}
+	return nil
+}
+
+// rotateOnce performs one rotation attempt.
+func (w *Writer) rotateOnce() error {
 	// Re-verify the directory on EVERY rotation (R64). R45's walk runs
 	// once at NewWriter, but rotations re-resolve --pcap-dir fresh: an
 	// attacker with write access to the PARENT of the pcap dir (rename +
@@ -142,7 +269,7 @@ func (w *Writer) rotateLocked() error {
 	// next name without committing the index keeps the invariant "index N is
 	// an existing rotation file of this run".
 	nextFileN := w.curFileN + 1
-	fname := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", nextFileN))
+	fname := filepath.Join(w.cfg.Dir, rotationName(nextFileN))
 	// Open with O_NOFOLLOW: os.Create would follow a symlink planted at the
 	// rotation filename by an attacker with write access to the pcap
 	// directory, truncating and overwriting an arbitrary file writable by
@@ -195,7 +322,7 @@ func (w *Writer) cleanupLocked() {
 	// cap is enforced regardless of what else is in the directory (R63).
 	oldIdx := w.curFileN - w.cfg.MaxFiles
 	if oldIdx >= 1 {
-		name := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", oldIdx))
+		name := filepath.Join(w.cfg.Dir, rotationName(oldIdx))
 		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
 			slog.Warn("pcap cleanup: remove failed", "file", name, "error", err)
 		}
@@ -243,10 +370,12 @@ func (w *Writer) cleanupLocked() {
 	// front is the NEWEST files, so the firewall unlinked its own current
 	// open rotation file (silent capture-evidence loss: writes land in an
 	// orphaned inode) and deleted newer captures while keeping older stale
-	// ones (retention inverted). Zero-padded blocked_%05d.pcap names sort
-	// lexicographically = numerically, so sorted matches are oldest-first
-	// and the removal targets exactly the stale files the scan exists for.
-	sort.Strings(matches)
+	// ones (retention inverted). R96.2: the sort must compare the NUMERIC
+	// rotation index, not the name string — `blocked_%05d.pcap` is ordered
+	// lexicographically only up to index 99999, and past that the newest
+	// captures sort first and the removal loop deletes them (see
+	// sortByRotationIndex).
+	sortByRotationIndex(matches)
 	// Never remove the file this rotation JUST opened (index curFileN): it
 	// is definitionally not stale — it is the current forensic capture
 	// receiving WriteBlock writes. Mechanism 1 (indexed removal) already
@@ -259,7 +388,7 @@ func (w *Writer) cleanupLocked() {
 	// the total at len(matches)-MaxFiles even when the current file falls
 	// inside the removal window — the retention cap is a hard contract
 	// (R9.14: at most MaxFiles files remain after cleanup).
-	current := filepath.Join(w.cfg.Dir, fmt.Sprintf("blocked_%05d.pcap", w.curFileN))
+	current := filepath.Join(w.cfg.Dir, rotationName(w.curFileN))
 	removed := 0
 	for i := 0; i < len(matches) && removed < len(matches)-w.cfg.MaxFiles; i++ {
 		if matches[i] == current {

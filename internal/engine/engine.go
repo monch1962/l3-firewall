@@ -111,6 +111,22 @@ type Engine struct {
 	recentMu     sync.RWMutex
 	recentBlocks []BlockLogEntry
 
+	// pcap failure reporting (R96.3). The pcap writer runs on the NFQUEUE
+	// receive goroutine and a persistent failure (disk full, unwritable dir,
+	// a planted hard link/symlink at the rotation name) would otherwise log
+	// one line per BLOCKED PACKET — ~83k lines/s at the firewall's throughput
+	// ceiling, on the goroutine that must deliver verdicts, and the operator's
+	// shipper sees a wall of identical lines instead of one actionable warning.
+	// The first occurrence of a distinct failure text is logged immediately;
+	// the same text is then suppressed for pcapErrLogInterval, and a changed
+	// text is logged immediately (a transition from one outage mode to another
+	// stays visible). A successful write clears the latch so a recurrence after
+	// recovery is reported again. This mirrors R91's audit-rotation posture.
+	pcapErrMu     sync.Mutex
+	pcapErrText   string
+	pcapErrAt     time.Time
+	pcapErrActive atomic.Bool // fast path: false on a healthy hot path
+
 	// NFQUEUE lifecycle
 	lifecycleMu sync.RWMutex // guards ctx/cancel (Run vs Stop, R50)
 	ctx         context.Context
@@ -649,7 +665,9 @@ func (e *Engine) packetHandler(attr nfqueue.Attribute) (ret int) {
 	// Capture blocked packet to pcap if enabled
 	if e.pcapWriter != nil {
 		if err := e.pcapWriter.WriteBlock(*attr.Payload); err != nil {
-			slog.Warn("pcap write failed", "error", err)
+			e.logPcapWriteError(err)
+		} else {
+			e.clearPcapWriteError()
 		}
 	}
 	return 1
@@ -703,6 +721,43 @@ func (e *Engine) handleQueuePacket(nf verdictSender, attr nfqueue.Attribute) int
 		return 1
 	}
 	return 0 // keep the receive loop alive
+}
+
+// pcapErrLogInterval bounds how often the SAME pcap write failure may be
+// logged (R96.3). Long enough that a sustained outage is one line per window
+// in an operator's log stream, short enough that the outage is never stale.
+const pcapErrLogInterval = 10 * time.Second
+
+// logPcapWriteError reports a pcap write failure without turning a persistent
+// one into a per-packet log flood (R96.3). See the field comment on pcapErrMu.
+func (e *Engine) logPcapWriteError(err error) {
+	text := err.Error()
+	now := time.Now()
+	e.pcapErrMu.Lock()
+	defer e.pcapErrMu.Unlock()
+	if text == e.pcapErrText && now.Sub(e.pcapErrAt) < pcapErrLogInterval {
+		return
+	}
+	e.pcapErrText = text
+	e.pcapErrAt = now
+	e.pcapErrActive.Store(true)
+	slog.Warn("pcap write failed", "error", text)
+}
+
+// clearPcapWriteError re-arms pcap failure reporting after a successful write
+// (R96.3), so a failure that recurs after recovery is reported again instead of
+// being suppressed for the rest of the process's life. The atomic fast path
+// keeps the healthy hot path free of a mutex acquisition: the lock is taken
+// only while a failure is latched.
+func (e *Engine) clearPcapWriteError() {
+	if !e.pcapErrActive.Load() {
+		return
+	}
+	e.pcapErrMu.Lock()
+	e.pcapErrText = ""
+	e.pcapErrAt = time.Time{}
+	e.pcapErrActive.Store(false)
+	e.pcapErrMu.Unlock()
 }
 
 // saveState persists the engine's block stats to a JSON file.

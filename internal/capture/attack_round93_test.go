@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // ── R93.1 (capture integration): hardlink write-through on rotation ────────
@@ -66,12 +67,19 @@ func TestAttack_RotationRecoversAfterRefusedHardLink(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	defer w.Close()
+	// R96: a failed rotation is retried at most once per retryInterval (one
+	// attempt per second in production) instead of on every blocked packet, so
+	// recovery is bounded by that window rather than instantaneous. Shorten it
+	// for the test; the property under test — capture resumes once the planted
+	// name is gone, with no operator action — is unchanged.
+	w.retryInterval = 5 * time.Millisecond
 	if werr := w.WriteBlock([]byte{0x01, 0x02}); werr == nil {
 		t.Fatal("WriteBlock accepted the hard-linked rotation path")
 	}
 	if err := os.Remove(linkPath); err != nil {
 		t.Fatalf("removing planted link: %v", err)
 	}
+	time.Sleep(3 * w.retryInterval)
 	if werr := w.WriteBlock([]byte{0x03, 0x04}); werr != nil {
 		t.Fatalf("WriteBlock after the link was removed: %v", werr)
 	}
