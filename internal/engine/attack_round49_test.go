@@ -45,11 +45,18 @@ type verdictCall struct {
 type fakeVerdictSender struct {
 	mu       sync.Mutex
 	verdicts []verdictCall
+	// err, when set, makes every SetVerdict fail (R95): the verdict socket
+	// refuses the message (ENOBUFS under memory pressure), which is the
+	// production condition that stops go-nfqueue's receive loop.
+	err error
 }
 
 func (f *fakeVerdictSender) SetVerdict(id uint32, verdict int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
 	f.verdicts = append(f.verdicts, verdictCall{id: id, verdict: verdict})
 	return nil
 }

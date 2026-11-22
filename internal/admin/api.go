@@ -296,13 +296,37 @@ func (a *API) requireWriteAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// healthState decides the health endpoint's status code and body status from
+// the engine's two lifecycle facts: has it been ASKED to filter (Started) and
+// is it filtering now (Running). See R95 in attack_round95_test.go.
+//
+// The trap this closes: `running` is false BOTH before Run() and after the
+// NFQUEUE receive loop dies, so the endpoint cannot key on it alone without
+// failing every probe during a normal startup. `started && !running` is
+// unambiguous — the firewall was asked to filter and is not — and that is the
+// state that must be a FAILURE (netfilter has no listener, so every queued
+// packet is dropped). Answering 200/"ok" there is how a total outage hides
+// from an orchestrator's liveness probe for the life of the process.
+func healthState(running, started bool) (code int, status string) {
+	if started && !running {
+		return http.StatusServiceUnavailable, "degraded"
+	}
+	return http.StatusOK, "ok"
+}
+
 func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
+	running := a.engine.Running()
+	code, status := healthState(running, a.engine.Started())
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":         "ok",
+		"status":         status,
 		"version":        a.version,
 		"uptime":         time.Since(a.started).String(),
-		"engine_running": a.engine.Running(),
+		"engine_running": running,
+		// firewalling is the machine-readable form of the same fact, so a
+		// probe can alert on it even when it only inspects the body (R95).
+		"firewalling": running,
 	})
 }
 
@@ -313,7 +337,7 @@ func (a *API) handleStats(w http.ResponseWriter, r *http.Request) {
 		"packets_processed": stats.PacketsProcessed,
 		"packets_allowed":   stats.PacketsAllowed,
 		"packets_blocked":   stats.PacketsBlocked,
-		"conntrack_entries": json.Number(fmt.Sprintf("%d", ctStats.Created)),
+		"conntrack_entries": json.Number(fmt.Sprintf("%d", a.engine.ConntrackLen())),
 		"conntrack_expired": json.Number(fmt.Sprintf("%d", ctStats.Expired)),
 		"conntrack_evicted": json.Number(fmt.Sprintf("%d", ctStats.Evicted)),
 		"engine_running":    a.engine.Running(),

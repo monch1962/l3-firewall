@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -220,6 +221,14 @@ func main() {
 		log.Fatalf("failed to initialize OPA: %v", err)
 	}
 	slog.Info("OPA evaluator ready")
+
+	// R95: the policy's country plane is only as real as the GeoIP database
+	// behind it. Warn when the policy declares non-empty country sets and no
+	// --geoip-db is configured — without it every input.geo.* field is empty
+	// and no country rule can fire, which is a silently inert control.
+	if w := geoipControlWarning(string(policyData), *geoipDBPath); w != "" {
+		slog.Warn(w)
+	}
 
 	// Start etcd syncer for distributed policy if configured
 	if *etcdEndpoints != "" {
@@ -488,6 +497,52 @@ func resolveAdminTLS(cert, key string) (string, string, bool, error) {
 		return "", "", false, fmt.Errorf("admin TLS: refusing to start — both --admin-tls-cert and --admin-tls-key are required (cert set: %t, key set: %t); a half-configured pair would silently serve the control plane in cleartext", cert != "", key != "")
 	}
 	return cert, key, true, nil
+}
+
+// geoCountrySetRe matches the delivered form of the three country settings:
+// a top-level `name := {...}` assignment in the policy file (the documented
+// way the shipped policy carries configuration — there is no params file).
+// A negated class matches newlines, so a multi-line set is matched whole.
+var geoCountrySetRe = regexp.MustCompile(`(?m)^[ 	]*(blocked_src_countries|allowed_src_countries|allowed_dst_countries)[ 	]*:=[ 	]*\{([^}]*)\}`)
+
+// geoipControlWarning returns a loud, actionable warning when the policy
+// declares non-empty country sets but no GeoIP database is configured, and
+// "" otherwise.
+//
+// R95: opa-policies/l3.rego ships `blocked_src_countries := {"KP"}` and three
+// rules keyed on `input.geo.src_country` / `input.geo.dst_country`. The engine
+// only populates input.geo when --geoip-db is set, and its DEFAULT is empty,
+// so in every default deployment every country in the OPA input is "" and the
+// shipped country control can never deny anything — while the README lists
+// "GeoIP Blocking" as an attack category and the policy file reads as though
+// KP traffic were blocked. That is the R83/R90 class: a control that is not
+// what the deployment says it is, starting in complete silence.
+//
+// The check is deliberately narrow and cheap: it looks only for the
+// assignment form the shipped policy uses, and only reports when at least one
+// set is NON-empty (an operator who emptied the sets has no inert control, and
+// a warning that fires for a no-op configuration is what trains an operator to
+// ignore warnings). A policy carrying its sets in some other shape produces no
+// warning rather than a false one.
+func geoipControlWarning(policySource, geoDBPath string) string {
+	if strings.TrimSpace(geoDBPath) != "" {
+		return ""
+	}
+	var inert []string
+	for _, m := range geoCountrySetRe.FindAllStringSubmatch(policySource, -1) {
+		if len(m) < 3 {
+			continue
+		}
+		body := strings.TrimSpace(m[2])
+		if body == "" {
+			continue
+		}
+		inert = append(inert, m[1]+" := {"+body+"}")
+	}
+	if len(inert) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("GeoIP country rules CANNOT FIRE: the policy declares %s but --geoip-db is not set, so every input.geo.src_country/dst_country in the OPA input is empty and no country deny/allow rule can ever match — the country control this policy describes is inert. Set --geoip-db to a MaxMind .mmdb, or empty the country sets so the policy says what it does", strings.Join(inert, ", "))
 }
 
 // adminExposureWarning returns a loud, actionable warning when the admin

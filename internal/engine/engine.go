@@ -116,6 +116,12 @@ type Engine struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	running     atomic.Bool
+	// started records that the operator asked this engine to filter (Run was
+	// entered). It is what lets the control plane tell "not started yet" from
+	// "started and no longer filtering" (R95): `running` alone reports false
+	// in both cases, so /admin/health could not distinguish a startup window
+	// from a dead receive loop.
+	started atomic.Bool
 }
 
 // MetricsSink is the minimal decision-reporting surface the engine needs.
@@ -175,6 +181,24 @@ func (e *Engine) Stats() Stats {
 // Running returns whether the engine is actively running (NFQUEUE connected).
 func (e *Engine) Running() bool {
 	return e.running.Load()
+}
+
+// Started returns whether the engine has been asked to filter (Run was
+// entered), regardless of whether it is still filtering now (R95). The pair
+// (Started, Running) is the control plane's only way to distinguish a
+// startup window — where the admin API is intentionally already serving —
+// from the failure state this round exists to surface: an engine that was
+// started and has stopped inspecting packets.
+func (e *Engine) Started() bool {
+	return e.started.Load()
+}
+
+// ConntrackLen returns the number of flows currently tracked. This is the
+// LIVE table size — the same fact /metrics publishes through
+// l3_firewall_conntrack_entries — as opposed to Stats().Created, the
+// cumulative number of flows ever created (R95).
+func (e *Engine) ConntrackLen() int {
+	return e.conntrack.Len()
 }
 
 // ConntrackStats returns the connection tracking stats.
@@ -654,8 +678,11 @@ type verdictSender interface {
 func (e *Engine) handleQueuePacket(nf verdictSender, attr nfqueue.Attribute) int {
 	if attr.PacketID == nil {
 		// A verdict cannot be delivered without the packet ID. Stop the
-		// receive loop (library contract: non-zero stops).
-		slog.Error("nfqueue: attribute missing PacketID — cannot deliver verdict")
+		// receive loop (library contract: non-zero stops) — and record that
+		// the firewall has stopped filtering (R95): the queue keeps no
+		// listener after the stop, so every packet is dropped and the
+		// self-report must say so.
+		e.stopFiltering("nfqueue: attribute missing PacketID — cannot deliver verdict")
 		return 1
 	}
 
@@ -666,7 +693,13 @@ func (e *Engine) handleQueuePacket(nf verdictSender, attr nfqueue.Attribute) int
 		verdict = nfqueue.NfDrop
 	}
 	if err := nf.SetVerdict(*attr.PacketID, verdict); err != nil {
-		slog.Warn("nfqueue: failed to send verdict", "packet_id", *attr.PacketID, "verdict", verdict, "error", err)
+		// R95: a verdict-delivery failure (ENOBUFS on the netlink socket
+		// under memory pressure, or a packet id the kernel no longer
+		// honours) stops the receive loop. That is attacker-reachable — a
+		// packet flood is what produces ENOBUFS — and used to leave
+		// Running()==true forever, so a flood could permanently convert the
+		// firewall into a non-filtering process that reports itself healthy.
+		e.stopFiltering(fmt.Sprintf("nfqueue: failed to send verdict for packet %d: %v", *attr.PacketID, err))
 		return 1
 	}
 	return 0 // keep the receive loop alive
@@ -728,8 +761,55 @@ func (e *Engine) setLifecycle(ctx context.Context, cancel context.CancelFunc) {
 	e.lifecycleMu.Unlock()
 }
 
+// stopFiltering records that the NFQUEUE receive loop is about to return.
+//
+// R95: go-nfqueue's socketCallback returns on a non-zero hook/error-func
+// result, and its deferred unbind removes the queue handler — netfilter then
+// has no listener, so every queued packet is dropped. That is a total outage,
+// and before this round the engine kept reporting Running()==true for the
+// life of the process: /admin/health answered {"status":"ok"} and no
+// supervisor ever restarted the firewall. Clearing `running` here is what
+// makes the self-report match the state, and the log line says what happened
+// so the outage is visible in the log stream as well as on the probe.
+func (e *Engine) stopFiltering(reason string) {
+	e.running.Store(false)
+	slog.Error("firewall is NO LONGER FILTERING: "+reason+
+		" — the NFQUEUE receive loop stopped and the queue has no listener, so the kernel drops every queued packet; "+
+		"/admin/health now reports degraded (503) and the process needs a restart",
+		"engine_started", e.started.Load())
+}
+
+// handleReceiveError is the go-nfqueue error function body, extracted from
+// Run() so the receive-loop stop decision is testable without a kernel queue.
+//
+// The library's contract (v1.3.2 socketCallback): a non-zero return STOPS the
+// receive loop and the deferred unbind removes the queue handler, after which
+// netfilter has no listener and drops every queued packet. A transient
+// netlink error (read timeout) must therefore keep processing, and a
+// non-transient one must stop — and, R95, must leave the engine's own state
+// saying so (Running()), or a stopped loop is indistinguishable from a healthy
+// one through /admin/health.
+func (e *Engine) handleReceiveError(err error) int {
+	// Mirror the error semantics of the deprecated nf.Register:
+	// transient netlink errors (timeouts) continue processing,
+	// everything else stops the receive loop.
+	if opError, ok := err.(*netlink.OpError); ok {
+		if opError.Timeout() || opError.Temporary() {
+			return 0
+		}
+	}
+	e.stopFiltering(fmt.Sprintf("nfqueue receive error: %v", err))
+	return 1
+}
+
 // Run starts the NFQUEUE listener on the given queue number.
 func (e *Engine) Run(queueNum uint16) error {
+	// Record that the operator asked this engine to filter BEFORE any
+	// fallible step (R95): from here on, "not running" means the firewall
+	// stopped, not that it has not started yet — the distinction
+	// /admin/health needs to report a degraded posture instead of "ok".
+	e.started.Store(true)
+
 	// Restore state from previous run
 	e.restoreState()
 
@@ -758,18 +838,7 @@ func (e *Engine) Run(queueNum uint16) error {
 		// (R49 — before the fix the kernel was never verdicted and the
 		// first blocked packet terminated the receive loop).
 		return e.handleQueuePacket(nf, attr)
-	}, func(err error) int {
-		// Mirror the error semantics of the deprecated nf.Register:
-		// transient netlink errors (timeouts) continue processing,
-		// everything else stops the receive loop.
-		if opError, ok := err.(*netlink.OpError); ok {
-			if opError.Timeout() || opError.Temporary() {
-				return 0
-			}
-		}
-		slog.Error("nfqueue: receive error", "error", err)
-		return 1
-	}); err != nil {
+	}, e.handleReceiveError); err != nil {
 		nf.Close()
 		e.running.Store(false)
 		cancel()
