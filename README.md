@@ -220,7 +220,7 @@ Metrics (:9090 or admin port)
 ## Quick Start
 
 ### Prerequisites
-- Go 1.25+
+- Go **1.25.3+** (the toolchain, not just the language version: `govulncheck ./...` at go1.25.0 reports 49 reachable standard-library advisories — `crypto/x509`, `net/http`, `net/mail`, `encoding/asn1` and others — whose fixes landed in 1.25.2/1.25.3; a firewall must not ship a known-vulnerable parser for attacker-supplied bytes)
 - OPA 1.0+ (for policy testing: `opa test opa-policies/`)
 - Linux with nftables (for NFQUEUE runtime)
 - Container: `--cap-add=NET_ADMIN`

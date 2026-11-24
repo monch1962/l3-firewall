@@ -1,5 +1,10 @@
 # Build stage
-FROM golang:1.25-alpine AS builder
+# Pinned to a PATCH release on purpose (R97): go1.25.0 reports 49 reachable
+# standard-library advisories via govulncheck (crypto/x509, net/http, net/mail,
+# encoding/asn1, ...); the fixes landed in 1.25.2/1.25.3. `golang:1.25-alpine`
+# floats with the 1.25 line, so a base-image refresh could silently move the
+# build back to a vulnerable patch.
+FROM golang:1.25.3-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 
