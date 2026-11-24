@@ -9,13 +9,13 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/monch1962/l3-firewall/internal/netguard"
 	"github.com/monch1962/l3-firewall/internal/redact"
 )
 
@@ -94,18 +94,10 @@ func warnPlaintextWebhook(raw string) {
 }
 
 // isLocalWebhookHost reports whether host cannot put bytes on a network.
+// The predicate lives in internal/netguard because the etcd policy channel
+// asks the same question (R97) and two copies of a guard drift (R85).
 func isLocalWebhookHost(host string) bool {
-	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
-	if h == "" {
-		return false
-	}
-	if h == "localhost" || strings.HasSuffix(h, ".localhost") {
-		return true
-	}
-	if ip := net.ParseIP(h); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
+	return netguard.IsLoopbackHost(host)
 }
 
 // Router manages alert dispatch with per-type cooldown suppression.

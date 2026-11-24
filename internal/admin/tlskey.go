@@ -3,9 +3,6 @@ package admin
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
-	"os"
-	"syscall"
 
 	"github.com/monch1962/l3-firewall/internal/securepath"
 )
@@ -15,60 +12,25 @@ import (
 // upper bound and still far below anything that would matter for memory.
 const maxKeyFileSize = 1 << 20
 
-// readKeyFile reads one PEM file of the admin TLS key pair with the same
-// hardening every other credential-bearing reader in this tree uses
-// (readPolicyFile R42/R70/R85, geoip.NewReader R38/R71, persist.LoadState
-// R62, audit.openAuditFile R15/R43):
+// readKeyFile reads one PEM file of the admin TLS key pair.
 //
-//   - ".." components rejected on the RAW path (filepath.Dir/Clean consume
-//     them before a walk could see them, while the kernel resolves the raw
-//     string) — R85;
-//   - symlinks at every DIRECTORY component rejected (the kernel resolves
-//     them before the open, so O_NOFOLLOW alone cannot help) — R45/R62;
-//   - O_NOFOLLOW: a symlink at the FINAL component refused — R42;
-//   - O_NONBLOCK + regular-file check on the already-opened fd: a FIFO planted
-//     at the path would otherwise block the open forever (startup DoS — this
-//     read runs synchronously in main() before eng.Run()), and the type check
-//     on the open descriptor leaves no Stat/Open TOCTOU window — R14/R15/R38;
-//   - size cap enforced through fstat AND io.LimitReader, so a multi-GB
-//     "certificate" is refused before its content is buffered — R42's
-//     check-before-allocate doctrine.
+// R91 wrote this reader here; R97 needed the same requirements for the etcd
+// policy channel's CA bundle and client identity, so the implementation moved
+// to securepath.ReadCredentialFile — one place that can be found, extended and
+// tested, instead of a second copy in a third package (R85/R89: a guard that
+// exists twice drifts). The reader enforces, in order: ".." rejected on the RAW
+// path (R85), a symlink at any directory component rejected (R45/R62),
+// O_NOFOLLOW for the final component (R42), O_NONBLOCK plus a regular-file
+// check on the opened fd so a FIFO cannot block startup (R14/R15/R38), and the
+// size cap through fstat AND io.LimitReader (R42 check-before-allocate).
 //
-// The TLS pair was the LAST reader without this class, and it is the most
-// sensitive file in the process: its content IS the control-plane identity
-// (R91 — R83 named "a certificate planted by an attacker with write access to
-// the configured path" but only fixed the load-FAILURE direction; a planted
-// pair that parses loads happily and the admin API then serves the attacker's
-// key).
+// The TLS pair is the most sensitive file in the process: its content IS the
+// control-plane identity (R91 — R83 named "a certificate planted by an
+// attacker with write access to the configured path" but only fixed the
+// load-FAILURE direction; a planted pair that parses loads happily and the
+// admin API then serves the attacker's key).
 func readKeyFile(path string) ([]byte, error) {
-	if err := securepath.RejectUnsafePath(path); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, fmt.Errorf("opening TLS key material %s: %w", path, err)
-	}
-	defer f.Close()
-
-	fi, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stating TLS key material %s: %w", path, err)
-	}
-	if !fi.Mode().IsRegular() {
-		return nil, fmt.Errorf("TLS key material is not a regular file: %s", path)
-	}
-	if fi.Size() > maxKeyFileSize {
-		return nil, fmt.Errorf("TLS key material %s too large: %d bytes (max %d)", path, fi.Size(), maxKeyFileSize)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(f, maxKeyFileSize+1))
-	if err != nil {
-		return nil, fmt.Errorf("reading TLS key material %s: %w", path, err)
-	}
-	if len(data) > maxKeyFileSize {
-		return nil, fmt.Errorf("TLS key material %s grew beyond %d bytes while reading", path, maxKeyFileSize)
-	}
-	return data, nil
+	return securepath.ReadCredentialFile(path, maxKeyFileSize)
 }
 
 // loadKeyPair reads the certificate and key through readKeyFile and parses

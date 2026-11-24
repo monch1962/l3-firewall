@@ -4,6 +4,7 @@ package securepath
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,6 +119,65 @@ func RejectUnsafePath(path string) error {
 
 // OwnerOnlyMode is the mode every firewall-owned runtime file is forced to.
 const OwnerOnlyMode = 0o600
+
+// ReadCredentialFile reads a credential-bearing file (TLS key material, a CA
+// bundle) with the hardening every credential reader in this tree needs
+// (R91: the admin key pair; R97: the etcd policy channel's CA and client
+// identity). A bare os.ReadFile — and every library that wraps it, e.g.
+// tls.LoadX509KeyPair — has none of these:
+//
+//   - ".." components rejected on the RAW path, before any lexical cleaning
+//     (filepath.Dir/Clean consume the ".." while the kernel resolves the raw
+//     string) — R85;
+//   - a symlink at any DIRECTORY component rejected, because the kernel
+//     resolves those before the open — R45/R62;
+//   - O_NOFOLLOW: a symlink at the FINAL component refused — R42. A planted
+//     link serves an attacker-chosen trust root or private key, which for a
+//     TLS *client* means the peer it authenticates is the attacker;
+//   - O_NONBLOCK + a regular-file check on the already-opened descriptor: a
+//     FIFO planted at the path would block the open forever, and these reads
+//     run synchronously in main() before the engine starts (R14/R15/R38) —
+//     the type check on the open fd leaves no Stat/Open TOCTOU window;
+//   - the size cap enforced through fstat AND io.LimitReader, so an oversized
+//     "certificate" is refused before its content is buffered — R42's
+//     check-before-allocate doctrine.
+//
+// A hard link (nlink > 1) is deliberately NOT refused here: this is a
+// read-only open, and the harm R93 names — destroying or appending to a
+// shared inode — cannot happen through it. An attacker who can write the
+// directory can already replace the file outright, so a link check would add
+// breakage (e.g. unusual but legitimate hard-linked key stores) without
+// removing any capability.
+func ReadCredentialFile(path string, maxSize int64) ([]byte, error) {
+	if err := RejectUnsafePath(path); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening credential file %s: %w", path, err)
+	}
+	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stating credential file %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("credential path is not a regular file: %s", path)
+	}
+	if maxSize > 0 && fi.Size() > maxSize {
+		return nil, fmt.Errorf("credential file %s too large: %d bytes (max %d)", path, fi.Size(), maxSize)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(f, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("reading credential file %s: %w", path, err)
+	}
+	if maxSize > 0 && int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("credential file %s grew beyond %d bytes while reading", path, maxSize)
+	}
+	return data, nil
+}
 
 // OpenOwnerOnly opens path with the caller's access mode/flags plus the
 // two hardening flags every writer of firewall-owned runtime data needs,

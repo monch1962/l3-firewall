@@ -12,6 +12,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -160,6 +161,9 @@ func main() {
 		stateFile               = flag.String("state-file", "", "Path for persisting firewall state across restarts")
 		etcdEndpoints           = flag.String("etcd-endpoints", "", "etcd endpoints for distributed policy sync (comma-separated)")
 		etcdKey                 = flag.String("etcd-key", "/l3-firewall/policy", "etcd key to watch for policy updates")
+		etcdTLSCA               = flag.String("etcd-tls-ca", "", "Path to a PEM CA bundle that verifies the etcd cluster (empty = system roots; requires https:// endpoints — R97)")
+		etcdTLSCert             = flag.String("etcd-tls-cert", "", "Path to the etcd client TLS certificate for mutual TLS (requires --etcd-tls-key)")
+		etcdTLSKey              = flag.String("etcd-tls-key", "", "Path to the etcd client TLS private key (requires --etcd-tls-cert)")
 	)
 	flag.Parse()
 
@@ -236,13 +240,36 @@ func main() {
 		for i := range endpoints {
 			endpoints[i] = strings.TrimSpace(endpoints[i])
 		}
+		// R97: the policy channel carries the Rego that governs every packet
+		// decision, so its transport is a security control, not a preference.
+		// Reading the CA bundle / client identity is done here, through the
+		// hardened loader, and a broken configuration is FATAL rather than a
+		// warning: an operator who sets --etcd-tls-ca and starts anyway would
+		// believe the channel is authenticated when it is not (the R87 admin
+		// TLS posture). An unreachable cluster is NOT fatal — that is handled
+		// inside the syncer, which connects in the background.
+		etcdTLS, err := syncer.TLSConfig(*etcdTLSCA, *etcdTLSCert, *etcdTLSKey)
+		if err != nil {
+			log.Fatalf("etcd TLS configuration: %v", err)
+		}
 		policySyncer, err := syncer.New(syncer.Config{
 			Endpoints: endpoints,
 			Key:       *etcdKey,
+			TLS:       etcdTLS,
 		}, func(policy string) error {
 			return opaEval.Load(policy)
 		})
 		if err != nil {
+			// R97: a configuration error can never become a working channel,
+			// so starting the firewall with one means running a long-lived
+			// process whose policy plane is silently dead (one warning, then
+			// business as usual). Refuse to start — the admin TLS posture
+			// (R87). An unreachable CLUSTER is not a config error: the syncer
+			// reports it separately and reconnects in the background, so the
+			// firewall still boots during an etcd rolling restart (R97.6).
+			if errors.Is(err, syncer.ErrConfig) {
+				log.Fatalf("etcd configuration: %v", err)
+			}
 			slog.Warn("etcd syncer not available", "error", err)
 		} else if policySyncer != nil {
 			policySyncer.Start(context.Background())
