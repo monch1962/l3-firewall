@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/monch1962/l3-firewall/internal/redact"
 )
@@ -214,6 +216,13 @@ func (bl *Blocklist) Add(entry string) bool {
 	if bl == nil {
 		return false
 	}
+	// R98: normalise ONCE at the single ingest point. Add is the only way an
+	// entry reaches the deny plane, so stripping format characters HERE means
+	// every present and future caller (a feed line, a static config list, a
+	// direct API call) is covered — not just the feed reader (R85/R89:
+	// centralise in the component that owns the text). Stripping before the
+	// lock keeps the critical section unchanged.
+	entry = stripFormatChars(entry)
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 
@@ -497,6 +506,37 @@ func normalizeURLList(urls []string) []string {
 	return out
 }
 
+// stripFormatChars removes Unicode FORMAT characters (category Cf) from an
+// entry or feed line.
+//
+// strings.TrimSpace strips White_Space only; Cf is a different category, so a
+// UTF-8 BOM (U+FEFF) prefixed to an indicator survived the trim and made
+// net.ParseIP reject the whole line (R98). The class also includes ZWSP
+// (U+200B), ZWNJ/ZWJ (U+200C/U+200D), the word joiner (U+2060) and the bidi
+// embedding/override controls — all invisible, none meaningful in an IP or
+// CIDR. Removing them before parsing means a feed cannot hide an indicator
+// behind an invisible character, and a legitimate BOM-prefixed feed keeps
+// every entry.
+//
+// This runs once per feed line (and once per Add), on a path that must keep up
+// with a 50 MB feed, so the common case is a plain ASCII byte scan: every Cf
+// codepoint is non-ASCII (the lowest, U+00AD SOFT HYPHEN, encodes as 2 bytes),
+// which means an all-ASCII string can never contain one. Only a string with a
+// high byte pays for rune decoding — no closure, no allocation otherwise.
+func stripFormatChars(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			return strings.Map(func(r rune) rune {
+				if unicode.Is(unicode.Cf, r) {
+					return -1
+				}
+				return r
+			}, s)
+		}
+	}
+	return s
+}
+
 // parseReader reads IP/CIDR entries from a reader and adds them to the blocklist.
 // Lines longer than maxFeedLineSize are skipped with a warning, not fatal:
 // bufio.Scanner (pre-R54) aborted the ENTIRE parse on ErrTooLong, so a
@@ -528,10 +568,18 @@ func (bl *Blocklist) parseReader(r io.Reader) (int, error) {
 		if err != nil && err != io.EOF {
 			return count, err
 		}
-		// Trim with the same Unicode-aware semantics as the pre-R54
-		// strings.TrimSpace(scanner.Text()) so normal lines parse exactly
-		// as before; only the overlong-line handling changes.
-		lineStr := strings.TrimSpace(string(line))
+		// R98: strip Unicode FORMAT characters (category Cf) before trimming.
+		// strings.TrimSpace removes White_Space (Zs/Zl/Zp) only, so a UTF-8
+		// BOM (U+FEFF, category Cf) in front of an indicator — routine for
+		// feeds written by Windows tooling and some exporters — left the line
+		// as "\ufeff203.0.113.7", which net.ParseIP rejects: the FIRST
+		// indicator of every refresh was dropped with no warning while the
+		// refresh still reported a healthy count. The same shape hides one
+		// chosen entry per cycle (R82.2 on the deny plane). Stripping the
+		// whole Cf class also covers ZWSP (U+200B), ZWNJ/ZWJ (U+200C/D) and
+		// the bidi overrides, not just the one character a test happened to
+		// use (R16 doctrine: filter the class, not the example).
+		lineStr := strings.TrimSpace(stripFormatChars(string(line)))
 		if lineStr == "" || strings.HasPrefix(lineStr, "#") {
 			if err == io.EOF {
 				return count, nil

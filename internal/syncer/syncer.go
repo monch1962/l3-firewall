@@ -76,6 +76,72 @@ type Syncer struct {
 	// limiting" documentation finding, finally fixed).
 	policyMu   sync.Mutex
 	lastPolicy string
+
+	// reconnectDelay overrides watchReconnectDelay when non-zero. It is a
+	// field rather than only a constant so a test can drive many reconnect
+	// cycles in milliseconds (the capture.Writer.retryInterval pattern, R96).
+	reconnectDelay time.Duration
+
+	// warnLog suppresses repeats of the same policy-plane warning (R98).
+	// connect() already deduplicated its own failures (R96.3); the watch and
+	// resync paths did not, so a stream the firewall does not control — a
+	// hostile etcd cancelling every watch, or an endpoint that never answers
+	// Get — produced one identical line per reconnect, forever.
+	warnLog warnThrottle
+}
+
+// policyWarnWindow is how long the SAME policy-plane warning is suppressed
+// after it was logged (R98). Long enough that a sustained outage is one line
+// per window rather than ten per second, short enough that the state is never
+// stale. Matches etcdConnectLogInterval.
+const policyWarnWindow = 30 * time.Second
+
+// maxLogErrorText bounds an error string before it becomes a log attribute
+// (R98). The policy-plane callbacks can return errors that quote the policy
+// they rejected — opa.Load's compile error echoes the offending source
+// (2-3x the policy) — so the caller bounds what it prints even though the
+// evaluator now bounds what it returns. Two independent controls: a
+// production callback is not required to be this package's own.
+const maxLogErrorText = 2048
+
+// warnThrottle decides whether a warning should be emitted now.
+//
+// The key is the CONSTANT site/reason text, never the error text: a
+// terminating watch carries server-chosen detail in its error, so keying on
+// the rendered string would re-open the flood this exists to stop. Windows are
+// PER KEY, not a single last-seen slot: a hostile etcd can alternate between
+// two termination modes (Canceled, then channel close), and with one slot each
+// alternation would look like a change and pass the throttle — doubling the
+// rate rather than bounding it. First occurrence of a key is immediate; a
+// repeat is suppressed for policyWarnWindow; a different key is unaffected.
+type warnThrottle struct {
+	mu     sync.Mutex
+	lastAt map[string]time.Time
+}
+
+// maxWarnThrottleKeys bounds the throttle table. Every caller passes a
+// compile-time constant (the site text), so the live key count is a handful;
+// the cap exists so a future caller that keys on attacker-influenced text
+// cannot grow this map without bound (R93's aggregation-map class). Such a key
+// is still LOGGED (visibility first) but not remembered.
+const maxWarnThrottleKeys = 16
+
+func (t *warnThrottle) allow(key string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	at, seen := t.lastAt[key]
+	if seen && now.Sub(at) < policyWarnWindow {
+		return false
+	}
+	if !seen && len(t.lastAt) >= maxWarnThrottleKeys {
+		return true
+	}
+	if t.lastAt == nil {
+		t.lastAt = make(map[string]time.Time, 8)
+	}
+	t.lastAt[key] = now
+	return true
 }
 
 // Config controls the etcd syncer.
@@ -486,7 +552,13 @@ func (s *Syncer) connect(ctx context.Context) bool {
 		}
 		text := err.Error()
 		if text != lastText || time.Since(lastLog) >= etcdConnectLogInterval {
-			slog.Warn("etcd: connect failed, retrying", "key", s.key, "error", err)
+			// R98: the error attribute is bounded even though this path is
+			// backoff-paced. The dedupe key IS the error text (a CHANGED
+			// failure stays visible), so an endpoint that varies a byte per
+			// attempt would otherwise print a fresh, arbitrarily long line
+			// for each retry.
+			slog.Warn("etcd: connect failed, retrying", "key", s.key,
+				"error", redact.Truncate(text, maxLogErrorText))
 			lastText, lastLog = text, time.Now()
 		}
 		select {
@@ -535,7 +607,14 @@ func (s *Syncer) loadCurrent(ctx context.Context) string {
 	defer cancel()
 	resp, err := cli.Get(getCtx, s.key)
 	if err != nil {
-		slog.Warn("etcd: failed to get initial policy", "key", s.key, "error", err)
+		// R98: throttled by SITE (never by error text, which carries
+		// server-chosen detail) and bounded — this runs on every reconnect,
+		// so an endpoint that never answers produced one line per cycle for
+		// the life of the process.
+		if s.warnLog.allow("resync Get failed") {
+			slog.Warn("etcd: failed to get initial policy", "key", s.key,
+				"error", redact.Truncate(err.Error(), maxLogErrorText))
+		}
 		return ""
 	}
 	// A Get response missing its kv entirely (nil response) or whose first
@@ -563,12 +642,27 @@ func (s *Syncer) loadCurrent(ctx context.Context) string {
 	// Content dedupe (R61): the same policy is already applied — a reload
 	// would recompile identical content for nothing.
 	if !s.applyPolicy(policy) {
-		slog.Debug("etcd: initial policy unchanged, skipping", "key", s.key)
+		// R98: the healthy steady state is SILENT per cycle. This runs on
+		// every reconnect resync, so a hostile etcd that kills the watch
+		// every watchReconnectDelay turned this trace into a per-cycle line
+		// (behind --log-level=debug, but still operator-paced by the
+		// attacker). Throttled like the warnings: the first occurrence
+		// explains the state, repeats are suppressed.
+		if s.warnLog.allow("initial policy unchanged") {
+			slog.Debug("etcd: initial policy unchanged, skipping", "key", s.key)
+		}
 		return policy
 	}
 	// Wrap callback in panic recovery to prevent goroutine death
 	if err := safeOnUpdate(s.onUpdate, policy); err != nil {
-		slog.Warn("etcd: failed to load initial policy", "error", err)
+		// R98: throttled by SITE and bounded. err may quote the policy it
+		// rejected (OPA's compile error echoes the offending line), and this
+		// runs on every reconnect cycle — so an unbounded per-cycle error is
+		// a log/disk DoS paced by the policy channel's owner.
+		if s.warnLog.allow("initial policy load failed") {
+			slog.Warn("etcd: failed to load initial policy",
+				"error", redact.Truncate(err.Error(), maxLogErrorText))
+		}
 	} else {
 		slog.Info("etcd: loaded policy from", "key", s.key)
 	}
@@ -636,7 +730,14 @@ func (s *Syncer) watch(ctx context.Context) {
 		// compile must not re-trigger on every event of a flood (the
 		// R61 last-PROCESSED dedupe semantics).
 		if err := safeOnUpdate(s.onUpdate, pendingPolicy); err != nil {
-			slog.Warn("etcd: failed to apply policy update", "error", err)
+			// R98: same site-keyed throttle + bound as the initial-load
+			// path. The callback is production opa.Load, whose compile error
+			// echoes the rejected source; one 10 MB policy would otherwise
+			// write a 20–30 MB line per minReloadInterval.
+			if s.warnLog.allow("policy update failed") {
+				slog.Warn("etcd: failed to apply policy update",
+					"error", redact.Truncate(err.Error(), maxLogErrorText))
+			}
 		} else {
 			slog.Info("etcd: policy applied", "key", s.key)
 		}
@@ -686,13 +787,29 @@ func (s *Syncer) watch(ctx context.Context) {
 				// line and no recovery. The reconnect path below resyncs
 				// via Get (compaction-proof) and re-establishes the watch.
 				if !ok || wresp.Err() != nil || wresp.Canceled {
+					// R98: one warning per SITE, throttled by the constant
+					// reason text — never by the error text, which a hostile
+					// etcd chooses. A server that cancels EVERY watch used to
+					// produce an identical line per watchReconnectDelay
+					// (~10/s, forever); the operator still gets the first
+					// line immediately and any CHANGE of failure mode
+					// immediately. The error attribute is bounded: the
+					// terminating response's error string is server-chosen
+					// and can be arbitrarily long.
 					switch {
 					case wresp.Err() != nil:
-						slog.Warn("etcd: watch terminated with error, reconnecting", "key", s.key, "error", wresp.Err())
+						if s.warnLog.allow("watch terminated with error") {
+							slog.Warn("etcd: watch terminated with error, reconnecting", "key", s.key,
+								"error", redact.Truncate(wresp.Err().Error(), maxLogErrorText))
+						}
 					case wresp.Canceled:
-						slog.Warn("etcd: watch canceled, reconnecting", "key", s.key)
+						if s.warnLog.allow("watch canceled") {
+							slog.Warn("etcd: watch canceled, reconnecting", "key", s.key)
+						}
 					default:
-						slog.Warn("etcd: watch channel closed, reconnecting", "key", s.key)
+						if s.warnLog.allow("watch channel closed") {
+							slog.Warn("etcd: watch channel closed, reconnecting", "key", s.key)
+						}
 					}
 					terminated = true
 					break
@@ -747,9 +864,14 @@ func (s *Syncer) watch(ctx context.Context) {
 					}
 					policy := string(ev.Kv.Value)
 					// Content dedupe (R61): an identical replay never reloads
-					// twice — see applyPolicy.
+					// twice — see applyPolicy. R98: the trace is throttled
+					// because one wire response can carry thousands of
+					// identical events (the count dimension R58/R61 bounds
+					// for CPU also bounds for log volume).
 					if !s.applyPolicy(policy) {
-						slog.Debug("etcd: policy unchanged, skipping reload", "key", s.key)
+						if s.warnLog.allow("policy unchanged") {
+							slog.Debug("etcd: policy unchanged, skipping reload", "key", s.key)
+						}
 						continue
 					}
 					// Rate limit (R63): distinct policies arriving within
@@ -798,8 +920,15 @@ func (s *Syncer) watch(ctx context.Context) {
 		// the resync read NOTHING (etcd down), the pending policy is the
 		// best-known state and is kept as before.
 		if current != "" && pendingSet && pendingPolicy != current {
+			// R98: report the SHAPE, never the bytes. Both strings can be
+			// maxPolicySize (10 MB), and the attacker who controls the
+			// policy channel also chooses how often the watch dies — one
+			// ~20 MB line per reconnect cycle. The operator still needs to
+			// know a stale pending policy was dropped and how large the two
+			// states were; that is what this carries.
 			slog.Warn("etcd: resync superseded queued policy, dropping stale pending",
-				"key", s.key, "queued", pendingPolicy, "current", current)
+				"key", s.key,
+				"queued_bytes", len(pendingPolicy), "current_bytes", len(current))
 			pendingSet = false
 		}
 		select {
@@ -807,9 +936,17 @@ func (s *Syncer) watch(ctx context.Context) {
 			return
 		case <-ctx.Done():
 			return
-		case <-time.After(watchReconnectDelay):
+		case <-time.After(s.reconnectWait()):
 		}
 	}
+}
+
+// reconnectWait is the delay before re-establishing a terminated watch.
+func (s *Syncer) reconnectWait() time.Duration {
+	if s.reconnectDelay > 0 {
+		return s.reconnectDelay
+	}
+	return watchReconnectDelay
 }
 
 // safeOnUpdate calls the onUpdate callback with panic recovery.
@@ -821,7 +958,12 @@ func safeOnUpdate(fn func(string) error, policy string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("onUpdate panic: %v", r)
-			slog.Error("etcd: recovered panic in onUpdate callback", "panic", fmt.Sprintf("%v", r))
+			// R98: a panic value is arbitrary — a callback that panics with
+			// the policy it was handed carries the full document. Bounded
+			// like every other log value in this package; the recovered
+			// panic itself stays visible.
+			slog.Error("etcd: recovered panic in onUpdate callback",
+				"panic", redact.Truncate(fmt.Sprintf("%v", r), maxLogErrorText))
 		}
 	}()
 	return fn(policy)

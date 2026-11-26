@@ -16,7 +16,9 @@ package redact
 
 import (
 	"net/url"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // ellipsis marks the removed, credential-bearing part of a URL.
@@ -142,4 +144,30 @@ func redactOriginTails(msg, origin string) string {
 		b.WriteString(replacement)
 		msg = rest[end:]
 	}
+}
+
+// Truncate bounds a log attribute value to max bytes.
+//
+// Some of the values this package's consumers log are not theirs: a Rego
+// compile error echoes the offending policy source (measured 2-3x the source
+// for a single parse error), and the policy channel accepts 10 MB of
+// attacker-controlled Rego. Logging such a string verbatim is the R96.3
+// "per-event logging IS the DoS" shape with the payload supplied by the
+// attacker: one reload writes 20-30 MB, once per reload interval, on the
+// goroutine that must keep applying policy.
+//
+// The HEAD is kept, because that is where the actionable part lives
+// (file:line, the OPA message); the tail (the echoed source) is replaced by a
+// marker carrying the original size, so an operator can still tell a 40-byte
+// error from a 30 MB one. The cut is moved back to a rune boundary so a
+// multi-byte character is never split into invalid UTF-8.
+func Truncate(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + ellipsis + "[" + strconv.Itoa(len(s)) + " bytes]"
 }

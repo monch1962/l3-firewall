@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/open-policy-agent/opa/v1/storage"
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
+
+	"github.com/monch1962/l3-firewall/internal/redact"
 )
 
 // decisionQuery is the single Rego query the evaluator runs for every
@@ -32,6 +35,70 @@ const decisionQuery = "data.l3_firewall"
 // alone accepted a module that declares `package l3_firewall` and nothing
 // else — see verifyPolicyPackage.
 const decisionRuleRef = "data.l3_firewall.allow"
+
+// maxPolicyErrorBytes bounds the error text this package RETURNS. OPA's
+// compile errors echo the offending source line (measured R98: 2x the policy
+// for a parse error, 3x for an unterminated string literal), and the policy
+// channel accepts maxPolicySize (10 MB) of attacker-controlled Rego. Every
+// caller logs err.Error() — the etcd syncer's watch goroutine after each
+// distinct failed reload, main() at startup — so an unbounded error turns the
+// firewall's own logging into the attack: one 10 MB policy becomes a 20-30 MB
+// log line, once per reload, on the goroutine that must keep applying policy
+// (the R96.3 "per-event logging IS the DoS" class, payload supplied by the
+// attacker). Bounding it HERE protects every present and future caller with
+// one implementation (R85/R89: centralise, do not patch each consumer).
+//
+// 4 KiB keeps the actionable part — file:line plus the OPA message — and
+// drops the echoed source.
+const maxPolicyErrorBytes = 4096
+
+// maxPolicyErrorLineBytes bounds any SINGLE LINE of an error string. OPA's
+// parse errors reproduce the offending source line verbatim (twice: once for
+// the primary error, once for the follow-on "illegal token", each with a
+// caret ruler). A total cap alone is not enough: the echoed source is the
+// HEAD of the message, so truncating to maxPolicyErrorBytes still reproduces
+// the first 4 KiB of a 10 MB policy line. Clamping every line keeps the head
+// of each (`policy.rego:5: rego_parse_error: ...`) and the caret, while no
+// single line can dominate a log record. Applies to every line, not only the
+// tab-indented ones, so an attacker-controlled message line cannot slip a
+// long run through either.
+const maxPolicyErrorLineBytes = 160
+
+// clampErrorLines bounds each line of text to maxLine bytes. Text whose every
+// line already fits is returned unchanged, so ordinary diagnostics are
+// byte-identical to before.
+func clampErrorLines(text string, maxLine int) string {
+	if len(text) <= maxLine {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	for i, ln := range lines {
+		if len(ln) > maxLine {
+			lines[i] = redact.Truncate(ln, maxLine)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// boundPolicyError caps err's text at maxPolicyErrorBytes and each of its
+// lines at maxPolicyErrorLineBytes. Errors already within both caps are
+// returned UNCHANGED (including their wrap chain), so ordinary diagnostics
+// are byte-identical to before.
+func boundPolicyError(err error, policyLen int) error {
+	if err == nil {
+		return nil
+	}
+	text := err.Error()
+	clamped := clampErrorLines(text, maxPolicyErrorLineBytes)
+	if clamped == text && len(text) <= maxPolicyErrorBytes {
+		return err
+	}
+	if len(clamped) > maxPolicyErrorBytes {
+		clamped = redact.Truncate(clamped, maxPolicyErrorBytes)
+	}
+	return fmt.Errorf("%s [policy source withheld: the error text was %d bytes for a %d-byte policy]",
+		clamped, len(text), policyLen)
+}
 
 // EmbedConfig configures the in-process OPA evaluator.
 type EmbedConfig struct {
@@ -155,13 +222,13 @@ func NewEmbedded(cfg EmbedConfig) (*EmbeddedEvaluator, error) {
 		"policy.rego": cfg.Policy,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("compiling Rego: %w", err)
+		return nil, boundPolicyError(fmt.Errorf("compiling Rego: %w", err), len(cfg.Policy))
 	}
 	// The module must declare the decision package (R75): without the gate,
 	// a wrong-package policy boots an allow-all firewall with no error (see
 	// verifyPolicyPackage).
 	if err := verifyPolicyPackage(compiler); err != nil {
-		return nil, err
+		return nil, boundPolicyError(err, len(cfg.Policy))
 	}
 	// A correct-package policy that can never produce a decision permits
 	// everything by the deny-override contract — make that audible (R89).
@@ -176,7 +243,7 @@ func NewEmbedded(cfg EmbedConfig) (*EmbeddedEvaluator, error) {
 	}
 
 	if err := e.rebuild(); err != nil {
-		return nil, err
+		return nil, boundPolicyError(err, len(cfg.Policy))
 	}
 
 	return e, nil
@@ -207,7 +274,7 @@ func (e *EmbeddedEvaluator) Load(policy string) error {
 		"policy.rego": policy,
 	})
 	if err != nil {
-		return fmt.Errorf("compiling Rego: %w", err)
+		return boundPolicyError(fmt.Errorf("compiling Rego: %w", err), len(policy))
 	}
 	// Reject a policy that cannot produce a decision at the queried document
 	// (R75): a wrong-package policy would otherwise Load successfully and
@@ -216,7 +283,7 @@ func (e *EmbeddedEvaluator) Load(policy string) error {
 	// governing (callers log the error; pollPolicyFile/syncer keep their
 	// existing retry semantics).
 	if err := verifyPolicyPackage(compiler); err != nil {
-		return err
+		return boundPolicyError(err, len(policy))
 	}
 	// Same observability rule on the hot-reload path (etcd syncer / policy
 	// file watcher): a reload that silently switches the firewall to
@@ -230,7 +297,7 @@ func (e *EmbeddedEvaluator) Load(policy string) error {
 	e.mu.Unlock()
 
 	if err := e.rebuild(); err != nil {
-		return err
+		return boundPolicyError(err, len(policy))
 	}
 
 	// Notify reload channel (non-blocking send)
