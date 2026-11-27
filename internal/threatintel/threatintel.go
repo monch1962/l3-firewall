@@ -222,7 +222,7 @@ func (bl *Blocklist) Add(entry string) bool {
 	// direct API call) is covered — not just the feed reader (R85/R89:
 	// centralise in the component that owns the text). Stripping before the
 	// lock keeps the critical section unchanged.
-	entry = stripFormatChars(entry)
+	entry = normalizeEntry(entry)
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 
@@ -343,6 +343,15 @@ func (bl *Blocklist) Remove(entry string) {
 	if bl == nil {
 		return
 	}
+	// R99: every mutation of the key space must apply the SAME transform as
+	// Add. Add strips the Unicode Cf class (R98), so it stores the canonical
+	// form of a spelling net.ParseIP would reject; Remove used the raw string,
+	// so an indicator ingested from a BOM/ZWSP-prefixed feed line could never
+	// be removed with the spelling the feed supplied — a silently
+	// un-removable deny entry (the R41 Add/Remove consistency rule, which R98
+	// re-broke for its own class one round later). Remove has no production
+	// caller today; the next one must not inherit the asymmetry.
+	entry = normalizeEntry(entry)
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 
@@ -504,6 +513,17 @@ func normalizeURLList(urls []string) []string {
 		return nil
 	}
 	return out
+}
+
+// normalizeEntry is the single ingestion transform every mutation of the
+// blocklist key space applies — Add (which stores an entry) and Remove (which
+// deletes it). Centralised so the two can never drift: R41 established the
+// rule for IPv4-mapped forms (Add and Contains normalised, Remove did not),
+// and R98's Cf strip was added to Add alone, re-creating exactly that
+// asymmetry one round later (R99). Keep it the ONLY place an entry string is
+// transformed.
+func normalizeEntry(entry string) string {
+	return stripFormatChars(entry)
 }
 
 // stripFormatChars removes Unicode FORMAT characters (category Cf) from an

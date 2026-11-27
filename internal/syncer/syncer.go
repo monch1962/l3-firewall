@@ -829,8 +829,18 @@ func (s *Syncer) watch(ctx context.Context) {
 				// syncer (eventual consistency).
 				events := wresp.Events
 				if len(events) > maxWatchEventsPerResponse {
-					slog.Warn("etcd: watch response carries excessive events, applying only the latest state",
-						"key", s.key, "count", len(events), "max", maxWatchEventsPerResponse)
+					// R99.4: throttle by the CONSTANT site key. The collapse is
+					// per RESPONSE, and a hostile etcd streams oversized
+					// responses, so an unthrottled warning here is the same
+					// per-event shape one level up (R98's class inside the
+					// event loop it left unthrottled). The count is kept — the
+					// operator must still be able to tell how bad a response
+					// was — and the throttle's per-key window means a CHANGE
+					// (normal -> oversized) is still reported immediately.
+					if s.warnLog.allow("watch response carries excessive events") {
+						slog.Warn("etcd: watch response carries excessive events, applying only the latest state",
+							"key", s.key, "count", len(events), "max", maxWatchEventsPerResponse)
+					}
 					events = events[len(events)-1:]
 				}
 				for _, ev := range events {
@@ -842,24 +852,41 @@ func (s *Syncer) watch(ctx context.Context) {
 					// (R51 — the nil deref was the only unprotected statement
 					// in the watch loop).
 					if ev == nil || ev.Kv == nil {
-						slog.Warn("etcd: watch event missing key/value, skipping")
+						// R99.2: one line per event is a log flood — the
+						// event count is bounded (10 000/response) but a
+						// hostile etcd streams responses. Throttled by the
+						// constant site key (R98's posture, applied to the
+						// per-event drop paths the R98 sweep missed).
+						if s.warnLog.allow("watch event missing key/value") {
+							slog.Warn("etcd: watch event missing key/value, skipping", "key", s.key)
+						}
 						continue
 					}
 					// DELETE events carry no policy value (nil Kv.Value):
 					// applying one always failed the empty-policy check,
 					// churning a failed reload + error log per delete. Skip
 					// with a warning and keep the last applied policy (R61).
+					// R99.1: the warning is throttled by its constant site
+					// key — one response can carry 10 000 DELETEs, and the
+					// attacker paces the responses.
 					if ev.Type == mvccpb.DELETE {
-						slog.Warn("etcd: policy key deleted, keeping last applied policy", "key", s.key)
+						if s.warnLog.allow("policy key deleted") {
+							slog.Warn("etcd: policy key deleted, keeping last applied policy", "key", s.key)
+						}
 						continue
 					}
 					// Enforce policy size limit BEFORE the string conversion —
 					// same check-before-allocate ordering as loadCurrent (R54):
 					// string() copies the value, so a post-copy check lets an
 					// oversized value allocate fully before being rejected.
+					// R99.3: throttled by the constant site key — the `size`
+					// value is attacker-chosen, so the rendered text is not
+					// even stable (the R98 rule: key on the site, not the text).
 					if len(ev.Kv.Value) > maxPolicySize {
-						slog.Warn("etcd: policy update exceeds max size, skipping",
-							"key", s.key, "size", len(ev.Kv.Value), "max", maxPolicySize)
+						if s.warnLog.allow("policy update exceeds max size") {
+							slog.Warn("etcd: policy update exceeds max size, skipping",
+								"key", s.key, "size", len(ev.Kv.Value), "max", maxPolicySize)
+						}
 						continue
 					}
 					policy := string(ev.Kv.Value)
